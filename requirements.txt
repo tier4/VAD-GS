@@ -19,7 +19,7 @@ torchmetrics
 kornia
 roma
 imgviz
-protobuf==3.19
+protobuf==5.29.6
 termcolor
 segment_anything
 numba==0.58.1
