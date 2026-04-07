@@ -31,7 +31,10 @@ class Scene:
                     
         else:
             # First check if there is a point cloud saved and get the iteration to load from
-            assert(os.path.exists(cfg.point_cloud_dir))
+            if not os.path.exists(cfg.point_cloud_dir):
+                raise FileNotFoundError(
+                    f"Evaluation requires a trained model, but point cloud directory was not found: {cfg.point_cloud_dir}"
+                )
             if cfg.loaded_iter == -1:
                 self.loaded_iter = searchForMaxIteration(cfg.point_cloud_dir)
             else:
@@ -40,7 +43,10 @@ class Scene:
             # Load checkpoint if it exists (this loads other parameters like the optimized tracking poses)
             print("Loading checkpoint at iteration {}".format(self.loaded_iter))
             checkpoint_path = os.path.join(cfg.trained_model_dir, f"iteration_{str(self.loaded_iter)}.pth")
-            assert os.path.exists(checkpoint_path)
+            if not os.path.exists(checkpoint_path):
+                raise FileNotFoundError(
+                    f"Evaluation requires a trained checkpoint, but it was not found: {checkpoint_path}"
+                )
             state_dict = torch.load(checkpoint_path)
             self.gaussians.load_state_dict(state_dict=state_dict)
             

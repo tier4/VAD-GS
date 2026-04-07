@@ -3,6 +3,7 @@ data/*
 notebooks/*
 .ipynb_checkpoints
 **/__pycache__/
+*.pyc
 .vscode/
 build/
 *.so

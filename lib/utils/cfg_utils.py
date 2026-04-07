@@ -59,7 +59,7 @@ def parse_cfg(cfg, args):
         relative_path = os.path.relpath(cfg.source_path, cfg.workspace)
         cfg.source_path = os.path.join(cur_workspace, relative_path)
         if not os.path.exists(cfg.source_path):
-            __import__('ipdb').set_trace()
+            raise FileNotFoundError(f"Dataset source_path does not exist: {cfg.source_path}")
     
     # log directory
     if cfg.record_dir is None:

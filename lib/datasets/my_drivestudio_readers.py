@@ -35,9 +35,8 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
     
     # dynamic mask
     dynamic_mask_dir = os.path.join(path, 'sam_masks')
-    # dynamic_mask_dir = os.path.join(path, 'fine_dynamic_masks/all')
     bkgd_mask_dir = os.path.join(path, 'sam_bkgd_masks')
-    load_dynamic_mask = True
+    load_dynamic_mask = os.path.exists(dynamic_mask_dir) and os.path.exists(bkgd_mask_dir)
 
     # sky mask
     sky_mask_dir = os.path.join(path, 'sky_masks')
@@ -49,10 +48,10 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
 
     # zyk
     mono_depth_dir = os.path.join(path, 'depth_v2')
-    load_mono_depth = True # (cfg.mode == 'train') and os.path.exists(mono_depth_dir)
+    load_mono_depth = os.path.exists(mono_depth_dir)
 
     normal_dir = os.path.join(path, "normal_img")
-    load_normal = True
+    load_normal = os.path.exists(normal_dir)
 
 
     output = generate_dataparser_outputs(
@@ -239,16 +238,28 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
     lidar_ply_path = os.path.join(cfg.model_path, 'input_ply/points3D_lidar.ply')
     if os.path.exists(lidar_ply_path):
         sphere_pcd: BasicPointCloud = fetchPly(lidar_ply_path)
-    else:
+    elif os.path.exists(bkgd_ply_path):
         sphere_pcd: BasicPointCloud = fetchPly(bkgd_ply_path)
+    else:
+        # In evaluation-before-training flows there may be no generated point cloud yet.
+        cam_centers = []
+        for cam_info in train_cam_infos:
+            RT = np.eye(4)
+            RT[:3, :3] = cam_info.R.T
+            RT[:3, 3] = cam_info.T
+            cam_centers.append(np.linalg.inv(RT)[:3, 3])
+        cam_centers = np.asarray(cam_centers, dtype=np.float32)
+        sphere_pcd = BasicPointCloud(points=cam_centers, colors=np.zeros_like(cam_centers), normals=np.zeros_like(cam_centers))
     
     sphere_normalization = get_Sphere_Norm(sphere_pcd.points)
     scene_metadata['sphere_center'] = sphere_normalization['center']
     scene_metadata['sphere_radius'] = sphere_normalization['radius']
     print(f'Sphere extent: {sphere_normalization["radius"]}')
 
-    pcd: BasicPointCloud = fetchPly(bkgd_ply_path)
+    pcd: BasicPointCloud = fetchPly(bkgd_ply_path) if os.path.exists(bkgd_ply_path) else None
     if cfg.mode == 'train':
+        if pcd is None:
+            raise FileNotFoundError(f"Missing generated background point cloud: {bkgd_ply_path}")
         point_cloud = pcd
     else:
         point_cloud = None
