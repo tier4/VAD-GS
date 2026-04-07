@@ -255,6 +255,7 @@ def training():
 
                 hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
                 hard_depth = hard_render_pkg["depth"][0]
+                del hard_render_pkg
 
                 voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
                 voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
@@ -264,6 +265,7 @@ def training():
                     flag_global_reconstruct = True
                 if m1.sum() > (voxel_depth_tensor > 0).sum() * 0.2:
                     flag_local_reconstruct = True
+                del hard_depth, voxel_depth_tensor, m1
 
                 # m2 = (voxel_depth_tensor > 0) & (hard_depth < voxel_depth_tensor * 0.9) # objects occluded
                 # mask = m1 | m2
@@ -301,6 +303,7 @@ def training():
                 gaussians.parse_camera(viewpoint_cam)
                 obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=True)
                 obj_acc = obj_render_pkg["acc"]
+                del obj_render_pkg
 
                 actor_mask = torch.any(dynamic_mask != 255, axis=0, keepdim=True)
 
@@ -309,6 +312,7 @@ def training():
                     v = obj_acc[actor_mask].kthvalue(k).values
                     if v.item() < 0.7:
                         flag_actor_reconstruct = True
+                del obj_acc
 
 
                 # if flag_global_reconstruct or flag_local_reconstruct or flag_actor_reconstruct:
@@ -421,23 +425,28 @@ def training():
                     src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
                     src_rendered_depth = src_render_pkg['depth'][0]
                     src_rendered_normal = src_render_pkg['normals']
+                    del src_render_pkg
 
                     #get the src_depth first
                     # depth_propagation(src_viewpoint, torch.zeros_like(src_projected_depth).cuda(), viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
                     src_idxs_for_src = src_idxs[:idx] + src_idxs[idx:] + [randidx]
                     # depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth.detach().cpu().numpy(), src_rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
                     src_depth, src_cost, src_normal = depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth, src_rendered_normal, viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-                    
+                    del src_cost, src_normal, src_rendered_depth, src_rendered_normal
+
                     # src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
                     # src_depth = torch.tensor(src_depth).cuda()
-                    mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
-                                                                                                                    ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
+                    mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0),
+                                                                                                                    ref_pose.unsqueeze(0), src_depth.unsqueeze(0),
                                                                                                                     src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
+                    del depth_reprojected, x2d_src, y2d_src, relative_depth_diff, src_depth
                     if geometric_counts is None:
                         geometric_counts = mask.to(torch.uint8)
                     else:
                         geometric_counts += mask.to(torch.uint8)
-                        
+                    del mask
+                    torch.cuda.empty_cache()
+
                 cost = geometric_counts.squeeze() # 这里cost大约代表各视角下共享视野的部分，越高代表被共同观测且匹配成功的视角越多
                 # cost_mask = cost >= 2
                 cost_mask = cost >= len(src_idxs)*0.5 # 0.75
@@ -563,22 +572,27 @@ def training():
                             src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
                             src_rendered_depth = src_render_pkg['depth'][0]
                             src_rendered_normal = src_render_pkg['normals']
+                            del src_render_pkg
 
                             #get the src_depth first
                             src_idxs_for_src = src_idxs[:idx] + src_idxs[idx:] + [randidx]
                             # depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth.detach().cpu().numpy(), src_rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
                             src_depth, cost, src_normal = depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth, src_rendered_normal, viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-                            
+                            del cost, src_normal, src_rendered_depth, src_rendered_normal
+
                             # src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
                             # src_depth = torch.tensor(src_depth).cuda()
-                            mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
-                                                                                                                            ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
+                            mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0),
+                                                                                                                            ref_pose.unsqueeze(0), src_depth.unsqueeze(0),
                                                                                                                             src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
+                            del depth_reprojected, x2d_src, y2d_src, relative_depth_diff, src_depth
                             if geometric_counts is None:
                                 geometric_counts = mask.to(torch.uint8)
                             else:
                                 geometric_counts += mask.to(torch.uint8)
-                                
+                            del mask
+                            torch.cuda.empty_cache()
+
                         cost = geometric_counts.squeeze() # 这里cost大约代表各视角下共享视野的部分，越高代表被共同观测且匹配成功的视角越多
                         # cost_mask = cost >= 2
                         cost_mask = cost >= len(src_idxs)*0.5 #0.75
@@ -736,27 +750,32 @@ def training():
 
                         # src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
                         src_render_pkg = gaussians_renderer.render_object(src_viewpoint, gaussians, parse_camera_again=False)
-                        src_rendered_depth = src_render_pkg['depth'][0] 
+                        src_rendered_depth = src_render_pkg['depth'][0]
                         src_rendered_normal = src_render_pkg['normals']
+                        del src_render_pkg
 
                         #get the src_depth first
                         # depth_propagation(src_viewpoint, torch.zeros_like(src_projected_depth).cuda(), viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
                         src_idxs_for_src = src_idxs[:idx] + src_idxs[idx:] + [randidx]
                         # depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth.detach().cpu().numpy(), src_rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20)
                         src_depth, cost, src_normal = depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth, src_rendered_normal, viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20)
+                        del cost, src_normal, src_rendered_depth, src_rendered_normal
                         if src_depth is None:
                             print("no props")
-                            continue 
+                            continue
 
                         # src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
                         # src_depth = torch.tensor(src_depth).cuda()
-                        mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
-                                                                                                                        ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
+                        mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0),
+                                                                                                                        ref_pose.unsqueeze(0), src_depth.unsqueeze(0),
                                                                                                                         src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
+                        del depth_reprojected, x2d_src, y2d_src, relative_depth_diff, src_depth
                         if geometric_counts is None:
                             geometric_counts = mask.to(torch.uint8)
                         else:
                             geometric_counts += mask.to(torch.uint8)
+                        del mask
+                        torch.cuda.empty_cache()
                             
                     if geometric_counts is None:
                         continue
@@ -802,8 +821,8 @@ def training():
                             continue
                         obj_model.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), render_acc, gt_image, obj_rots, obj_trans, init_opacity=0.3, target_count=target_count) 
                     
-            # torch.cuda.empty_cache()
-            
+            torch.cuda.empty_cache()
+
 
         voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
         voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
@@ -825,9 +844,10 @@ def training():
 
             loss_hard.backward()
             # Optimizer step
-            if iteration < training_args.iterations:                
+            if iteration < training_args.iterations:
                 gaussians.update_optimizer()
-
+            del hard_render_pkg, hard_depth, loss_hard, loss_l2_dpt, loss_global
+            torch.cuda.empty_cache()
 
         soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
         image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
@@ -857,12 +877,14 @@ def training():
         if optim_args.lambda_reg > 0 and gaussians.include_obj and iteration >= optim_args.densify_until_iter:
             render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=False)
             image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
+            del render_pkg_obj
             acc_obj = torch.clamp(acc_obj, min=1e-6, max=1.-1e-6)
-            obj_acc_loss = torch.where(torch.any(dynamic_mask != 255, axis=0), # obj_bound, 
-                -(acc_obj * torch.log(acc_obj) +  (1. - acc_obj) * torch.log(1. - acc_obj)), 
+            obj_acc_loss = torch.where(torch.any(dynamic_mask != 255, axis=0), # obj_bound,
+                -(acc_obj * torch.log(acc_obj) +  (1. - acc_obj) * torch.log(1. - acc_obj)),
                 -torch.log(1. - acc_obj)).mean()
             scalar_dict['obj_acc_loss'] = obj_acc_loss.item()
             loss += optim_args.lambda_reg * obj_acc_loss
+            del image_obj, acc_obj
 
 
 
@@ -909,7 +931,7 @@ def training():
                 lambda_cos_normal = 0.02
                 loss += lambda_l1_normal * l1_normal + lambda_cos_normal * cos_normal
 
-                viewpoint_cam.guidance['mono_normal'] = mono_normal #.cpu()
+                viewpoint_cam.guidance['mono_normal'] = mono_normal.cpu()
 
         scalar_dict['loss'] = loss.item()
         
@@ -929,6 +951,7 @@ def training():
             with torch.no_grad():
                 render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians)
                 image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
+                del render_pkg_obj
             acc_obj = acc_obj.repeat(3, 1, 1)
             # row1 = torch.cat([acc, image_obj, acc_obj], dim=2)
             row1 = torch.cat([voxel_depth_tensor[None,:,:].repeat(3,1,1) / voxel_depth_tensor.max(), image_obj, mono_depth.repeat(3,1,1)], dim=2)
@@ -937,6 +960,7 @@ def training():
             image_to_show = torch.clamp(image_to_show, 0.0, 1.0)
             os.makedirs(f"{cfg.model_path}/log_images", exist_ok = True)
             save_img_torch(image_to_show, f"{cfg.model_path}/log_images/{iteration}.jpg")
+            del row0, row1, image_to_show, depth_colored, image_obj, acc_obj
         
         with torch.no_grad():
             
