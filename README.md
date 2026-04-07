@@ -31,21 +31,12 @@ git checkout -b dev origin/dev
 <details> <summary>Set up the environment</summary>
 
 ```
-# Set conda environment
-conda create -n vadgs python=3.8
-conda activate vadgs
+# Create and sync the environment with uv
+uv venv
 
-# Install torch (corresponding to your CUDA version)
-pip install torch==1.12.0+cu113 torchvision==0.13.0+cu113 torchaudio==0.12.0 --extra-index-url https://download.pytorch.org/whl/cu113
-
-# Install requirements
-pip install -r requirements.txt
-
-# Install submodules
-pip install ./submodules/diff-gaussian-rasterization
-pip install ./submodules/simple-knn
-pip install ./submodules/simple-waymo-open-dataset-reader
-pip install ./submodules/MyPropagation
+# Install project dependencies
+# On Linux, uv resolves torch/torchvision from the PyTorch cu124 index.
+uv sync
 ```
 </details>
 

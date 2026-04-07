@@ -5,6 +5,7 @@ import glob
 import os
 import cv2
 import shutil
+import subprocess
 import sys
 sys.path.append(os.getcwd())
 import json
@@ -16,6 +17,14 @@ from lib.utils.data_utils import get_val_frames
 from lib.utils.colmap_utils import read_extrinsics_binary, qvec2rotmat
 
 image_filename_to_cam = lambda x: int(x.split('/')[0].split('_')[1]) # cam_{cam_id}/{frame}.png
+
+
+def run_colmap_command(args):
+    env = os.environ.copy()
+    env['QT_QPA_PLATFORM'] = env.get('QT_QPA_PLATFORM', 'offscreen')
+    env.pop('QT_PLUGIN_PATH', None)
+    env.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
+    subprocess.run(args, check=True, env=env)
 
 def convert_filename(filename):
     # {frame}_{cam_id}.png -> cam_{cam_id}/{frame}.png
@@ -106,18 +115,26 @@ def run_colmap_waymo(result):
         # new_mask_filename = f'{new_image_filename}.png'
         new_mask_filename = os.path.join(mask_images_dir, "cam_"+cam_id, img_name)
         if not os.path.exists(new_mask_filename):
-            shutil.copyfile(image_filename, new_mask_filename)
-            mask = cv2.imread(new_mask_filename)
+            if os.path.exists(image_filename):
+                shutil.copyfile(image_filename, new_mask_filename)
+                mask = cv2.imread(new_mask_filename)
+            else:
+                source_image_filename = train_image_filenames[i]
+                source_image = cv2.imread(source_image_filename)
+                mask = np.zeros(source_image.shape[:2], dtype=np.uint8)
             flip_mask = (255 - mask).astype(np.uint8)
             cv2.imwrite(new_mask_filename, flip_mask)
     
     # https://colmap.github.io/faq.html#mask-image-regions
-    os.system(f'colmap feature_extractor \
-            --ImageReader.mask_path {mask_images_dir} \
-            --ImageReader.camera_model SIMPLE_PINHOLE  \
-            --ImageReader.single_camera_per_folder 1 \
-            --database_path {colmap_dir}/database.db \
-            --image_path {train_images_dir}')
+    run_colmap_command([
+        'colmap',
+        'feature_extractor',
+        '--ImageReader.mask_path', mask_images_dir,
+        '--ImageReader.camera_model', 'SIMPLE_PINHOLE',
+        '--ImageReader.single_camera_per_folder', '1',
+        '--database_path', f'{colmap_dir}/database.db',
+        '--image_path', train_images_dir,
+    ])
 
     # load intrinsic
     camera_infos = dict()
@@ -226,7 +243,7 @@ def run_colmap_waymo(result):
 
     # create points3D.txt
     points3D_fn = os.path.join(model_dir, 'points3D.txt')
-    os.system(f'touch {points3D_fn}')
+    open(points3D_fn, 'a').close()
     
     # create rid ba config
     cam_rigid = dict()
@@ -261,40 +278,49 @@ def run_colmap_waymo(result):
     with open(rigid_config_path, "w+") as f:
         json.dump([cam_rigid], f, indent=4)   
 
-    os.system(f'colmap exhaustive_matcher \
-            --database_path {colmap_dir}/database.db')
+    run_colmap_command([
+        'colmap',
+        'exhaustive_matcher',
+        '--database_path', f'{colmap_dir}/database.db',
+    ])
 
     triangulated_dir = os.path.join(colmap_dir, 'triangulated/sparse/model')
     os.makedirs(triangulated_dir, exist_ok=True)
-    os.system(f'colmap point_triangulator \
-        --database_path {colmap_dir}/database.db \
-        --image_path {train_images_dir} \
-        --input_path {model_dir} \
-        --output_path {triangulated_dir} \
-        --Mapper.ba_refine_focal_length 0 \
-        --Mapper.ba_refine_principal_point 0 \
-        --Mapper.max_extra_param 0 \
-        --clear_points 0 \
-        --Mapper.ba_global_max_num_iterations 30 \
-        --Mapper.filter_max_reproj_error 4 \
-        --Mapper.filter_min_tri_angle 0.5 \
-        --Mapper.tri_min_angle 0.5 \
-        --Mapper.tri_ignore_two_view_tracks 1 \
-        --Mapper.tri_complete_max_reproj_error 4 \
-        --Mapper.tri_continue_max_angle_error 4')
+    run_colmap_command([
+        'colmap',
+        'point_triangulator',
+        '--database_path', f'{colmap_dir}/database.db',
+        '--image_path', train_images_dir,
+        '--input_path', model_dir,
+        '--output_path', triangulated_dir,
+        '--Mapper.ba_refine_focal_length', '0',
+        '--Mapper.ba_refine_principal_point', '0',
+        '--Mapper.max_extra_param', '0',
+        '--clear_points', '0',
+        '--Mapper.ba_global_max_num_iterations', '30',
+        '--Mapper.filter_max_reproj_error', '4',
+        '--Mapper.filter_min_tri_angle', '0.5',
+        '--Mapper.tri_min_angle', '0.5',
+        '--Mapper.tri_ignore_two_view_tracks', '1',
+        '--Mapper.tri_complete_max_reproj_error', '4',
+        '--Mapper.tri_continue_max_angle_error', '4',
+    ])
     
     if cfg.data.use_colmap_pose:
         # May lead to unstable results when refining relative poses
-        os.system(f'colmap rig_bundle_adjuster \
-                --input_path {triangulated_dir} \
-                --output_path {triangulated_dir} \
-                --rig_config_path {rigid_config_path} \
-                --estimate_rig_relative_poses 0 \
-                --RigBundleAdjustment.refine_relative_poses 1 \
-                --BundleAdjustment.max_num_iterations 50 \
-                --BundleAdjustment.refine_focal_length 0 \
-                --BundleAdjustment.refine_principal_point 0 \
-                --BundleAdjustment.refine_extra_params 0')
+        run_colmap_command([
+            'colmap',
+            'rig_bundle_adjuster',
+            '--input_path', triangulated_dir,
+            '--output_path', triangulated_dir,
+            '--rig_config_path', rigid_config_path,
+            '--estimate_rig_relative_poses', '0',
+            '--RigBundleAdjustment.refine_relative_poses', '1',
+            '--BundleAdjustment.max_num_iterations', '50',
+            '--BundleAdjustment.refine_focal_length', '0',
+            '--BundleAdjustment.refine_principal_point', '0',
+            '--BundleAdjustment.refine_extra_params', '0',
+        ])
 
     os.system(f'rm -rf {train_images_dir}')
     os.system(f'rm -rf {test_images_dir}')
