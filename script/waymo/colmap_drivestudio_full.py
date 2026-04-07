@@ -110,7 +110,7 @@ def run_colmap_waymo(result):
         basename = os.path.basename(image_filename)
         mask_images_dir = os.path.join(colmap_dir, 'mask')
         img_name = image_filename.split("/")[-1]
-        cam_id = image_filename.split("/")[-1].split("_")[-1].split(".")[0]       
+        cam_id = image_filename.split("/")[-1].split("_")[-1].split(".")[0]
         # new_image_filename = os.path.join(mask_images_dir, "cam_"+cam_id, img_name)
         # new_mask_filename = f'{new_image_filename}.png'
         new_mask_filename = os.path.join(mask_images_dir, "cam_"+cam_id, img_name)
@@ -126,6 +126,23 @@ def run_colmap_waymo(result):
             cv2.imwrite(new_mask_filename, flip_mask)
     
     # https://colmap.github.io/faq.html#mask-image-regions
+    # COLMAP looks for mask at {mask_path}/{image_name}.png
+    # Image names are "cam_X/NNN.png", so COLMAP expects "mask/cam_X/NNN.png.png"
+    # Rename mask files to match: "NNN_X.png" -> "NNN.png.png"
+    for unqiue_cam in unique_cams:
+        cam_mask_dir = os.path.join(mask_images_dir, f'cam_{unqiue_cam}')
+        for mask_file in os.listdir(cam_mask_dir):
+            if mask_file.endswith('.png') and not mask_file.endswith('.png.png'):
+                # convert_filename: "000_0.png" -> "cam_0/000.png"
+                # COLMAP expects mask named "{basename_of_image}.png" = "000.png.png"
+                converted = convert_filename(mask_file)  # "cam_X/NNN.png"
+                image_basename = os.path.basename(converted)  # "NNN.png"
+                new_name = f'{image_basename}.png'  # "NNN.png.png"
+                old_path = os.path.join(cam_mask_dir, mask_file)
+                new_path = os.path.join(cam_mask_dir, new_name)
+                if old_path != new_path and not os.path.exists(new_path):
+                    os.rename(old_path, new_path)
+
     run_colmap_command([
         'colmap',
         'feature_extractor',
@@ -150,13 +167,21 @@ def run_colmap_waymo(result):
             'img_w': img_w,
         }
 
-    # load id_names from database
+    # load id_names from database and build camera ID mapping
     db = f'{colmap_dir}/database.db'
     conn = sqlite3.connect(db)
     c = conn.cursor()
     c.execute('SELECT * FROM images')
     result = c.fetchall()
-        
+
+    # Build mapping: logical cam (0,1,2,...) -> DB camera_id (1,2,3,...)
+    cam_to_db_id = dict()
+    for i in result:
+        name = i[1]
+        cam = image_filename_to_cam(name)
+        db_camera_id = i[2]
+        cam_to_db_id[cam] = db_camera_id
+
     out_fn = f'{colmap_dir}/id_names.txt'
     with open(out_fn, 'w') as f:
         for i in result:
@@ -164,7 +189,7 @@ def run_colmap_waymo(result):
     f.close()
 
     path_idname = f'{colmap_dir}/id_names.txt'
-    
+
     f_id_name = open(path_idname, 'r')
     f_id_name_lines= f_id_name.readlines()
 
@@ -172,7 +197,7 @@ def run_colmap_waymo(result):
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
 
-    # create images.txt
+    # create images.txt (use DB camera IDs to match feature_extractor output)
     f_w = open(f'{model_dir}/images.txt', 'w')
     id_names = []
     for l in f_id_name_lines:
@@ -195,18 +220,20 @@ def run_colmap_waymo(result):
         id_ = id_names[i][0]
         name = id_names[i][1]
         cam = image_filename_to_cam(name)
+        db_cam_id = cam_to_db_id[cam]
 
         f_w.write(f'{id_} ')
         f_w.write(' '.join([str(a) for a in out.tolist()] ) )
-        f_w.write(f' {cam} {name}')
+        f_w.write(f' {db_cam_id} {name}')
         f_w.write('\n\n')
-    
+
     f_w.close()
 
-    # create cameras.txt
+    # create cameras.txt (use DB camera IDs)
     cameras_fn = os.path.join(model_dir, 'cameras.txt')
     with open(cameras_fn, 'w') as f:
         for unique_cam in unique_cams:
+            db_cam_id = cam_to_db_id[unique_cam]
             camera_info = camera_infos[unique_cam]
             ixt = camera_info['ixt']
             img_w = camera_info['img_w']
@@ -215,24 +242,15 @@ def run_colmap_waymo(result):
             fy = ixt[1, 1]
             cx = ixt[0, 2]
             cy = ixt[1, 2]
-            f.write(f'{unique_cam} SIMPLE_PINHOLE {img_w} {img_h} {fx} {cx} {cy}')
+            f.write(f'{db_cam_id} SIMPLE_PINHOLE {img_w} {img_h} {fx} {cx} {cy}')
             f.write('\n')
 
-    # update database
-    db = f'{colmap_dir}/database.db'
-    conn = sqlite3.connect(db)
+    # update database intrinsics
+    conn = sqlite3.connect(f'{colmap_dir}/database.db')
     c = conn.cursor()
-    c.execute('SELECT * FROM images')
-    result = c.fetchall()
-    cam_to_id = dict()
-    for i in result:
-        name = i[1]
-        cam = image_filename_to_cam(name)
-        cam_id = i[2]
-        cam_to_id[cam] = cam_id
-    
+
     for unique_cam in unique_cams:
-        cam_id = cam_to_id[unique_cam]
+        cam_id = cam_to_db_id[unique_cam]
         ixt = camera_infos[unique_cam]['ixt']
         fx, fy, cx, cy = ixt[0, 0], ixt[1, 1], ixt[0, 2], ixt[1, 2]
         params = np.array([fx, cx, cy]).astype(np.float64)
