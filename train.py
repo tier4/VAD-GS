@@ -303,7 +303,6 @@ def training():
                 gaussians.parse_camera(viewpoint_cam)
                 obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=True)
                 obj_acc = obj_render_pkg["acc"]
-                del obj_render_pkg
 
                 actor_mask = torch.any(dynamic_mask != 255, axis=0, keepdim=True)
 
