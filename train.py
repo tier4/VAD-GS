@@ -1,5 +1,6 @@
 import os
 import torch
+from torch.cuda.amp import autocast, GradScaler
 import patchmatch_cuda
 
 from random import randint
@@ -139,6 +140,10 @@ def training():
     save_cfg(cfg, cfg.model_path, epoch=start_iter)
 
     gaussians_renderer = StreetGaussianRenderer()
+
+    use_amp = optim_args.use_amp
+    scaler = GradScaler(enabled=use_amp)
+    print(f'AMP (Automatic Mixed Precision): {"ON" if use_amp else "OFF"}')
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -828,113 +833,117 @@ def training():
 
         if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end:
             loss_hard = 0
-            hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
-            hard_depth = hard_render_pkg["depth"]
+            with autocast(enabled=use_amp):
+                hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
+                hard_depth = hard_render_pkg["depth"]
 
-            patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
-            mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
-            hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
+                patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
+                mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
+                hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
 
-            loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
-            loss_hard += 1 * loss_l2_dpt
+                loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
+                loss_hard += 1 * loss_l2_dpt
 
-            loss_global = patch_norm_mse_loss_global(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
-            loss_hard += 1 * loss_global
+                loss_global = patch_norm_mse_loss_global(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
+                loss_hard += 1 * loss_global
 
-            loss_hard.backward()
+            scaler.scale(loss_hard).backward()
             # Optimizer step
             if iteration < training_args.iterations:
-                gaussians.update_optimizer()
+                gaussians.update_optimizer(scaler=scaler if use_amp else None)
+                if use_amp:
+                    scaler.update()
             del hard_render_pkg, hard_depth, loss_hard, loss_l2_dpt, loss_global
             torch.cuda.empty_cache()
 
-        soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
-        image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
+        with autocast(enabled=use_amp):
+            soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
+            image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
 
-        scalar_dict = dict()
-        
-        # rgb loss
-        Ll1 = l1_loss(image, gt_image, mask=loss_mask)
-        scalar_dict['l1_loss'] = Ll1.item()
-        loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
+            scalar_dict = dict()
 
-        # shape_pena = (gaussians.get_scaling.max(dim=1).values / gaussians.get_scaling.min(dim=1).values).mean()
-        # scale_pena = ((gaussians.get_scaling.max(dim=1, keepdim=True).values)**2).mean()
-        # loss_reg = optim_args.lambda_shape_pena*shape_pena + optim_args.lambda_scale_pena*scale_pena
-        # loss += loss_reg
+            # rgb loss
+            Ll1 = l1_loss(image, gt_image, mask=loss_mask)
+            scalar_dict['l1_loss'] = Ll1.item()
+            loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
 
-
-        # sky loss
-        if optim_args.lambda_sky > 0 and gaussians.include_sky and sky_mask is not None:
-            acc = torch.clamp(acc, min=1e-6, max=1.-1e-6)
-            sky_loss = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc)).mean()
-            if len(optim_args.lambda_sky_scale) > 0:
-                sky_loss *= optim_args.lambda_sky_scale[viewpoint_cam.meta['cam']]
-            scalar_dict['sky_loss'] = sky_loss.item()
-            loss += optim_args.lambda_sky * sky_loss
-        
-        if optim_args.lambda_reg > 0 and gaussians.include_obj and iteration >= optim_args.densify_until_iter:
-            render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=False)
-            image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
-            del render_pkg_obj
-            acc_obj = torch.clamp(acc_obj, min=1e-6, max=1.-1e-6)
-            obj_acc_loss = torch.where(torch.any(dynamic_mask != 255, axis=0), # obj_bound,
-                -(acc_obj * torch.log(acc_obj) +  (1. - acc_obj) * torch.log(1. - acc_obj)),
-                -torch.log(1. - acc_obj)).mean()
-            scalar_dict['obj_acc_loss'] = obj_acc_loss.item()
-            loss += optim_args.lambda_reg * obj_acc_loss
-            del image_obj, acc_obj
+            # shape_pena = (gaussians.get_scaling.max(dim=1).values / gaussians.get_scaling.min(dim=1).values).mean()
+            # scale_pena = ((gaussians.get_scaling.max(dim=1, keepdim=True).values)**2).mean()
+            # loss_reg = optim_args.lambda_shape_pena*shape_pena + optim_args.lambda_scale_pena*scale_pena
+            # loss += loss_reg
 
 
+            # sky loss
+            if optim_args.lambda_sky > 0 and gaussians.include_sky and sky_mask is not None:
+                acc = torch.clamp(acc, min=1e-6, max=1.-1e-6)
+                sky_loss = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc)).mean()
+                if len(optim_args.lambda_sky_scale) > 0:
+                    sky_loss *= optim_args.lambda_sky_scale[viewpoint_cam.meta['cam']]
+                scalar_dict['sky_loss'] = sky_loss.item()
+                loss += optim_args.lambda_sky * sky_loss
 
-        # lidar depth loss
-        if optim_args.lambda_depth_lidar > 0: 
-            if optim_args.use_lidar_depth and lidar_depth is not None:           
-                depth_mask = torch.logical_and((lidar_depth > 0.), loss_mask)
-                expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)  
-                depth_error = torch.abs((expected_depth[depth_mask] - lidar_depth[depth_mask]))
-                depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
-                lidar_depth_loss = depth_error.mean()
-                scalar_dict['lidar_depth_loss'] = lidar_depth_loss
-                loss += optim_args.lambda_depth_lidar * lidar_depth_loss
-
-            if optim_args.use_voxel_depth:
-                depth_mask = torch.logical_and((voxel_depth_tensor > 0.), loss_mask)
-                expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)  
-                depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
-                depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
-                voxel_depth_loss = depth_error.mean()
-                scalar_dict['lidar_depth_loss'] = voxel_depth_loss
-                loss += optim_args.lambda_depth_lidar * voxel_depth_loss
+            if optim_args.lambda_reg > 0 and gaussians.include_obj and iteration >= optim_args.densify_until_iter:
+                render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=False)
+                image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
+                del render_pkg_obj
+                acc_obj = torch.clamp(acc_obj, min=1e-6, max=1.-1e-6)
+                obj_acc_loss = torch.where(torch.any(dynamic_mask != 255, axis=0), # obj_bound,
+                    -(acc_obj * torch.log(acc_obj) +  (1. - acc_obj) * torch.log(1. - acc_obj)),
+                    -torch.log(1. - acc_obj)).mean()
+                scalar_dict['obj_acc_loss'] = obj_acc_loss.item()
+                loss += optim_args.lambda_reg * obj_acc_loss
+                del image_obj, acc_obj
 
 
-        # color correction loss
-        if optim_args.lambda_color_correction > 0 and gaussians.use_color_correction:
-            color_correction_reg_loss = gaussians.color_correction.regularization_loss(viewpoint_cam)
-            scalar_dict['color_correction_reg_loss'] = color_correction_reg_loss.item()
-            loss += optim_args.lambda_color_correction * color_correction_reg_loss
 
-        if optim_args.normal_loss:
-            if mono_normal is not None:
-                rendered_normal = soft_render_pkg['normals'] 
-                normal_gt = mono_normal # 
-                if sky_mask is not None: # if viewpoint_cam.sky_mask is not None:
-                    filter_mask = sky_mask.to(normal_gt.device).to(torch.bool)
-                    normal_gt[(filter_mask.repeat(3, 1, 1))] = -10
-                    
-                filter_mask = (normal_gt != -10)[0, :, :].to(torch.bool)
-                l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
-                cos_normal = (1. - torch.sum(rendered_normal * normal_gt, dim = 0))[filter_mask].mean()
+            # lidar depth loss
+            if optim_args.lambda_depth_lidar > 0:
+                if optim_args.use_lidar_depth and lidar_depth is not None:
+                    depth_mask = torch.logical_and((lidar_depth > 0.), loss_mask)
+                    expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)
+                    depth_error = torch.abs((expected_depth[depth_mask] - lidar_depth[depth_mask]))
+                    depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
+                    lidar_depth_loss = depth_error.mean()
+                    scalar_dict['lidar_depth_loss'] = lidar_depth_loss
+                    loss += optim_args.lambda_depth_lidar * lidar_depth_loss
 
-                lambda_l1_normal = 0.02
-                lambda_cos_normal = 0.02
-                loss += lambda_l1_normal * l1_normal + lambda_cos_normal * cos_normal
+                if optim_args.use_voxel_depth:
+                    depth_mask = torch.logical_and((voxel_depth_tensor > 0.), loss_mask)
+                    expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)
+                    depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
+                    depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
+                    voxel_depth_loss = depth_error.mean()
+                    scalar_dict['lidar_depth_loss'] = voxel_depth_loss
+                    loss += optim_args.lambda_depth_lidar * voxel_depth_loss
 
-                viewpoint_cam.guidance['mono_normal'] = mono_normal.cpu()
+
+            # color correction loss
+            if optim_args.lambda_color_correction > 0 and gaussians.use_color_correction:
+                color_correction_reg_loss = gaussians.color_correction.regularization_loss(viewpoint_cam)
+                scalar_dict['color_correction_reg_loss'] = color_correction_reg_loss.item()
+                loss += optim_args.lambda_color_correction * color_correction_reg_loss
+
+            if optim_args.normal_loss:
+                if mono_normal is not None:
+                    rendered_normal = soft_render_pkg['normals']
+                    normal_gt = mono_normal #
+                    if sky_mask is not None: # if viewpoint_cam.sky_mask is not None:
+                        filter_mask = sky_mask.to(normal_gt.device).to(torch.bool)
+                        normal_gt[(filter_mask.repeat(3, 1, 1))] = -10
+
+                    filter_mask = (normal_gt != -10)[0, :, :].to(torch.bool)
+                    l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
+                    cos_normal = (1. - torch.sum(rendered_normal * normal_gt, dim = 0))[filter_mask].mean()
+
+                    lambda_l1_normal = 0.02
+                    lambda_cos_normal = 0.02
+                    loss += lambda_l1_normal * l1_normal + lambda_cos_normal * cos_normal
+
+                    viewpoint_cam.guidance['mono_normal'] = mono_normal.cpu()
 
         scalar_dict['loss'] = loss.item()
-        
-        loss.backward()
+
+        scaler.scale(loss).backward()
         
         iter_end.record()
                 
@@ -1021,7 +1030,9 @@ def training():
 
             # Optimizer step
             if iteration < training_args.iterations:
-                gaussians.update_optimizer()
+                gaussians.update_optimizer(scaler=scaler if use_amp else None)
+                if use_amp:
+                    scaler.update()
 
             if (iteration in training_args.checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

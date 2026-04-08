@@ -70,8 +70,11 @@ class SkyCubeMap(nn.Module):
                 lr = self.sky_cube_map_scheduler_args(iteration)
                 param_group['lr'] = lr
     
-    def update_optimizer(self):
-        self.optimizer.step()
+    def update_optimizer(self, scaler=None):
+        if scaler is not None:
+            scaler.step(self.optimizer)
+        else:
+            self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 
     def forward(self, camera: Camera, acc=None):

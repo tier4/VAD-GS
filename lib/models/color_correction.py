@@ -94,10 +94,13 @@ class ColorCorrection(nn.Module):
             lr = self.color_correction_scheduler_args(iteration)
             param_group['lr'] = lr
     
-    def update_optimizer(self):
-        self.optimizer.step()       
+    def update_optimizer(self, scaler=None):
+        if scaler is not None:
+            scaler.step(self.optimizer)
+        else:
+            self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=None)
-        
+
     def get_id(self, camera: Camera):
         if self.mode == 'image':
             return camera.id

@@ -332,8 +332,11 @@ class GaussianModel(nn.Module):
         self.scalar_dict = dict()
         self.tensor_dict = dict()  
         
-    def update_optimizer(self):
-        self.optimizer.step()
+    def update_optimizer(self, scaler=None):
+        if scaler is not None:
+            scaler.step(self.optimizer)
+        else:
+            self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 
     def update_learning_rate(self, iteration):

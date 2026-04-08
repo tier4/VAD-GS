@@ -45,6 +45,7 @@ cfg.train.start_checkpoint = None
 cfg.train.importance_sampling = False
 
 cfg.optim = CN()
+cfg.optim.use_amp = False # If set to True, use Automatic Mixed Precision (AMP) for training.
 # learning rate
 cfg.optim.position_lr_init = 0.00016 # position_lr_init_{bkgd, obj ...}, similar to the following
 cfg.optim.position_lr_final = 0.0000016

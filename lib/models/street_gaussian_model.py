@@ -530,24 +530,24 @@ class StreetGaussianModel(nn.Module):
         if self.pose_correction is not None:
             self.pose_correction.update_learning_rate(iteration)
     
-    def update_optimizer(self, exclude_list=[]):
+    def update_optimizer(self, exclude_list=[], scaler=None):
         for model_name in self.model_name_id.keys():
             if startswith_any(model_name, exclude_list):
                 continue
             model: GaussianModel = getattr(self, model_name)
-            model.update_optimizer()
+            model.update_optimizer(scaler=scaler)
 
         if self.actor_pose is not None:
-            self.actor_pose.update_optimizer()
-        
+            self.actor_pose.update_optimizer(scaler=scaler)
+
         if self.sky_cubemap is not None:
-            self.sky_cubemap.update_optimizer()
-            
+            self.sky_cubemap.update_optimizer(scaler=scaler)
+
         if self.color_correction is not None:
-            self.color_correction.update_optimizer()
-            
+            self.color_correction.update_optimizer(scaler=scaler)
+
         if self.pose_correction is not None:
-            self.pose_correction.update_optimizer()
+            self.pose_correction.update_optimizer(scaler=scaler)
 
     def set_max_radii2D(self, radii, visibility_filter):
         radii = radii.float()
