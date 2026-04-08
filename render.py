@@ -4,6 +4,7 @@ import json
 import collections
 from tqdm import tqdm
 import numpy as np
+import cv2
 import imageio
 from lib.models.street_gaussian_model import StreetGaussianModel
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer
@@ -153,13 +154,138 @@ def render_trajectory():
 
         visualizer.summarize()
             
+def render_background_gt():
+    """Render only background Gaussians along the GT trajectory.
+
+    Uses train + test cameras sorted by id (the full GT trajectory) and
+    renders only the background Gaussian model (no foreground objects).
+    Sky blending is applied when the sky model is available.
+    Per-camera MP4 videos are saved.
+    """
+    cfg.render.save_image = False
+    cfg.render.save_video = False
+
+    fps = cfg.render.get('fps', 24)
+
+    with torch.no_grad():
+        dataset = Dataset()
+        gaussians = StreetGaussianModel(dataset.scene_info.metadata)
+        scene = Scene(gaussians=gaussians, dataset=dataset)
+        renderer = StreetGaussianRenderer()
+
+        train_cameras = scene.getTrainCameras()
+        test_cameras = scene.getTestCameras()
+        cameras = train_cameras + test_cameras
+        cameras = sorted(cameras, key=lambda x: x.id)
+
+        cam_frames = collections.defaultdict(list)
+
+        for idx, camera in enumerate(tqdm(cameras, desc="Rendering Background GT")):
+            # Render background only
+            result_bkgd = renderer.render_background(camera, gaussians)
+            rgb = result_bkgd['rgb']
+
+            # Blend sky if available
+            if gaussians.include_sky:
+                sky_color = gaussians.sky_cubemap(camera, result_bkgd['acc'].detach())
+                rgb = rgb + sky_color * (1 - result_bkgd['acc'])
+
+            rgb = torch.clamp(rgb, 0.0, 1.0)
+
+            rgb_np = (rgb.detach().cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+            cam_id = camera.meta['cam']
+            cam_frames[cam_id].append(rgb_np)
+
+        save_dir = os.path.join(cfg.model_path, 'background_gt',
+                                f"ours_{scene.loaded_iter}")
+        _save_per_camera_videos(cam_frames, save_dir, fps)
+
+
+def render_lateral_shift():
+    """Render front camera shifted laterally from GT trajectory.
+
+    Shifts the front camera (cam==0) along its local right axis in 2 m
+    increments from -6 m to +6 m.  Positive values move the camera to the
+    RIGHT when viewed from the GT pose.  The seven views are concatenated
+    horizontally in the order [+6, +4, +2, 0, -2, -4, -6] m and written
+    as a single MP4 video.
+    """
+    cfg.render.save_image = False
+    cfg.render.save_video = False
+
+    fps = cfg.render.get('fps', 24)
+    shifts = [6, 4, 2, 0, -2, -4, -6]  # metres; positive = right
+
+    with torch.no_grad():
+        dataset = Dataset()
+        gaussians = StreetGaussianModel(dataset.scene_info.metadata)
+        scene = Scene(gaussians=gaussians, dataset=dataset)
+        renderer = StreetGaussianRenderer()
+
+        # Collect front cameras from both train and test splits, sorted by id
+        train_cameras = scene.getTrainCameras()
+        test_cameras = scene.getTestCameras()
+        cameras = train_cameras + test_cameras
+        cameras = sorted(cameras, key=lambda x: x.id)
+        front_cameras = [c for c in cameras if c.meta['cam'] == 0]
+
+        frames = []
+        for camera in tqdm(front_cameras, desc="Rendering lateral shifts"):
+            c2w_orig = camera.get_extrinsic()          # 4x4 numpy
+            right_dir = c2w_orig[:3, 0]                 # camera local x-axis (right)
+
+            shift_images = []
+            for shift in shifts:
+                # --- shift camera along its right axis ---
+                c2w_shifted = c2w_orig.copy()
+                c2w_shifted[:3, 3] += shift * right_dir
+                camera.set_extrinsic(c2w_shifted)
+
+                result = renderer.render(camera, gaussians)
+                rgb = result['rgb']                     # [3, H, W]
+                rgb_np = np.ascontiguousarray(
+                    (torch.clamp(rgb, 0, 1)
+                     .detach().cpu().numpy()
+                     .transpose(1, 2, 0) * 255).astype(np.uint8))
+
+                # Draw label (white text with black outline for readability)
+                label = f"{shift:+d}m" if shift != 0 else "0m (GT)"
+                cv2.putText(rgb_np, label, (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                            (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(rgb_np, label, (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+
+                shift_images.append(rgb_np)
+
+            # Restore original pose
+            camera.set_extrinsic(c2w_orig)
+
+            # Concatenate the 7 views horizontally: +6 | +4 | +2 | 0 | -2 | -4 | -6
+            frame = np.concatenate(shift_images, axis=1)
+            frames.append(frame)
+
+        # Save video
+        save_dir = os.path.join(cfg.model_path, 'lateral_shift',
+                                f"ours_{scene.loaded_iter}")
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, 'lateral_shift_front.mp4')
+        imageio.mimwrite(out_path, frames, fps=fps)
+        print(f"Saved {out_path} ({len(frames)} frames)")
+
+
 if __name__ == "__main__":
     print("Rendering " + cfg.model_path)
     safe_state(cfg.eval.quiet)
-    
+
     if cfg.mode == 'evaluate':
         render_sets()
     elif cfg.mode == 'trajectory':
         render_trajectory()
+    elif cfg.mode == 'lateral_shift':
+        render_lateral_shift()
+    elif cfg.mode == 'background_gt':
+        render_background_gt()
     else:
         raise NotImplementedError()
