@@ -23,7 +23,8 @@ class Scene:
             print("Creating gaussian model from point cloud")
             # self.gaussians.create_from_pcd(point_cloud, scene_raidus, len(self.dataset.train_cameras[1]) + len(self.dataset.test_cameras[1]))
             self.gaussians.create_from_pcd(point_cloud, scene_raidus, np.array([c.id for c in self.dataset.train_cameras[1]]))
-            
+            del point_cloud
+
             if cfg.get('to_cuda', False):
                 print('Moving training cameras to GPU')
                 for camera in self.getTrainCameras():

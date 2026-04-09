@@ -139,9 +139,10 @@ def readT4Info(path, images="images", split_train=-1, split_test=-1, **kwargs):
         pose = poses[i]
         image_path = image_filenames[i]
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
-
-        width, height = image.size
+        # Get dimensions from header only; defer pixel loading to loadCam
+        with Image.open(image_path) as img:
+            width, height = img.size
+        image = None
         fx, fy = ixt[0, 0], ixt[1, 1]
         FovY = focal2fov(fx, height)
         FovX = focal2fov(fy, width)
@@ -168,66 +169,46 @@ def readT4Info(path, images="images", split_train=-1, split_test=-1, **kwargs):
 
         guidance = dict()
 
-        # Load dynamic mask
+        # Store paths for deferred loading (loaded in loadguidance)
         if load_dynamic_mask:
             dynamic_mask_path = os.path.join(dynamic_mask_dir, f"{image_name}.png")
             if os.path.exists(dynamic_mask_path):
-                dynamic_mask = cv2.imread(dynamic_mask_path)
-                guidance["dynamic_mask"] = dynamic_mask
+                guidance["dynamic_mask"] = dynamic_mask_path
 
                 seg_bkgd_mask_path = os.path.join(bkgd_mask_dir, f"{image_name}.png")
                 if os.path.exists(seg_bkgd_mask_path):
-                    seg_bkgd_mask = cv2.imread(seg_bkgd_mask_path)
-                    guidance["seg_bkgd"] = seg_bkgd_mask
+                    guidance["seg_bkgd"] = seg_bkgd_mask_path
 
-                guidance["obj_bound"] = Image.fromarray(obj_bounds[i])
+                # Save obj_bound to disk to avoid ~700MB of PIL Images in RAM
+                obj_bound_dir = os.path.join(cfg.model_path, "obj_bounds")
+                os.makedirs(obj_bound_dir, exist_ok=True)
+                obj_bound_path = os.path.join(obj_bound_dir, f"{image_name}.png")
+                if not os.path.exists(obj_bound_path):
+                    cv2.imwrite(obj_bound_path, obj_bounds[i].astype(np.uint8) * 255)
+                guidance["obj_bound"] = obj_bound_path
 
-        # Load lidar depth
         if load_lidar_depth:
             depth_path = os.path.join(lidar_depth_dir, f"{image_name}.npy")
             if os.path.exists(depth_path):
-                depth = np.load(depth_path, allow_pickle=True)
-                depth = dict(depth.item())
-                mask = depth["mask"]
-                value = depth["value"]
-                depth_arr = np.zeros_like(mask).astype(np.float32)
-                depth_arr[mask] = value
-                guidance["lidar_depth"] = depth_arr
+                guidance["lidar_depth"] = depth_path
 
-        # Load sky mask
         if load_sky_mask:
             sky_mask_path = os.path.join(sky_mask_dir, f"{image_name}.png")
             if os.path.exists(sky_mask_path):
-                sky_mask = (cv2.imread(sky_mask_path)[..., 0]) > 0.0
-                guidance["sky_mask"] = Image.fromarray(sky_mask)
+                guidance["sky_mask"] = sky_mask_path
 
-        # Load mono depth (prefer .npz from Depth Anything V2, fallback to .png)
         if load_mono_depth:
             depth_npz_path = os.path.join(mono_depth_dir, f"{image_name}.npz")
             depth_png_path = os.path.join(mono_depth_dir, f"{image_name}.png")
             if os.path.exists(depth_npz_path):
-                mono_depth_raw = np.load(depth_npz_path)["depth"]
-                # Normalize to [0, 255] uint8 for PIL (higher value = farther)
-                d_min, d_max = mono_depth_raw.min(), mono_depth_raw.max()
-                if d_max - d_min > 1e-6:
-                    mono_depth = ((mono_depth_raw - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-                else:
-                    mono_depth = np.zeros_like(mono_depth_raw, dtype=np.uint8)
-                guidance["mono_depth"] = Image.fromarray(mono_depth)
+                guidance["mono_depth"] = depth_npz_path
             elif os.path.exists(depth_png_path):
-                mono_depth = 255 - cv2.imread(depth_png_path)[:, :, 0]
-                guidance["mono_depth"] = Image.fromarray(mono_depth)
+                guidance["mono_depth"] = depth_png_path
 
-        # Load normal map
         if load_normal:
             normal_img_path = os.path.join(normal_dir, f"{image_name}.png")
             if os.path.exists(normal_img_path):
-                tmp = cv2.imread(normal_img_path) / 255.0 * 2 - 1
-                ref_norm = np.zeros(tmp.shape)
-                ref_norm[:, :, 0] = -tmp[:, :, 2]
-                ref_norm[:, :, 1] = -tmp[:, :, 1]
-                ref_norm[:, :, 2] = -tmp[:, :, 0]
-                guidance["mono_normal"] = ref_norm
+                guidance["mono_normal"] = normal_img_path
 
         cam_info = CameraInfo(
             uid=i, R=R, T=T, FovY=FovY, FovX=FovX, K=K,

@@ -57,7 +57,9 @@ class GrapeTrellis:
             "root_points_xyz": self.root_table.points_xyz,
             "root_points_color": self.root_table.points_color,
             "root_points_normal": self.root_table.points_normal,
-            "root_points_visibility": self.root_table.points_visibility,
+            # Save packed visibility (8x smaller) with n_views for unpacking
+            "root_visibility_packed": self.root_table._visibility_packed,
+            "root_n_views": self.root_table._n_views,
             "root_hash_voxel_id": self.root_table.hash_voxel_id,
 
             "vine_valid_cnt": self.vine_table.valid_cnt,
@@ -70,19 +72,24 @@ class GrapeTrellis:
             "vine_hash_voxel_table_id": self.vine_table.hash_voxel_table_id,
         }
         np.savez(path, **data)
-        
+
 
     def load(self, path):
         data = np.load(path, allow_pickle=True)
         self.root_table.points_xyz = data["root_points_xyz"]
         self.root_table.points_color = data["root_points_color"]
         self.root_table.points_normal = data["root_points_normal"]
-        self.root_table.points_visibility = data["root_points_visibility"]
+        # Load packed visibility (new format) or unpack from legacy format
+        if "root_visibility_packed" in data:
+            self.root_table._visibility_packed = data["root_visibility_packed"]
+            self.root_table._n_views = int(data["root_n_views"])
+        else:
+            # Backward compat: old saves stored unpacked bool array
+            self.root_table.points_visibility = data["root_points_visibility"]
         self.root_table.hash_voxel_id = data["root_hash_voxel_id"].item()
         self.root_table.voxel_size = data["voxel_size"].item()
         self.root_table.min_bound = data["min_bound"]
         self.root_table.max_bound = data["max_bound"]
-
 
         self.vine_table.valid_cnt = data["vine_valid_cnt"].item()
         self.vine_table.points_xyz = data["vine_points_xyz"]
@@ -128,6 +135,27 @@ class GrapeTrellis:
         vine_vis = self.vine_table.get_visibility()
         return np.concatenate([root_vis, vine_vis], axis=0)
 
+    def get_visibility_column(self, view_id):
+        """Get visibility for a single view without unpacking the full matrix."""
+        root_col = self.root_table.vis_column(view_id)
+        vine_col = self.vine_table.points_visibility[:self.vine_table.valid_cnt, view_id]
+        return np.concatenate([root_col, vine_col], axis=0)
+
+    def get_visibility_rows(self, row_mask):
+        """Get visibility for selected rows only."""
+        n_root = self.root_table.points_xyz.shape[0]
+        root_mask = row_mask[:n_root]
+        vine_mask = row_mask[n_root:]
+        root_rows = self.root_table.vis_rows(root_mask)
+        vine_rows = self.vine_table.points_visibility[:self.vine_table.valid_cnt][vine_mask]
+        return np.concatenate([root_rows, vine_rows], axis=0)
+
+    def get_view_has_voxels(self):
+        """Return bool array [N_views] indicating which views have any visible voxels."""
+        root_any = self.root_table.vis_any_per_view()
+        vine_any = self.vine_table.points_visibility[:self.vine_table.valid_cnt].any(axis=0) if self.vine_table.valid_cnt > 0 else np.zeros(self.N_views, dtype=bool)
+        return root_any | vine_any
+
     def get_normal(self):
         root_normal = self.root_table.points_normal
         vine_normal = self.vine_table.get_normal()
@@ -136,11 +164,9 @@ class GrapeTrellis:
         return anchor_normal
 
     def get_voxel_visibility_from_xyz(self, x, y, z):
-        # key = self.hashcode(x,y,z)
-
         vid = self.root_table.get_voxel_id_from_point(x, y, z)
         if vid is not None:
-            return self.root_table.points_visibility[vid]
+            return np.unpackbits(self.root_table._visibility_packed[vid])[:self.root_table._n_views].astype(bool)
 
         voxel_name = self.vine_table.hashcode_voxel(x, y, z)
         if voxel_name in self.vine_table.hash_voxel_table_id:
@@ -179,8 +205,19 @@ class GrapeTrellis:
 
     def render_voxel_depth(self, current_view, img_H, img_W, obj_rots=None, obj_trans=None):
         actor_positions = self.get_voxel_center_xyz()
-        actor_colors = self.get_voxel_color()
-        actor_view_mask = self.get_visibility()[:, current_view]
+        actor_view_mask = self.get_visibility_column(current_view)
+        n_total = actor_positions.shape[0]
+
+        # Pre-filter by visibility to reduce memory of corner expansion
+        prefilter_idx = np.where(actor_view_mask)[0]
+        if len(prefilter_idx) == 0:
+            mask_visible = np.zeros(n_total, dtype=bool)
+            corners_2d_all = np.zeros((n_total, 2), dtype=np.int32)
+            voxel_depth_value = np.zeros((img_H, img_W), dtype=np.float32)
+            voxel_depth_source = np.zeros((img_H, img_W), dtype=np.int32)
+            return voxel_depth_value, voxel_depth_source, mask_visible, corners_2d_all
+
+        positions_sub = actor_positions[prefilter_idx]
 
         # track_id = obj_model.track_id
         # obj_rot = gaussians.actor_pose.get_tracking_rotation(track_id, viewpoint_cam)
@@ -191,12 +228,12 @@ class GrapeTrellis:
         # obj_rots = quaternion_to_matrix(obj_rot)
         # obj_trans = ego_pose[:3, :3] @ obj_trans + ego_pose[:3, 3]
         if obj_rots is not None and obj_trans is not None:
-            xyzs_obj = torch.einsum('bij, bj -> bi', obj_rots, torch.from_numpy(actor_positions).cuda()) + obj_trans
+            xyzs_obj = torch.einsum('bij, bj -> bi', obj_rots, torch.from_numpy(positions_sub).cuda()) + obj_trans
             xyzs_obj = xyzs_obj.cpu().detach().numpy()
         else:
-            xyzs_obj = actor_positions
+            xyzs_obj = positions_sub
 
-        # view_pos_world_voxel_corners = bkgd_positions[mask_root, None, :].repeat(8,1) + self.ctr2corners
+        # Compute corners only for pre-filtered voxels (saves ~300MB for large point clouds)
         view_pos_world_voxel_corners = xyzs_obj[:, None, :].repeat(8,1) + self.ctr2corners
         view_pos_world_voxel_corners = np.concatenate([view_pos_world_voxel_corners, np.ones_like(view_pos_world_voxel_corners[..., :1])], axis=-1)
         view_pos_cam = view_pos_world_voxel_corners @ np.linalg.inv(self.c2ws[current_view]).T
@@ -212,17 +249,23 @@ class GrapeTrellis:
         corners_2d = tmp[..., :2] / tmp[..., 2:]
         corners_2d = np.round(corners_2d).astype(int)
 
-        # 判断条件是否足够？如边界等
-        mask_visible = np.logical_and(corners_2d[:,0,0] >= 0, corners_2d[:,0,0] < img_W)
-        mask_visible = np.logical_and(mask_visible, corners_2d[:,0,1] >= 0)
-        mask_visible = np.logical_and(mask_visible, corners_2d[:,0,1] < img_H)
-        mask_visible = np.logical_and(mask_visible, tmp[:,0,2] > 0.2333)
-        mask_visible = np.logical_and(mask_visible, actor_view_mask) # 遮挡关系. zyk: nuscenes过于稀疏，先这样尝试，后续按visibility应当删除
+        # Frustum check on pre-filtered subset
+        sub_visible = np.logical_and(corners_2d[:,0,0] >= 0, corners_2d[:,0,0] < img_W)
+        sub_visible = np.logical_and(sub_visible, corners_2d[:,0,1] >= 0)
+        sub_visible = np.logical_and(sub_visible, corners_2d[:,0,1] < img_H)
+        sub_visible = np.logical_and(sub_visible, tmp[:,0,2] > 0.2333)
 
-        # corners_2d = np.round(corners_2d[mask_visible]).astype(int)
-        voxel_depth_value, voxel_depth_source = parallel_rasterize(corners_2d[mask_visible], tmp[mask_visible,0,2], img_H, img_W)
+        # Map back to full-size mask
+        mask_visible = np.zeros(n_total, dtype=bool)
+        mask_visible[prefilter_idx[sub_visible]] = True
+
+        # Build 2D coords for all voxels (needed by callers)
+        corners_2d_all = np.zeros((n_total, 2), dtype=np.int32)
+        corners_2d_all[prefilter_idx] = corners_2d[:, 0, :2]
+
+        voxel_depth_value, voxel_depth_source = parallel_rasterize(corners_2d[sub_visible], tmp[sub_visible,0,2], img_H, img_W)
         voxel_depth_value[voxel_depth_value==np.inf] = 0
-        return voxel_depth_value, voxel_depth_source, mask_visible, corners_2d[:, 0, :2] # actor_positions[mask_visible], actor_colors[mask_visible]
+        return voxel_depth_value, voxel_depth_source, mask_visible, corners_2d_all
 
 
 
@@ -309,7 +352,7 @@ class GrapeTrellis:
         #     x,y,z = rootvine_xyz[i]
         #     vibility = self.get_voxel_visibility_from_xyz(x,y,z)
         #     vine_visibility.append(vibility)
-        vine_visibility = self.get_visibility()[mask_visible] # bkgd或obj所有voxel中被观测到的部分
+        vine_visibility = self.get_visibility_rows(mask_visible) # bkgd或obj所有voxel中被观测到的部分
 
         obs_per_voxel = vine_visibility.sum(1) # 每个voxel 被观测到的视角数，用于找到被多个视角共同观测的锚点
         # thres = max(obs_per_voxel.mean(), 5) # Waymo
@@ -645,23 +688,53 @@ class RootTable: # 对于root，每个voxel有且仅有一个点。不需要额�
         valid_i = 0
         for i in range(points_xyz.shape[0]):
             key = self.hashcode(points_xyz[i,0], points_xyz[i,1], points_xyz[i,2])
-            
+
             if key in self.hash_voxel_id:
-                # 可能存在一些隐患。在处理duplicates时，可以忽略xyz/color，但是visibility不应忽略，需要累加
                 continue
 
             self.hash_voxel_id[key] = valid_i
-            valid_i += 1            
+            valid_i += 1
             keep_idx.append(i)
         keep_idx = np.array(keep_idx)
-        
-        self.points_xyz = points_xyz[keep_idx]
 
+        self.points_xyz = points_xyz[keep_idx]
         self.points_color = points_color[keep_idx]
         self.points_normal = points_normal[keep_idx]
-        
-        self.points_visibility = points_visibility[keep_idx]
-        return self.points_xyz, self.points_color, self.points_normal, self.points_visibility
+
+        # Pack visibility as bits: 8x memory reduction (4GB → 500MB for large datasets)
+        vis = points_visibility[keep_idx]
+        self._n_views = vis.shape[1]
+        self._visibility_packed = np.packbits(vis, axis=1)
+        return self.points_xyz, self.points_color, self.points_normal, vis
+
+    # --- Packed visibility accessors (avoid unpacking the full matrix) ---
+
+    @property
+    def points_visibility(self):
+        """Unpack full visibility matrix. Use only for save/legacy paths, NOT in hot loops."""
+        return np.unpackbits(self._visibility_packed, axis=1)[:, :self._n_views].astype(bool)
+
+    @points_visibility.setter
+    def points_visibility(self, value):
+        """Accept unpacked bool array (e.g. from load) and pack it."""
+        self._n_views = value.shape[1]
+        self._visibility_packed = np.packbits(value.astype(bool), axis=1)
+
+    def vis_column(self, view_id):
+        """Get visibility for a single view. Returns bool array [n_voxels]."""
+        byte_idx = view_id // 8
+        bit_idx = view_id % 8
+        return ((self._visibility_packed[:, byte_idx] >> (7 - bit_idx)) & 1).astype(bool)
+
+    def vis_rows(self, row_mask):
+        """Get unpacked visibility for selected rows only."""
+        packed_rows = self._visibility_packed[row_mask]
+        return np.unpackbits(packed_rows, axis=1)[:, :self._n_views].astype(bool)
+
+    def vis_any_per_view(self):
+        """Return bool[n_views]: True if any voxel is visible in that view."""
+        or_all = np.bitwise_or.reduce(self._visibility_packed, axis=0)
+        return np.unpackbits(or_all)[:self._n_views].astype(bool)
         
     def get_voxel_id_from_point(self, x, y, z):
         key = self.hashcode(x,y,z)

@@ -11,7 +11,7 @@ data:
   white_background: false
   split_test: 4
   split_train: -1
-  selected_frames: [0, 40]
+  selected_frames: null
 
   # T4-specific settings
   scene_index: 0                 # Index of the scene to load from scene.json

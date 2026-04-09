@@ -278,9 +278,9 @@ class StreetGaussianModel(nn.Module):
                 for obj_name in self.graph_obj_list:
                     obj_model: GaussianModelActor = getattr(self, obj_name)
                     if obj_model.deformable or self.flip_prob == 0:
-                        flip_mask = torch.zeros_like(obj_model.get_xyz[:, 0]).bool()
+                        flip_mask = torch.zeros(obj_model.get_xyz.shape[0], dtype=torch.bool, device=obj_model.get_xyz.device)
                     else:
-                        flip_mask = torch.rand_like(obj_model.get_xyz[:, 0]) < self.flip_prob
+                        flip_mask = torch.rand(obj_model.get_xyz.shape[0], device=obj_model.get_xyz.device) < self.flip_prob
                     self.flip_mask.append(flip_mask)
                 self.flip_mask = torch.cat(self.flip_mask, dim=0)
             

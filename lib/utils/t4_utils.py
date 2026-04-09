@@ -830,8 +830,13 @@ def _build_pointcloud_t4(
         from script.t4.colmap_t4 import run_colmap_t4
         run_colmap_t4(result, extrinsics_list=extrinsics)
 
-    print("Building point cloud from T4 LiDAR data...")
     pointcloud_dir = os.path.join(cfg.model_path, "input_ply")
+    bkgd_ply = os.path.join(pointcloud_dir, "points3D_bkgd.ply")
+    if os.path.exists(bkgd_ply):
+        print(f"Point cloud cache found at {pointcloud_dir}, skipping rebuild.")
+        return
+
+    print("Building point cloud from T4 LiDAR data...")
     os.makedirs(pointcloud_dir, exist_ok=True)
 
     points_xyz_dict = {"bkgd": []}
@@ -871,7 +876,9 @@ def _build_pointcloud_t4(
     cams_list = result["cams"]
     N_VIEWS = num_frames * num_cameras
 
-    normals_world_all = []
+    # Store only metadata for normal images (not full images) to save memory.
+    # Each entry: (normal_filename_or_None, c2w_rotation_3x3)
+    normals_world_info = []
 
     # Process each frame
     for i, frame in tqdm(enumerate(range(start_frame, end_frame + 1)), desc="Building point cloud"):
@@ -926,7 +933,7 @@ def _build_pointcloud_t4(
         points_visibility = np.zeros([points_xyz_vehicle.shape[0], N_VIEWS], dtype=bool)
 
         for cam, image_filename, idx in zip(cams_frame, image_filenames_frame, idxs):
-            image = cv2.imread(image_filename)[..., [2, 1, 0]] / 255.0
+            image = cv2.imread(image_filename)[..., [2, 1, 0]].astype(np.float32) / 255.0
 
             if has_normals:
                 normal_filename = image_filename.replace("images", "normal_img")
@@ -937,7 +944,7 @@ def _build_pointcloud_t4(
                         normal_filename = nf
                         break
                 if os.path.exists(normal_filename):
-                    normal_dsine = cv2.imread(normal_filename) / 255.0 * 2 - 1
+                    normal_dsine = cv2.imread(normal_filename).astype(np.float32) / 255.0 * 2 - 1
                     normals_transformed = np.zeros_like(normal_dsine)
                     normals_transformed[..., 0] = -normal_dsine[..., 2]
                     normals_transformed[..., 1] = -normal_dsine[..., 1]
@@ -950,7 +957,16 @@ def _build_pointcloud_t4(
             ixt = ixts_all[idx]
             c2w = c2ws_all[idx]
             normals_world = normals_transformed @ c2w[:3, :3].T
-            normals_world_all.append(normals_world)
+            # Store metadata instead of full image to save memory
+            _resolved_normal_file = None
+            if has_normals:
+                _nf_candidate = image_filename.replace("images", "normal_img")
+                for ext_try in [".png", ".jpg"]:
+                    _nf = os.path.splitext(_nf_candidate)[0] + ext_try
+                    if os.path.exists(_nf):
+                        _resolved_normal_file = _nf
+                        break
+            normals_world_info.append((_resolved_normal_file, c2w[:3, :3].copy()))
 
             # Project points to this camera
             view_pos_world = np.concatenate(
@@ -1015,12 +1031,11 @@ def _build_pointcloud_t4(
         points_lidar_xyz = points_xyz_world_filtered[~points_xyz_obj_mask][..., :3]
         points_lidar_rgb = points_rgb[~points_xyz_obj_mask]
         points_lidar_normal = points_normal[~points_xyz_obj_mask]
-        points_lidar_visibility = points_visibility[~points_xyz_obj_mask]
 
         points_xyz_dict["bkgd"].append(points_lidar_xyz)
         points_rgb_dict["bkgd"].append(points_lidar_rgb)
         points_normal_dict["bkgd"].append(points_lidar_normal)
-        points_view_dict["bkgd"].append(points_lidar_visibility)
+        # NOTE: background visibility is computed at voxel level after voxelization (saves GBs of memory)
 
     # Voxelize and save
     if not points_xyz_dict["bkgd"]:
@@ -1034,7 +1049,13 @@ def _build_pointcloud_t4(
     points_bkgd_lidar_xyz = np.concatenate(points_xyz_dict["bkgd"], axis=0)
     points_bkgd_lidar_rgb = np.concatenate(points_rgb_dict["bkgd"], axis=0)
     points_bkgd_lidar_normal = np.concatenate(points_normal_dict["bkgd"], axis=0)
-    points_bkgd_lidar_view = np.concatenate(points_view_dict["bkgd"], axis=0)
+
+    # Free background data from dicts immediately after concatenation
+    points_xyz_dict["bkgd"] = []
+    points_rgb_dict["bkgd"] = []
+    points_normal_dict["bkgd"] = []
+    import gc
+    gc.collect()
 
     lidar_sphere_normalization = get_Sphere_Norm(points_bkgd_lidar_xyz)
     sphere_center = lidar_sphere_normalization["center"]
@@ -1053,17 +1074,58 @@ def _build_pointcloud_t4(
         nb_points=10, radius=0.5
     )
 
-    views_for_voxels = []
+    # Compute per-voxel normals by averaging points in each voxel
     normals_for_voxels = []
     for _tmp in downsample_outlier_indice:
         indices = point_indices_for_each_voxel[_tmp]
-        views_voxel = np.zeros([N_VIEWS], dtype=bool)
-        normals_voxel = []
-        for p3d_idx in indices:
-            views_voxel = np.logical_or(views_voxel, points_bkgd_lidar_view[p3d_idx])
-            normals_voxel.append(points_bkgd_lidar_normal[p3d_idx])
-        views_for_voxels.append(views_voxel)
+        normals_voxel = [points_bkgd_lidar_normal[p3d_idx] for p3d_idx in indices]
         normals_for_voxels.append(np.mean(np.array(normals_voxel).reshape(-1, 3), axis=0))
+
+    del points_bkgd_lidar_normal, point_indices_for_each_voxel
+    gc.collect()
+
+    # Compute per-voxel visibility by projecting voxel centers to all cameras
+    # This replaces the expensive per-point visibility tracking (saves GBs of memory)
+    voxel_xyz = np.array(downsample_outlier_pcd.points, dtype=np.float32)
+    num_voxels = voxel_xyz.shape[0]
+    views_for_voxels_arr = np.zeros([num_voxels, N_VIEWS], dtype=bool)
+    pts_h = np.concatenate([voxel_xyz, np.ones((num_voxels, 1), dtype=np.float32)], axis=1)
+    num_total_views = min(N_VIEWS, len(c2ws_all))
+    for idx in range(num_total_views):
+        cam_idx = idx % num_cameras
+        w2c = np.linalg.inv(c2ws_all[idx]).astype(np.float32)
+        ixt = ixts_all[idx].astype(np.float32)
+        pts_cam = pts_h @ w2c.T
+        pts_proj = pts_cam[:, :3] @ ixt.T
+        depth = pts_proj[:, 2]
+        us = pts_proj[:, 0] / (depth + 1e-8)
+        vs = pts_proj[:, 1] / (depth + 1e-8)
+        h, w = image_heights[cam_idx], image_widths[cam_idx]
+        vis = (us >= 0) & (us < w) & (vs >= 0) & (vs < h) & (depth > 2)
+        views_for_voxels_arr[:, idx] = vis
+    views_for_voxels = [views_for_voxels_arr[i] for i in range(num_voxels)]
+    del views_for_voxels_arr, pts_h
+
+    # Helper: load normal image on demand with simple cache
+    _normal_cache = {}  # view_id -> normals_world image
+    def _load_normal_world(view_id):
+        if view_id in _normal_cache:
+            return _normal_cache[view_id]
+        # Keep cache small (max 2 images)
+        if len(_normal_cache) > 2:
+            _normal_cache.pop(next(iter(_normal_cache)))
+        normal_file, c2w_rot = normals_world_info[view_id]
+        if normal_file is not None and os.path.exists(normal_file):
+            normal_dsine = cv2.imread(normal_file).astype(np.float32) / 255.0 * 2 - 1
+            normals_transformed = np.zeros_like(normal_dsine)
+            normals_transformed[..., 0] = -normal_dsine[..., 2]
+            normals_transformed[..., 1] = -normal_dsine[..., 1]
+            normals_transformed[..., 2] = -normal_dsine[..., 0]
+            normals_world = normals_transformed @ c2w_rot.T
+        else:
+            normals_world = None
+        _normal_cache[view_id] = normals_world
+        return normals_world
 
     # Combine with COLMAP points
     try:
@@ -1095,8 +1157,12 @@ def _build_pointcloud_t4(
                     _cam_id = (colmap_view_id - 1) // num_frames
                     _stamp_id = (colmap_view_id - 1) % num_frames
                     _my_view_id = _stamp_id * num_cameras + _cam_id
-                    if start_frame <= _stamp_id <= end_frame and _my_view_id < len(normals_world_all):
-                        p_n = normals_world_all[_my_view_id][u, v]
+                    if start_frame <= _stamp_id <= end_frame and _my_view_id < len(normals_world_info):
+                        nw = _load_normal_world(_my_view_id)
+                        if nw is not None:
+                            p_n = nw[u, v]
+                        else:
+                            p_n = np.zeros(3, dtype=np.float32)
                         views_voxel[_my_view_id] = True
                         normals_voxel.append(p_n)
 

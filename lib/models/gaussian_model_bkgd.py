@@ -38,44 +38,27 @@ class GaussianModelBkgd(GaussianModel):
 
         super().__init__(model_name=model_name, num_classes=num_classes)
 
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.array): 
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.array):
         print('Create background model')
-        # pointcloud_path_sky =  os.path.join(cfg.model_path, 'input_ply', 'points3D_sky.ply')
-        # include_sky = cfg.model.nsg.get('include_sky', False)
-        # if os.path.exists(pointcloud_path_sky) and not include_sky:
-        #     pcd_sky = fetchPly(pointcloud_path_sky)
-        #     pointcloud_xyz = np.concatenate((pcd.points, pcd_sky.points), axis=0)
-        #     pointcloud_rgb = np.concatenate((pcd.colors, pcd_sky.colors), axis=0)
-        #     pointcloud_normal = np.zeros_like(pointcloud_xyz)
-        #     pcd = BasicPointCloud(pointcloud_xyz, pointcloud_rgb, pointcloud_normal)
 
-        # return super().create_from_pcd(pcd, spatial_lr_scale, N_views)
-
-        # self.spatial_lr_scale = spatial_lr_scale
-
-        bkgd_path  = os.path.join(cfg.model_path, 'input_ply/points3D_bkgd.ply')   
-        assert os.path.exists(bkgd_path) 
-
-        bkgd_pcd = fetchPly(bkgd_path)
-
-        points_xyz = np.asarray(bkgd_pcd.points)
-        points_rgb = np.asarray(bkgd_pcd.colors)
-        points_normal = np.asarray(bkgd_pcd.normals)[:,[2,0,1]] # 一阶球谐省略求解，直接计算方向
+        # Use pcd argument directly (already loaded from bkgd PLY) instead of re-loading
+        points_xyz = np.asarray(pcd.points)
+        points_rgb = np.asarray(pcd.colors)
+        points_normal = np.asarray(pcd.normals)[:,[2,0,1]] # 一阶球谐省略求解，直接计算方向
         norms = np.linalg.norm(points_normal, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-8)
         points_normal = points_normal / norms
+
+        # Load visibility and filter to train views in-place (avoids 2 extra full-size copies)
         points_visibility = np.load(os.path.join(cfg.model_path, "input_ply/points3D_bkgd.npy"))
- 
-        preserve_mask = np.zeros_like(points_visibility, dtype=bool)
-        preserve_mask[:, train_views] = True
-        filtered_visibility = np.logical_and(points_visibility, preserve_mask)
+        test_views = np.setdiff1d(np.arange(points_visibility.shape[1]), train_views)
+        if len(test_views) > 0:
+            points_visibility[:, test_views] = False
 
-        # self.voxel_size = 0.15 # Waymo
-        self.voxel_size = 0.15 # Nuscenes
+        self.voxel_size = 0.15
 
-        self.grape_trellis = GrapeTrellis(points_xyz, points_rgb, points_normal, filtered_visibility, voxel_size=self.voxel_size)
-        # self.last_update_root = self.grape_trellis.root_table.points_xyz.shape[0]
-        # self.last_update_vine = self.grape_trellis.vine_table.valid_cnt
+        self.grape_trellis = GrapeTrellis(points_xyz, points_rgb, points_normal, points_visibility, voxel_size=self.voxel_size)
+        del points_visibility  # Free the loaded copy; GrapeTrellis.RootTable holds its own
 
         return super().create_from_pcd(pcd, spatial_lr_scale, train_views)
 

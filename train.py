@@ -182,7 +182,10 @@ def training():
     for obj_name in gaussians.model_name_id:
         obj_model = getattr(gaussians, obj_name)
         if obj_model.grape_trellis is not None:
-            obj_model.grape_trellis.set_param(dataset.scene_info.metadata["c2ws"], dataset.scene_info.metadata["ixts"], data_args.selected_frames, cams_per_frame=cams_per_frame)
+            selected_frames = data_args.selected_frames
+            if selected_frames is None:
+                selected_frames = [0, dataset.scene_info.metadata["num_frames"] - 1]
+            obj_model.grape_trellis.set_param(dataset.scene_info.metadata["c2ws"], dataset.scene_info.metadata["ixts"], selected_frames, cams_per_frame=cams_per_frame)
     N_bkgd_init = gaussians.background.get_xyz.shape[0]
 
     viewpoint_stack = None
@@ -358,30 +361,30 @@ def training():
             # if iteration > FULL_STACK_LENGTH * 1 and iteration < FULL_STACK_LENGTH * 2:
             if flag_global_reconstruct:
             # if True and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end and (iteration % optim_args.propagation_interval == 0):
-                visibility = gaussians.background.grape_trellis.get_visibility()
-                # src_idxs = [randidx+itv*cams_per_frame for itv in [-2, -1, 1, 2] if ((itv*cams_per_frame + randidx > 0) and (itv*cams_per_frame + randidx < FULL_STACK_LENGTH))] # 随机选一个视角，与前后2帧作patch matching
+                view_has_voxels = gaussians.background.grape_trellis.get_view_has_voxels()
+                # src_idxs = [randidx+itv*cams_per_frame for itv in [-2, -1, 1, 2] if ((itv*cams_per_frame + randidx > 0) and (itv*cams_per_frame + randidx < FULL_STACK_LENGTH))] # 随机選一个視角，與前后2帧作patch matching
                 src_idxs = []
-                
+
                 pre = randidx - cams_per_frame
-                while pre >= 0 and visibility[:, pre].sum() == 0:
+                while pre >= 0 and not view_has_voxels[pre]:
                     pre -= cams_per_frame
                 if pre >= 0:
                     src_idxs.append(pre)
 
                 pre -= cams_per_frame
-                while pre >= 0 and visibility[:, pre].sum() == 0:
+                while pre >= 0 and not view_has_voxels[pre]:
                     pre -= cams_per_frame
                 if pre >= 0:
                     src_idxs.append(pre)
 
                 post = randidx + cams_per_frame
-                while post < FULL_STACK_LENGTH and visibility[:, post].sum() == 0:
+                while post < FULL_STACK_LENGTH and not view_has_voxels[post]:
                     post += cams_per_frame
                 if post < FULL_STACK_LENGTH:
                     src_idxs.append(post)
 
                 post += cams_per_frame
-                while post < FULL_STACK_LENGTH and visibility[:, post].sum() == 0:
+                while post < FULL_STACK_LENGTH and not view_has_voxels[post]:
                     post += cams_per_frame
                 if post < FULL_STACK_LENGTH:
                     src_idxs.append(post)        
@@ -957,9 +960,9 @@ def training():
         scalar_dict['loss'] = loss.item()
 
         scaler.scale(loss).backward()
-        
+
         iter_end.record()
-                
+
         is_save_images = True
         if is_save_images and (iteration % 100 == 0):
             # row0: gt_image, image, depth
@@ -1103,9 +1106,11 @@ def training():
                 
                 elements = PlyElement.describe(elements, 'vertex')
                 PlyData([elements]).write(os.path.join(pointcloud_dir, 'point_cloud.ply'))
-                
 
-
+            # End-of-iteration cleanup: free lazily-loaded data to prevent RAM accumulation
+            if hasattr(viewpoint_cam.guidance, 'unload'):
+                viewpoint_cam.guidance.unload()
+            viewpoint_cam.unload_image()
 
 
 def prepare_output_and_logger():
