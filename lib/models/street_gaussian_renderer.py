@@ -153,6 +153,9 @@ class StreetGaussianRenderer():
                 "rgb": rendered_color,
                 "acc": rendered_acc,
                 "semantic": rendered_semantic,
+                "viewspace_points": torch.zeros(0, 3, device="cuda"),
+                "visibility_filter": torch.zeros(0, dtype=torch.bool, device="cuda"),
+                "radii": torch.zeros(0, dtype=torch.int32, device="cuda"),
             }
 
         # Set up rasterization configuration and make rasterizer
