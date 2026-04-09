@@ -51,7 +51,7 @@ train:
   checkpoint_iterations: [4000, 8000, 16000, 24000, 30000]
 
 optim:
-  use_amp: True
+  use_amp: False
   error_tolerance: 0.01
   prune_box_interval: 100
   densification_interval: 100
