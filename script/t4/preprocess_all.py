@@ -45,16 +45,18 @@ def load_t4_tables(annotation_dir):
     return tables
 
 
-def count_expected_frames(dataroot, scene_index, camera_channels):
+def count_expected_frames(dataroot, scene_index, camera_channels, tables=None):
     """Count expected output frames per camera for a given scene.
 
     Returns dict mapping camera channel name -> expected frame count.
+    *tables* can be pre-loaded to avoid re-reading JSON from disk.
     """
     annotation_dir = dataroot / "annotation"
     if not annotation_dir.exists():
         return {}
 
-    tables = load_t4_tables(annotation_dir)
+    if tables is None:
+        tables = load_t4_tables(annotation_dir)
 
     sample_by_token = {s["token"]: s for s in tables["sample"]}
     cs_by_token = {c["token"]: c for c in tables["calibrated_sensor"]}
@@ -169,6 +171,8 @@ def main():
     batch_args = ["--batch-size", str(args.batch_size)]
     if args.device:
         batch_args += ["--device", args.device]
+    if args.force:
+        batch_args += ["--no-skip-existing"]
 
     all_steps = ["lidar_depth", "mono_depth", "sky_masks", "sam_masks", "normal_maps"]
     steps = args.steps or all_steps
@@ -178,13 +182,15 @@ def main():
     prep = dataroot / "preprocessed"
 
     # Count expected frames per camera for completeness checks
+    annotation_dir = dataroot / "annotation"
+    tables = load_t4_tables(annotation_dir) if annotation_dir.exists() else None
     lidar_cameras = args.camera_channels or [
         "CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
         "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
     ]
-    lidar_expected = count_expected_frames(dataroot, args.scene_index, lidar_cameras)
+    lidar_expected = count_expected_frames(dataroot, args.scene_index, lidar_cameras, tables)
     # Other steps auto-detect cameras when --camera-channels is not given
-    other_expected = count_expected_frames(dataroot, args.scene_index, args.camera_channels)
+    other_expected = count_expected_frames(dataroot, args.scene_index, args.camera_channels, tables)
 
     if lidar_expected:
         total = sum(lidar_expected.values())
