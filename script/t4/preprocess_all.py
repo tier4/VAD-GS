@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -31,21 +32,99 @@ def resolve_dataroot(dataset_id_or_path, revision=0):
     return Path(candidate)
 
 
-def dir_has_files(path, extensions=(".png", ".npy", ".npz")):
-    """Check if directory exists and contains at least one file with given extensions (recursive)."""
-    if not path.exists():
+def load_t4_tables(annotation_dir):
+    """Load T4 annotation tables needed for frame counting."""
+    tables = {}
+    for name in ["scene", "sample", "sample_data", "calibrated_sensor", "sensor"]:
+        path = os.path.join(str(annotation_dir), f"{name}.json")
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                tables[name] = json.load(f)
+        else:
+            tables[name] = []
+    return tables
+
+
+def count_expected_frames(dataroot, scene_index, camera_channels):
+    """Count expected output frames per camera for a given scene.
+
+    Returns dict mapping camera channel name -> expected frame count.
+    """
+    annotation_dir = dataroot / "annotation"
+    if not annotation_dir.exists():
+        return {}
+
+    tables = load_t4_tables(annotation_dir)
+
+    sample_by_token = {s["token"]: s for s in tables["sample"]}
+    cs_by_token = {c["token"]: c for c in tables["calibrated_sensor"]}
+    sensor_by_token = {s["token"]: s for s in tables["sensor"]}
+
+    scene = tables["scene"][scene_index]
+
+    # Build sample chain
+    samples = []
+    token = scene["first_sample_token"]
+    while token:
+        samples.append(sample_by_token[token])
+        token = sample_by_token[token].get("next", "")
+
+    # Map sample_token -> {channel: sample_data}
+    sd_by_sample: dict[str, dict] = {}
+    for sd in tables["sample_data"]:
+        cs = cs_by_token.get(sd["calibrated_sensor_token"])
+        if cs is None:
+            continue
+        sensor = sensor_by_token.get(cs["sensor_token"])
+        if sensor is None or sensor.get("modality") != "camera":
+            continue
+        sd_by_sample.setdefault(sd["sample_token"], {})[sensor["channel"]] = sd
+
+    # Auto-detect cameras if not specified
+    if camera_channels is None:
+        all_ch: set[str] = set()
+        for sensor in tables["sensor"]:
+            if sensor.get("modality") == "camera":
+                all_ch.add(sensor["channel"])
+        camera_channels = sorted(all_ch)
+
+    counts: dict[str, int] = {}
+    for sample in samples:
+        frame_data = sd_by_sample.get(sample["token"], {})
+        for ch in camera_channels:
+            if ch in frame_data:
+                img_path = dataroot / frame_data[ch]["filename"]
+                if img_path.exists():
+                    counts[ch] = counts.get(ch, 0) + 1
+
+    return counts
+
+
+def is_step_complete(output_dir, expected_counts, extension):
+    """Check if all expected output files exist for a preprocessing step."""
+    if not output_dir.exists() or not expected_counts:
         return False
-    for f in path.rglob("*"):
-        if f.suffix in extensions:
+
+    for camera, expected in expected_counts.items():
+        cam_dir = output_dir / camera
+        if not cam_dir.exists():
+            return False
+        actual = sum(1 for f in cam_dir.iterdir() if f.suffix == extension)
+        if actual < expected:
+            return False
+
+    return True
+
+
+def run_step(name, script, args, output_dir, force=False,
+             expected_counts=None, extension=None):
+    """Run a preprocessing step, skipping only if output is complete."""
+    if not force and expected_counts and extension:
+        if is_step_complete(output_dir, expected_counts, extension):
+            print(f"[SKIP] {name}: output is complete at {output_dir}")
             return True
-    return False
-
-
-def run_step(name, script, args, output_dir, force=False):
-    """Run a preprocessing step, skipping if output already exists."""
-    if not force and dir_has_files(output_dir):
-        print(f"[SKIP] {name}: output already exists at {output_dir}")
-        return True
+        elif output_dir.exists():
+            print(f"[INCOMPLETE] {name}: output is incomplete, re-running")
 
     print(f"\n{'='*60}")
     print(f"[RUN] {name}")
@@ -98,6 +177,22 @@ def main():
 
     prep = dataroot / "preprocessed"
 
+    # Count expected frames per camera for completeness checks
+    lidar_cameras = args.camera_channels or [
+        "CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
+        "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
+    ]
+    lidar_expected = count_expected_frames(dataroot, args.scene_index, lidar_cameras)
+    # Other steps auto-detect cameras when --camera-channels is not given
+    other_expected = count_expected_frames(dataroot, args.scene_index, args.camera_channels)
+
+    if lidar_expected:
+        total = sum(lidar_expected.values())
+        print(f"Expected frames (lidar cameras): {lidar_expected}  total={total}")
+    if other_expected:
+        total = sum(other_expected.values())
+        print(f"Expected frames (all cameras):   {other_expected}  total={total}")
+
     # Step 1: LiDAR depth
     if "lidar_depth" in steps:
         results["lidar_depth"] = run_step(
@@ -105,12 +200,12 @@ def main():
             SCRIPT_DIR / "generate_lidar_depth.py",
             ["--dataroot", str(dataroot),
              "--scene-index", str(args.scene_index),
-             "--camera-channels"] + (args.camera_channels or [
-                "CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
-                "CAM_BACK_LEFT", "CAM_BACK_RIGHT"
-             ]) + ["--lidar-channel", args.lidar_channel],
+             "--camera-channels"] + lidar_cameras
+            + ["--lidar-channel", args.lidar_channel],
             prep / "lidar_depth",
             force=args.force,
+            expected_counts=lidar_expected,
+            extension=".npy",
         )
 
     # Step 2: Mono depth (Depth Anything V2 Small)
@@ -121,6 +216,8 @@ def main():
             common + batch_args,
             prep / "depth",
             force=args.force,
+            expected_counts=other_expected,
+            extension=".npz",
         )
 
     # Step 3: Sky masks (SegFormer B5 Cityscapes)
@@ -131,17 +228,29 @@ def main():
             common + batch_args,
             prep / "sky_masks",
             force=args.force,
+            expected_counts=other_expected,
+            extension=".png",
         )
 
-    # Step 4: Dynamic + Background masks
+    # Step 4: Dynamic + Background masks (sam_masks + sam_bkgd_masks)
     if "sam_masks" in steps:
-        results["sam_masks"] = run_step(
-            "Dynamic + Background Masks",
-            SCRIPT_DIR / "generate_sam_masks.py",
-            common + batch_args,
-            prep / "sam_masks",
-            force=args.force,
+        sam_complete = (
+            is_step_complete(prep / "sam_masks", other_expected, ".png")
+            and is_step_complete(prep / "sam_bkgd_masks", other_expected, ".png")
         )
+        if not args.force and sam_complete:
+            print(f"[SKIP] Dynamic + Background Masks: output is complete")
+            results["sam_masks"] = True
+        else:
+            if not args.force and (prep / "sam_masks").exists():
+                print("[INCOMPLETE] Dynamic + Background Masks: output is incomplete, re-running")
+            results["sam_masks"] = run_step(
+                "Dynamic + Background Masks",
+                SCRIPT_DIR / "generate_sam_masks.py",
+                common + batch_args,
+                prep / "sam_masks",
+                force=True,
+            )
 
     # Step 5: Normal maps (from depth)
     if "normal_maps" in steps:
@@ -151,6 +260,8 @@ def main():
             common + batch_args,
             prep / "normal_img",
             force=args.force,
+            expected_counts=other_expected,
+            extension=".png",
         )
 
     # Summary
@@ -164,9 +275,60 @@ def main():
     failed = [s for s, ok in results.items() if not ok]
     if failed:
         print(f"\nFailed steps: {', '.join(failed)}")
-        sys.exit(1)
+
+    # --- Final validation ---
+    print(f"\n{'='*60}")
+    print("Validation")
+    print(f"{'='*60}")
+
+    validation_specs = [
+        ("lidar_depth", prep / "lidar_depth", lidar_expected, ".npy"),
+        ("mono_depth",  prep / "depth",       other_expected, ".npz"),
+        ("sky_masks",   prep / "sky_masks",   other_expected, ".png"),
+        ("sam_masks",   prep / "sam_masks",   other_expected, ".png"),
+        ("sam_bkgd_masks", prep / "sam_bkgd_masks", other_expected, ".png"),
+        ("normal_maps", prep / "normal_img",  other_expected, ".png"),
+    ]
+
+    all_ok = True
+    for step_name, output_dir, expected, ext in validation_specs:
+        if not expected:
+            print(f"  {step_name}: WARN (no expected frame counts available)")
+            continue
+        if not output_dir.exists():
+            print(f"  {step_name}: MISSING (directory not found)")
+            all_ok = False
+            continue
+
+        step_ok = True
+        for camera, exp_count in expected.items():
+            cam_dir = output_dir / camera
+            if not cam_dir.exists():
+                print(f"  {step_name}/{camera}: MISSING (0/{exp_count})")
+                step_ok = False
+                continue
+            actual = sum(1 for f in cam_dir.iterdir() if f.suffix == ext)
+            if actual < exp_count:
+                print(f"  {step_name}/{camera}: INCOMPLETE ({actual}/{exp_count})")
+                step_ok = False
+            elif actual > exp_count:
+                print(f"  {step_name}/{camera}: EXTRA ({actual}/{exp_count})")
+
+        if step_ok:
+            total = sum(expected.values())
+            print(f"  {step_name}: OK ({total} files)")
+        else:
+            all_ok = False
+
+    print(f"{'='*60}")
+    if all_ok:
+        print("All preprocessed data is complete.")
     else:
-        print("\nAll steps completed successfully.")
+        print("Some preprocessed data is incomplete or missing.")
+        sys.exit(1)
+
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -163,7 +163,7 @@ def main():
     batch_size = args.batch_size
     for batch_start in tqdm(range(0, len(image_entries), batch_size), desc="Sky mask inference"):
         batch = image_entries[batch_start:batch_start + batch_size]
-        images = [Image.open(p).convert("RGB") for p, _ in batch]
+        images = [Image.open(p).convert("RGB") for p, _, _ in batch]
         original_sizes = [(img.height, img.width) for img in images]
 
         inputs = image_processor(images=images, return_tensors="pt").to(device)
