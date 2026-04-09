@@ -1,6 +1,6 @@
 import os
 import torch
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import patchmatch_cuda
 
 from random import randint
@@ -142,7 +142,7 @@ def training():
     gaussians_renderer = StreetGaussianRenderer()
 
     use_amp = optim_args.use_amp
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler('cuda', enabled=use_amp)
     print(f'AMP (Automatic Mixed Precision): {"ON" if use_amp else "OFF"}')
 
     iter_start = torch.cuda.Event(enable_timing = True)
@@ -210,6 +210,12 @@ def training():
         gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
         loss_mask = viewpoint_cam.guidance['mask'] if 'mask' in viewpoint_cam.guidance else torch.ones_like(gt_image[0:1]).bool()
         loss_mask = loss_mask.cuda(non_blocking=True) if not loss_mask.is_cuda else loss_mask
+        lidar_depth = None
+        sky_mask = None
+        dynamic_mask = None
+        seg_bkgd_mask = None
+        mono_depth = None
+        mono_normal = None
         if 'lidar_depth' in viewpoint_cam.guidance:
             lidar_depth = viewpoint_cam.guidance['lidar_depth']
             lidar_depth = lidar_depth.cuda(non_blocking=True) if not lidar_depth.is_cuda else lidar_depth
@@ -294,10 +300,14 @@ def training():
 
                 acc = soft_render_pkg['acc']
 
-                bkgd_mask = ~sky_mask & ~torch.any(dynamic_mask != 255, axis=0, keepdim=True)
+                bkgd_mask = torch.ones_like(acc, dtype=torch.bool)
+                if sky_mask is not None:
+                    bkgd_mask = bkgd_mask & ~sky_mask
+                if dynamic_mask is not None:
+                    bkgd_mask = bkgd_mask & ~torch.any(dynamic_mask != 255, axis=0, keepdim=True)
                 k = int(len(acc[bkgd_mask]) * 0.25)
                 v = acc[bkgd_mask].kthvalue(k).values
-                    
+
                 if v.item() < 0.7:
                     flag_global_reconstruct = True
 
@@ -502,10 +512,12 @@ def training():
                 
                 # segment_img = cv2.imread(os.path.join(dataset.source_path, "sam_bkgd_masks/000%.3d_%d.png"%(current_view//3, current_view%3)))[:,:,:3]
                 # segment_img = cv2.resize(segment_img, (voxel_depth_value.shape[1], voxel_depth_value.shape[0]), interpolation=cv2.INTER_NEAREST)
-                segment_img = seg_bkgd_mask.cpu().detach().numpy().transpose(1,2,0)
-                no_bkgd_mask = np.logical_or(sky_mask.cpu().detach().numpy()[0], torch.any(dynamic_mask != 255, axis=0).cpu().detach().numpy())
+                vacancy_exist = False
+                if seg_bkgd_mask is not None and sky_mask is not None and dynamic_mask is not None:
+                    segment_img = seg_bkgd_mask.cpu().detach().numpy().transpose(1,2,0)
+                    no_bkgd_mask = np.logical_or(sky_mask.cpu().detach().numpy()[0], torch.any(dynamic_mask != 255, axis=0).cpu().detach().numpy())
 
-                vacancy_exist, vacancy_colors = gaussians.background.grape_trellis.if_vacancy_in_ref_view_masks(voxel_depth_value, segment_img, no_bkgd_mask, vacancy_threshold=0.5)
+                    vacancy_exist, vacancy_colors = gaussians.background.grape_trellis.if_vacancy_in_ref_view_masks(voxel_depth_value, segment_img, no_bkgd_mask, vacancy_threshold=0.5)
                 if vacancy_exist:
                 # if not vacancy_exist:
                 #     continue
@@ -641,9 +653,9 @@ def training():
 
 
 ##################################################### OBJECT #######################################################################################
-            if flag_actor_reconstruct and not optim_args.skip_view_selection: # or iteration > FULL_STACK_LENGTH * 0 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
+            if flag_actor_reconstruct and not optim_args.skip_view_selection and dynamic_mask is not None: # or iteration > FULL_STACK_LENGTH * 0 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
 
-                            
+
                 # Step1: render foreground
 
                 for dynamic_key in torch.unique(dynamic_mask):
@@ -831,15 +843,16 @@ def training():
         voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
         voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
 
-        if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end:
+        if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end and "mono_depth" in viewpoint_cam.guidance:
             loss_hard = 0
-            with autocast(enabled=use_amp):
+            with autocast('cuda', enabled=use_amp):
                 hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
                 hard_depth = hard_render_pkg["depth"]
 
                 patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
-                mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
-                hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
+                if sky_mask is not None:
+                    mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
+                    hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
 
                 loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
                 loss_hard += 1 * loss_l2_dpt
@@ -856,7 +869,7 @@ def training():
             del hard_render_pkg, hard_depth, loss_hard, loss_l2_dpt, loss_global
             torch.cuda.empty_cache()
 
-        with autocast(enabled=use_amp):
+        with autocast('cuda', enabled=use_amp):
             soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
             image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
 

@@ -8,12 +8,14 @@ from lib.datasets.colmap_readers import readColmapSceneInfo
 from lib.datasets.blender_readers import readNerfSyntheticInfo
 from lib.datasets.waymo_full_readers import readWaymoFullInfo
 from lib.datasets.my_drivestudio_readers import readDriveStudioInfo
+from lib.datasets.t4_readers import readT4Info
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
     "Waymo": readWaymoFullInfo,
     "DriveStudio": readDriveStudioInfo,
+    "T4": readT4Info,
 }
 
 class Dataset():

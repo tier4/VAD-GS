@@ -78,7 +78,15 @@ class ActorPose(nn.Module):
     def update_optimizer(self, scaler=None):
         if self.opt_track:
             if scaler is not None:
-                scaler.step(self.optimizer)
+                # Skip if no gradients exist (e.g. hard_depth loss doesn't flow here)
+                has_grads = any(
+                    p.grad is not None
+                    for group in self.optimizer.param_groups
+                    for p in group["params"]
+                )
+                if has_grads:
+                    scaler.unscale_(self.optimizer)
+                    scaler.step(self.optimizer)
             else:
                 self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)

@@ -57,7 +57,9 @@ class GaussianModel(nn.Module):
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         points_normal = np.asarray(pcd.normals)
-        points_normal = points_normal / np.linalg.norm(points_normal, axis=1, keepdims=True)
+        norms = np.linalg.norm(points_normal, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        points_normal = points_normal / norms
         
         
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -334,6 +336,7 @@ class GaussianModel(nn.Module):
         
     def update_optimizer(self, scaler=None):
         if scaler is not None:
+            scaler.unscale_(self.optimizer)
             scaler.step(self.optimizer)
         else:
             self.optimizer.step()

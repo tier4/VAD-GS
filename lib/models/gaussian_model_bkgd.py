@@ -61,7 +61,9 @@ class GaussianModelBkgd(GaussianModel):
         points_xyz = np.asarray(bkgd_pcd.points)
         points_rgb = np.asarray(bkgd_pcd.colors)
         points_normal = np.asarray(bkgd_pcd.normals)[:,[2,0,1]] # 一阶球谐省略求解，直接计算方向
-        points_normal = points_normal / np.linalg.norm(points_normal, axis=1, keepdims=True)
+        norms = np.linalg.norm(points_normal, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        points_normal = points_normal / norms
         points_visibility = np.load(os.path.join(cfg.model_path, "input_ply/points3D_bkgd.npy"))
  
         preserve_mask = np.zeros_like(points_visibility, dtype=bool)

@@ -64,6 +64,7 @@ class PoseCorrection(nn.Module):
     
     def update_optimizer(self, scaler=None):
         if scaler is not None:
+            scaler.unscale_(self.optimizer)
             scaler.step(self.optimizer)
         else:
             self.optimizer.step()

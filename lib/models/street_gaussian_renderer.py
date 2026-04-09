@@ -88,13 +88,14 @@ class StreetGaussianRenderer():
         result = self.render_kernel(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color)
         return result
     
+    @torch.amp.autocast('cuda', enabled=False)
     def render(
-        self, 
+        self,
         viewpoint_camera: Camera,
         pc: StreetGaussianModel,
-        convert_SHs_python = None, 
-        compute_cov3D_python = None, 
-        scaling_modifier = None, 
+        convert_SHs_python = None,
+        compute_cov3D_python = None,
+        scaling_modifier = None,
         override_color = None,
         exclude_list = [],
         render_type = "rgb"
