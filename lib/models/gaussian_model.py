@@ -52,7 +52,7 @@ class GaussianModel(nn.Module):
         self.spatial_lr_scale = 0
         self.setup_functions()
     
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, N_views: np.array):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, N_views: np.ndarray):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())

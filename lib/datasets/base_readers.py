@@ -1,35 +1,37 @@
+from __future__ import annotations
+
 import numpy as np
-from typing import NamedTuple
+from typing import Any, NamedTuple
 from lib.utils.graphics_utils import getWorld2View2, focal2fov, fov2focal, BasicPointCloud
 from plyfile import PlyData, PlyElement
 
 class CameraInfo(NamedTuple):
     uid: int
-    R: np.array
-    T: np.array
-    FovY: np.array
-    FovX: np.array
-    K: np.array
-    image: np.array
+    R: np.ndarray
+    T: np.ndarray
+    FovY: float
+    FovX: float
+    K: np.ndarray
+    image: np.ndarray | None
     image_path: str
     image_name: str
     width: int
     height: int
-    metadata: dict = dict()
-    guidance: dict = dict()
+    metadata: dict[str, Any] = dict()
+    guidance: dict[str, Any] = dict()
 
 class SceneInfo(NamedTuple):
-    point_cloud: BasicPointCloud
-    train_cameras: list
-    test_cameras: list
-    nerf_normalization: dict
-    ply_path: str
-    metadata: dict = dict()
-    novel_view_cameras: list = None
+    point_cloud: BasicPointCloud | None
+    train_cameras: list[CameraInfo]
+    test_cameras: list[CameraInfo]
+    nerf_normalization: dict[str, Any]
+    ply_path: str | None
+    metadata: dict[str, Any] = dict()
+    novel_view_cameras: list[CameraInfo] | None = None
 
-def getNerfppNorm(cam_info):
-    def get_center_and_diag(cam_centers):
-        cam_centers = np.hstack(cam_centers)
+def getNerfppNorm(cam_info: list[CameraInfo]) -> dict[str, Any]:
+    def get_center_and_diag(cam_centers_list: list[np.ndarray]) -> tuple[np.ndarray, float]:
+        cam_centers = np.hstack(cam_centers_list)
         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
         center = avg_cam_center
         dist = np.linalg.norm(cam_centers - center, axis=0, keepdims=True)
@@ -54,7 +56,7 @@ def getNerfppNorm(cam_info):
         'center': center,
     }
     
-def get_PCA_Norm(xyz):
+def get_PCA_Norm(xyz: np.ndarray) -> dict[str, float]:
     from sklearn.decomposition import PCA
     pca = PCA()
     pca.fit(xyz)
@@ -69,7 +71,7 @@ def get_PCA_Norm(xyz):
         'radius': radius, 
     }
 
-def get_Sphere_Norm(xyz):
+def get_Sphere_Norm(xyz: np.ndarray) -> dict[str, Any]:
     from lib.config import cfg
     xyz_max = np.max(xyz, axis=0)
     xyz_min = np.min(xyz, axis=0)
@@ -84,7 +86,7 @@ def get_Sphere_Norm(xyz):
     }
 
 
-def fetchPly(path):
+def fetchPly(path: str) -> BasicPointCloud:
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
@@ -92,7 +94,7 @@ def fetchPly(path):
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
-def storePly(path, xyz, rgb, normals=None):
+def storePly(path: str, xyz: np.ndarray, rgb: np.ndarray, normals: np.ndarray | None = None) -> None:
     # set rgb to 0 - 255
     if rgb.max() <= 1. and rgb.min() >= 0:
         rgb = np.clip(rgb * 255, 0., 255.)

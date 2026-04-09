@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import torch
 from torch.amp import autocast, GradScaler
@@ -31,7 +33,7 @@ import psutil
 from pynvml import *
 import queue
 
-marker_queue = queue.Queue()
+marker_queue: queue.Queue[str] = queue.Queue()
 
 ############################
 import gc
@@ -49,12 +51,12 @@ except ImportError:
 
 
 def monitor_resources(
-    interval=1.0,
-    log_file=None,
-    gpu_id=0,
-    stop_event=None,
-    marker_queue=None,
-):
+    interval: float = 1.0,
+    log_file: str | None = None,
+    gpu_id: int = 0,
+    stop_event: threading.Event | None = None,
+    marker_queue: queue.Queue[str] | None = None,
+) -> None:
     nvmlInit()
     handle = nvmlDeviceGetHandleByIndex(gpu_id)
 
@@ -104,7 +106,7 @@ def monitor_resources(
 
 
 
-def training():
+def training() -> None:
     training_args = cfg.train
     optim_args = cfg.optim
     data_args = cfg.data
@@ -1113,7 +1115,7 @@ def training():
             viewpoint_cam.unload_image()
 
 
-def prepare_output_and_logger():
+def prepare_output_and_logger() -> SummaryWriter | None:
     
     # if cfg.model_path == '':
     #     if os.getenv('OAR_JOB_ID'):
@@ -1148,7 +1150,7 @@ def prepare_output_and_logger():
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, scalar_stats, tensor_stats, testing_iterations, scene: Scene, renderer: StreetGaussianRenderer):
+def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stats: dict[str, float], tensor_stats: dict[str, torch.Tensor], testing_iterations: list[int], scene: Scene, renderer: StreetGaussianRenderer) -> None:
     if tb_writer:
         try:
             for key, value in scalar_stats.items():

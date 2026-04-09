@@ -76,3 +76,28 @@ nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git" }
 patchmatch_cuda = { path = "submodules/MyPropagation" }
 simple_knn = { path = "submodules/simple-knn" }
 simple_waymo_open_dataset_reader = { path = "submodules/simple-waymo-open-dataset-reader" }
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.rules]
+# Suppress errors for unresolvable third-party / C-extension modules
+unresolved-import = "ignore"
+# numpy/torch overload resolution often fails with ty
+no-matching-overload = "warn"
+# numba prange not recognized as iterable
+not-iterable = "warn"
+# nn.Module method overrides with different signatures (intentional)
+invalid-method-override = "warn"
+# unresolved attributes from cfg, external libs, and Optional narrowing
+unresolved-attribute = "warn"
+# numpy subscript on Optional types guarded at runtime
+not-subscriptable = "warn"
+# Optional fields used after runtime guards (e.g. if self.include_obj)
+call-non-callable = "warn"
+# numpy/torch operator overloads not fully resolved
+unsupported-operator = "warn"
+# Subscript assignments on variables narrowed to None (runtime-guarded)
+invalid-assignment = "warn"
+# Some torch utility function arg types not fully resolved
+invalid-argument-type = "warn"

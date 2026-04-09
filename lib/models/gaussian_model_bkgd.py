@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import torch
 import numpy as np
 import torch.nn as nn
 import os
+from typing import Any
 from lib.config import cfg
 from lib.utils.graphics_utils import BasicPointCloud
 from lib.datasets.base_readers import fetchPly
@@ -22,13 +25,13 @@ from lib.utils.waymo_utils import my_vis
 
 class GaussianModelBkgd(GaussianModel):
     def __init__(
-        self, 
-        model_name='background', 
-        scene_center=np.array([0, 0, 0]),
-        scene_radius=20,
-        sphere_center=np.array([0, 0, 0]),
-        sphere_radius=20,
-    ):
+        self,
+        model_name: str = 'background',
+        scene_center: np.ndarray = np.array([0, 0, 0]),
+        scene_radius: int = 20,
+        sphere_center: np.ndarray = np.array([0, 0, 0]),
+        sphere_radius: int = 20,
+    ) -> None:
         self.scene_center = torch.from_numpy(scene_center).float().cuda()
         self.scene_radius = torch.tensor([scene_radius]).float().cuda()
         self.sphere_center = torch.from_numpy(sphere_center).float().cuda()
@@ -38,7 +41,7 @@ class GaussianModelBkgd(GaussianModel):
 
         super().__init__(model_name=model_name, num_classes=num_classes)
 
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.array):
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.ndarray) -> None:
         print('Create background model')
 
         # Use pcd argument directly (already loaded from bkgd PLY) instead of re-loading
@@ -109,50 +112,50 @@ class GaussianModelBkgd(GaussianModel):
 
 
 
-    def set_background_mask(self, camera: Camera):
+    def set_background_mask(self, camera: Camera) -> None:
         pass
-    
+
     @property
-    def get_scaling(self):
+    def get_scaling(self) -> torch.Tensor:
         scaling = super().get_scaling
         # scaling = self.scaling_activation(self._scaling)
         return scaling if self.background_mask is None else scaling[self.background_mask]
 
     @property
-    def get_rotation(self):
+    def get_rotation(self) -> torch.Tensor:
         rotation = super().get_rotation
         # rotation = quaternion_raw_multiply(self._rotation_anchor[self._anchor_id], self._rotation_offset)
         return rotation if self.background_mask is None else rotation[self.background_mask]
 
     @property
-    def get_xyz(self):
+    def get_xyz(self) -> torch.Tensor:
         xyz = super().get_xyz
         # xyz = self._xyz_anchor[self._anchor_id] + self._xyz_offset
         return xyz if self.background_mask is None else xyz[self.background_mask]        
     
     @property
-    def get_features(self):
+    def get_features(self) -> torch.Tensor:
         features = super().get_features
         # features = torch.cat([self._features_dc, self._features_rest], dim=1)
         return features if self.background_mask is None else features[self.background_mask]        
     
     @property
-    def get_opacity(self):
+    def get_opacity(self) -> torch.Tensor:
         opacity = super().get_opacity
         # opacity = self.opacity_activation(self._opacity)
         return opacity if self.background_mask is None else opacity[self.background_mask]
     
     @property
-    def get_semantic(self):
+    def get_semantic(self) -> torch.Tensor:
         semantic = super().get_semantic
         return semantic if self.background_mask is None else semantic[self.background_mask]
 
 
-    def get_anchor_id(self):
+    def get_anchor_id(self) -> torch.Tensor:
         return self._anchor_id if self.background_mask is None else self._anchor_id [self.background_mask]
 
 
-    def densify_and_prune(self, max_grad, min_opacity, prune_big_points):
+    def densify_and_prune(self, max_grad: float, min_opacity: float, prune_big_points: bool) -> tuple[dict[str, Any], dict[str, Any]]:
         max_grad = cfg.optim.get('densify_grad_threshold_bkgd', max_grad)
         if cfg.optim.get('densify_grad_abs_bkgd', False):
             grads = self.xyz_gradient_accum[:, 1:2] / self.denom
@@ -170,7 +173,7 @@ class GaussianModelBkgd(GaussianModel):
 
         # Prune points below opacity
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-        prune_mask = torch.logical_or(prune_mask, torch.all(self.get_scaling < 0.001, axis=1).squeeze())
+        prune_mask = torch.logical_or(prune_mask, torch.all(self.get_scaling < 0.001, dim=1).squeeze())
         self.scalar_dict['points_below_min_opacity'] = prune_mask.sum().item()
 
         # Prune big points in world space 

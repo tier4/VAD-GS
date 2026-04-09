@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 
 import numpy as np
 import open3d as o3d
 from collections import defaultdict  #希望能提速
+from typing import Any
 
 import matplotlib.pyplot as plt
 from numba import njit, prange
@@ -15,7 +18,7 @@ import copy
 
 
 class GrapeTrellis:
-    def __init__(self, points_xyz, points_rgb, points_normal, points_visibility, voxel_size = 0.15):
+    def __init__(self, points_xyz: np.ndarray, points_rgb: np.ndarray, points_normal: np.ndarray, points_visibility: np.ndarray, voxel_size: float = 0.15) -> None:
         self.voxel_size = voxel_size
         self.min_bound=(points_xyz.min(axis=0) // self.voxel_size) * self.voxel_size
         self.max_bound=(points_xyz.max(axis=0) // self.voxel_size + 1) * self.voxel_size
@@ -47,7 +50,7 @@ class GrapeTrellis:
 
         # Trellis 只维护anchor xyz和rot的tensor或array。不存nn.parameter。nn.parameter一直在GaussianModelBkgd内进行迭代和训练。新增部分应当只空白地cat在最后，而非直接由Trellis获取并重复初始化。
 
-    def save(self, path):
+    def save(self, path: str) -> None:
         data = {
             "voxel_size": self.voxel_size,
             "min_bound": self.min_bound,
@@ -74,7 +77,7 @@ class GrapeTrellis:
         np.savez(path, **data)
 
 
-    def load(self, path):
+    def load(self, path: str) -> None:
         data = np.load(path, allow_pickle=True)
         self.root_table.points_xyz = data["root_points_xyz"]
         self.root_table.points_color = data["root_points_color"]
@@ -105,13 +108,13 @@ class GrapeTrellis:
         self.vine_table.max_bound = data["max_bound"]
 
 
-    def set_param(self, c2ws, ixts, selected_frames, cams_per_frame):
+    def set_param(self, c2ws: np.ndarray, ixts: np.ndarray, selected_frames: list[int], cams_per_frame: int) -> None:
         self.c2ws = c2ws
         self.ixts = ixts
         self.start_frame = selected_frames[0] * cams_per_frame
         self.end_frame = (selected_frames[1] + 1) * cams_per_frame
 
-    def get_voxel_center_xyz(self):
+    def get_voxel_center_xyz(self) -> np.ndarray:
         root_xyz = self.root_table.points_xyz
         vine_xyz = self.vine_table.get_xyz()
         return np.concatenate([root_xyz, vine_xyz], axis=0)
@@ -120,28 +123,28 @@ class GrapeTrellis:
     #     # 只在densiffication后修改torch tensor，其余时刻只读取nn.parameter
     #     pass
 
-    def get_voxel_color(self):
+    def get_voxel_color(self) -> np.ndarray:
         root_color = self.root_table.points_color
         vine_color = self.vine_table.get_color()
         return np.concatenate([root_color, vine_color], axis=0)
 
 
-    def get_voxel_size(self):
+    def get_voxel_size(self) -> int:
         return self.root_table.points_xyz.shape[0] + self.vine_table.valid_cnt
 
 
-    def get_visibility(self):
+    def get_visibility(self) -> np.ndarray:
         root_vis = self.root_table.points_visibility #[:, self.start_frame:self.end_frame]
         vine_vis = self.vine_table.get_visibility()
         return np.concatenate([root_vis, vine_vis], axis=0)
 
-    def get_visibility_column(self, view_id):
+    def get_visibility_column(self, view_id: int) -> np.ndarray:
         """Get visibility for a single view without unpacking the full matrix."""
         root_col = self.root_table.vis_column(view_id)
         vine_col = self.vine_table.points_visibility[:self.vine_table.valid_cnt, view_id]
         return np.concatenate([root_col, vine_col], axis=0)
 
-    def get_visibility_rows(self, row_mask):
+    def get_visibility_rows(self, row_mask: np.ndarray) -> np.ndarray:
         """Get visibility for selected rows only."""
         n_root = self.root_table.points_xyz.shape[0]
         root_mask = row_mask[:n_root]
@@ -150,20 +153,20 @@ class GrapeTrellis:
         vine_rows = self.vine_table.points_visibility[:self.vine_table.valid_cnt][vine_mask]
         return np.concatenate([root_rows, vine_rows], axis=0)
 
-    def get_view_has_voxels(self):
+    def get_view_has_voxels(self) -> np.ndarray:
         """Return bool array [N_views] indicating which views have any visible voxels."""
         root_any = self.root_table.vis_any_per_view()
         vine_any = self.vine_table.points_visibility[:self.vine_table.valid_cnt].any(axis=0) if self.vine_table.valid_cnt > 0 else np.zeros(self.N_views, dtype=bool)
         return root_any | vine_any
 
-    def get_normal(self):
+    def get_normal(self) -> np.ndarray:
         root_normal = self.root_table.points_normal
         vine_normal = self.vine_table.get_normal()
 
         anchor_normal = np.concatenate([root_normal, vine_normal], axis=0)
         return anchor_normal
 
-    def get_voxel_visibility_from_xyz(self, x, y, z):
+    def get_voxel_visibility_from_xyz(self, x: float, y: float, z: float) -> np.ndarray:
         vid = self.root_table.get_voxel_id_from_point(x, y, z)
         if vid is not None:
             return np.unpackbits(self.root_table._visibility_packed[vid])[:self.root_table._n_views].astype(bool)
@@ -203,7 +206,8 @@ class GrapeTrellis:
     #     return voxel_depth_value, voxel_depth_source, bkgd_positions[mask_visible], bkgd_colors[mask_visible]
 
 
-    def render_voxel_depth(self, current_view, img_H, img_W, obj_rots=None, obj_trans=None):
+    def render_voxel_depth(self, current_view: int, img_H: int, img_W: int, obj_rots: torch.Tensor | None = None, obj_trans: torch.Tensor | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        assert self.c2ws is not None and self.ixts is not None, "call set_param() before render_voxel_depth()"
         actor_positions = self.get_voxel_center_xyz()
         actor_view_mask = self.get_visibility_column(current_view)
         n_total = actor_positions.shape[0]
@@ -269,7 +273,7 @@ class GrapeTrellis:
 
 
 
-    def if_vacancy_in_ref_view_masks(self, voxel_depth_value, semantic_mask, no_bkgd_mask, vacancy_threshold=0.3):
+    def if_vacancy_in_ref_view_masks(self, voxel_depth_value: np.ndarray, semantic_mask: np.ndarray, no_bkgd_mask: np.ndarray, vacancy_threshold: float = 0.3) -> tuple[bool, list[np.ndarray]]:
         # 过滤所有semantic_mask id，取出存在voxel depth无法覆盖的mask颜色
         img_H, img_W = voxel_depth_value.shape[0], voxel_depth_value.shape[1]
         samentic_colors = np.unique(semantic_mask.reshape([-1,3]), axis=0)
@@ -315,7 +319,7 @@ class GrapeTrellis:
     
 
 
-    def calculate_belief_view_pair(self, target_points, ref_mat, src_mat):
+    def calculate_belief_view_pair(self, target_points: np.ndarray, ref_mat: np.ndarray, src_mat: np.ndarray) -> float:
         src_R = src_mat[:3,:3]
         src_T = src_mat[:3, 3]
 
@@ -334,8 +338,9 @@ class GrapeTrellis:
         return np.sqrt(B * theta) / (np.linalg.norm(target_points - src_T, axis=1).mean() * np.linalg.norm(target_points - ref_T, axis=1).mean())
 
     # 根据给定的一组视角，计算其整体视角差异置信度：
-    def calculate_belief_views(self, rootvine_xyz, ref_src_view_ids):
-        prop_belief = []
+    def calculate_belief_views(self, rootvine_xyz: np.ndarray, ref_src_view_ids: list[int]) -> np.floating[Any]:
+        assert self.c2ws is not None, "call set_param() first"
+        prop_belief: list[float] = []
         for i in range(len(ref_src_view_ids)-1):
             for j in range(i+1, len(ref_src_view_ids)):
                 view_A = ref_src_view_ids[i]
@@ -344,7 +349,8 @@ class GrapeTrellis:
         return np.median(prop_belief)
     
     
-    def greedy_sample_src_views_by_ref_points(self, rootvine_xyz, ref_view, mask_visible, point_obs_ratio=0.75, N=5, obj_rots=None, obj_trans=None):
+    def greedy_sample_src_views_by_ref_points(self, rootvine_xyz: np.ndarray, ref_view: int, mask_visible: np.ndarray, point_obs_ratio: float = 0.75, N: int = 5, obj_rots: torch.Tensor | None = None, obj_trans: torch.Tensor | None = None) -> list[int]:
+        assert self.c2ws is not None, "call set_param() first"
         # rootvine_xyz = self.get_voxel_center_xyz()[mask_visible]
 
         # vine_visibility = []
@@ -393,7 +399,7 @@ class GrapeTrellis:
 
 
     # def sample_viewset_from_obj_mask(self, current_view, obj_mask, voxel_depth_value, voxel_depth_source, mask_visible, point_obs_ratio=0.8):
-    def sample_viewset_from_obj_mask(self, current_view, mask_visible, point_obs_ratio=0.8, N=4, obj_rots=None, obj_trans=None):
+    def sample_viewset_from_obj_mask(self, current_view: int, mask_visible: np.ndarray, point_obs_ratio: float = 0.8, N: int = 4, obj_rots: torch.Tensor | None = None, obj_trans: torch.Tensor | None = None) -> tuple[list[int], np.floating[Any], np.ndarray]:
         # root_in_obj_mask = np.logical_and(voxel_depth_value > 0, obj_mask)
         # root_in_obj_idx = np.unique(voxel_depth_source[root_in_obj_mask])
         # rootvine_xyz = bkgd_positions_visibile[root_in_obj_idx]
@@ -407,8 +413,9 @@ class GrapeTrellis:
         view_diversity = self.calculate_belief_views(rootvine_xyz, ref_src_views)
         return ref_src_views, view_diversity, rootvine_xyz
 
-    def visualize_viewset(self, ref_src_views, rootvine_xyz, bkgd_positions_visibile, bkgd_colors_visibile):
-        # 补充视角可视化，定性评估视角多元化置信度指标
+    def visualize_viewset(self, ref_src_views: list[int], rootvine_xyz: np.ndarray, bkgd_positions_visibile: np.ndarray, bkgd_colors_visibile: np.ndarray) -> None:
+        assert self.c2ws is not None, "call set_param() first"
+        # 补充视角可视化，定性评估視角多元化置信度指標
         pcd_bkgd = o3d.geometry.PointCloud()
         pcd_bkgd.points = o3d.utility.Vector3dVector(bkgd_positions_visibile)
         pcd_bkgd.colors = o3d.utility.Vector3dVector(bkgd_colors_visibile)
@@ -428,7 +435,7 @@ class GrapeTrellis:
             lines.append(view_line_set)
         o3d.visualization.draw_geometries([voxel_bkgd] + lines)
     
-    def visualize_root_and_vine(self):
+    def visualize_root_and_vine(self) -> None:
         pcd_bkgd = o3d.geometry.PointCloud()
         xyz = np.vstack([self.root_table.points_xyz, self.vine_table.get_xyz().reshape([-1,3])])
         # c1 = np.ones(self.root_table.points_xyz.shape) * 0.9
@@ -441,7 +448,7 @@ class GrapeTrellis:
         voxel_bkgd = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd_bkgd, voxel_size=self.voxel_size)
         o3d.visualization.draw_geometries([voxel_bkgd])
 
-    def visualize_root_and_vine_visibility(self):
+    def visualize_root_and_vine_visibility(self) -> None:
         pcd_bkgd = o3d.geometry.PointCloud()
         xyz = np.vstack([self.root_table.points_xyz, self.vine_table.get_xyz().reshape([-1,3])])
         c1 = self.root_table.points_visibility.sum(1, keepdims=True).repeat(3,1).astype(np.float64)
@@ -456,7 +463,7 @@ class GrapeTrellis:
         o3d.visualization.draw_geometries([voxel_bkgd])
 
 
-    def rot_for_training(self):
+    def rot_for_training(self) -> np.ndarray:
         # zyk: normal 对应 rot scaling 如何计算? 
         # zyk: 肯定有问题。先定z轴为平面法线方向。
         anchor_normal = self.get_normal()
@@ -477,7 +484,7 @@ class GrapeTrellis:
         return rots
 
 
-    def generate_vine_voxel_from_depth_propogation(self, viewpoint_cam, propagated_depth, vine_mask, ref_visibility, ref_viewset_diversity_score, ref_gt_image, ref_prop_normal):
+    def generate_vine_voxel_from_depth_propogation(self, viewpoint_cam: Any, propagated_depth: torch.Tensor, vine_mask: np.ndarray, ref_visibility: np.ndarray, ref_viewset_diversity_score: float, ref_gt_image: torch.Tensor, ref_prop_normal: torch.Tensor) -> None:
         # 首先拿到所有点。对于root已有pixel（voxel depth有值），过滤；否则记录voxel_xyz和视角信息
         cam_id = viewpoint_cam.id
         K = viewpoint_cam.K
@@ -555,7 +562,7 @@ class GrapeTrellis:
 
 
 class VineTable:
-    def __init__(self, min_bound, max_bound, N_views=597, voxel_size=0.15):
+    def __init__(self, min_bound: np.ndarray, max_bound: np.ndarray, N_views: int = 597, voxel_size: float = 0.15) -> None:
         self.voxel_size = voxel_size
         self.N_views = N_views
         self.min_bound = min_bound
@@ -581,7 +588,7 @@ class VineTable:
 
     #     self.last_updated_cnt = self.valid_cnt
 
-    def add_observation(self, voxel_name, ref_visibility, ref_viewset_diversity_score, ray_vector):
+    def add_observation(self, voxel_name: str, ref_visibility: np.ndarray, ref_viewset_diversity_score: float, ray_vector: np.ndarray) -> None:
         idx = -1
         if voxel_name in self.hash_voxel_table_id:
             idx = self.hash_voxel_table_id[voxel_name]
@@ -593,7 +600,7 @@ class VineTable:
             self.view_diversity[idx] = ref_viewset_diversity_score
             self.points_ray_vector[idx] = ray_vector
     
-    def get_xyz(self, voxel_name=None):
+    def get_xyz(self, voxel_name: str | None = None) -> np.ndarray | None:
         if voxel_name is None:
             return self.points_xyz[:self.valid_cnt]
 
@@ -604,24 +611,24 @@ class VineTable:
                 return None
         return self.points_xyz[idx]
     
-    def get_color(self):
+    def get_color(self) -> np.ndarray:
         return self.points_color[:self.valid_cnt]
 
-    def get_normal(self):
+    def get_normal(self) -> np.ndarray:
         return self.points_normal[:self.valid_cnt]
     
-    def get_visibility(self):
+    def get_visibility(self) -> np.ndarray:
         return self.points_visibility[:self.valid_cnt]
     
-    def get_ray_vector(self):
+    def get_ray_vector(self) -> np.ndarray:
         return self.points_ray_vector[:self.valid_cnt]
 
-    def push_back(self, new_xyz, new_color, new_normal, new_visibility, new_view_diversity, new_ray_vector):
+    def push_back(self, new_xyz: np.ndarray, new_color: np.ndarray, new_normal: np.ndarray, new_visibility: np.ndarray, new_view_diversity: float | np.ndarray, new_ray_vector: np.ndarray) -> None:
         new_xyz = new_xyz.reshape(-1, 3)
         new_color = new_color.reshape(-1, 3)
         new_normal = new_normal.reshape(-1, 3)
         new_visibility = new_visibility.reshape(-1, self.N_views)
-        new_view_diversity = new_view_diversity.reshape(-1, 1)
+        new_view_diversity_arr = np.asarray(new_view_diversity).reshape(-1, 1)
         new_ray_vector = new_ray_vector.reshape(-1, 3)
 
         num_new_points = new_xyz.shape[0]
@@ -638,12 +645,12 @@ class VineTable:
                 self.points_normal[self.valid_cnt] = new_normal
                 self.points_visibility[self.valid_cnt] = new_visibility
                 self.points_ray_vector[self.valid_cnt] = new_ray_vector
-                self.view_diversity[self.valid_cnt] = new_view_diversity
+                self.view_diversity[self.valid_cnt] = new_view_diversity_arr
 
                 self.valid_cnt += 1
 
 
-    def _double_resize(self):
+    def _double_resize(self) -> None:
         self.CAPACITY = self.CAPACITY * 2
         self.points_xyz = self._enlarge_and_copy(self.points_xyz, self.CAPACITY)
         self.points_color = self._enlarge_and_copy(self.points_color, self.CAPACITY)
@@ -653,35 +660,35 @@ class VineTable:
         self.view_diversity = self._enlarge_and_copy(self.view_diversity, self.CAPACITY)
 
 
-    def _enlarge_and_copy(self, x, size):
+    def _enlarge_and_copy(self, x: np.ndarray, size: int) -> np.ndarray:
         new_x = np.zeros([size, x.shape[1]]) 
         new_x[:self.valid_cnt] = x[:self.valid_cnt]
         return new_x
 
 
-    def hashcode_point(self, x, y, z):
+    def hashcode_point(self, x: float, y: float, z: float) -> str:
         return str(int(x // self.voxel_size)) + " " + str(int(y // self.voxel_size)) + " " + str(int(z // self.voxel_size))
 
-    def hashcode_voxel(self, vx, vy, vz):
+    def hashcode_voxel(self, vx: int | float, vy: int | float, vz: int | float) -> str:
         # if isinstance(vx, int) and isinstance(vy, int) and isinstance(vz, int):
         return str(vx) + " " + str(vy) + " " + str(vz)
 
-    def hash_to_xyz(self, voxel_name):
+    def hash_to_xyz(self, voxel_name: str) -> list[int]:
         return [int(x) for x in voxel_name.split(" ")]
         
 
 
 
 class RootTable: # 对于root，每个voxel有且仅有一个点。不需要额外功能， 只需要提供查找给定float点对应的voxel和邻接voxel即可。
-    def __init__(self, min_bound, max_bound, voxel_size = 0.15):
+    def __init__(self, min_bound: np.ndarray, max_bound: np.ndarray, voxel_size: float = 0.15) -> None:
         self.voxel_size = voxel_size
         self.min_bound = min_bound
         self.max_bound = max_bound
         
-    def hashcode(self, x, y, z):
+    def hashcode(self, x: float, y: float, z: float) -> str:
         return str(int(x // self.voxel_size)) + " " + str(int(y // self.voxel_size)) + " " + str(int(z // self.voxel_size))
 
-    def build_hash_table(self, points_xyz, points_color, points_normal, points_visibility):
+    def build_hash_table(self, points_xyz: np.ndarray, points_color: np.ndarray, points_normal: np.ndarray, points_visibility: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         self.hash_voxel_id = defaultdict(list)
         keep_idx = []
 
@@ -710,40 +717,40 @@ class RootTable: # 对于root，每个voxel有且仅有一个点。不需要额�
     # --- Packed visibility accessors (avoid unpacking the full matrix) ---
 
     @property
-    def points_visibility(self):
+    def points_visibility(self) -> np.ndarray:
         """Unpack full visibility matrix. Use only for save/legacy paths, NOT in hot loops."""
         return np.unpackbits(self._visibility_packed, axis=1)[:, :self._n_views].astype(bool)
 
     @points_visibility.setter
-    def points_visibility(self, value):
+    def points_visibility(self, value: np.ndarray) -> None:
         """Accept unpacked bool array (e.g. from load) and pack it."""
         self._n_views = value.shape[1]
         self._visibility_packed = np.packbits(value.astype(bool), axis=1)
 
-    def vis_column(self, view_id):
+    def vis_column(self, view_id: int) -> np.ndarray:
         """Get visibility for a single view. Returns bool array [n_voxels]."""
         byte_idx = view_id // 8
         bit_idx = view_id % 8
         return ((self._visibility_packed[:, byte_idx] >> (7 - bit_idx)) & 1).astype(bool)
 
-    def vis_rows(self, row_mask):
+    def vis_rows(self, row_mask: np.ndarray) -> np.ndarray:
         """Get unpacked visibility for selected rows only."""
         packed_rows = self._visibility_packed[row_mask]
         return np.unpackbits(packed_rows, axis=1)[:, :self._n_views].astype(bool)
 
-    def vis_any_per_view(self):
+    def vis_any_per_view(self) -> np.ndarray:
         """Return bool[n_views]: True if any voxel is visible in that view."""
         or_all = np.bitwise_or.reduce(self._visibility_packed, axis=0)
         return np.unpackbits(or_all)[:self._n_views].astype(bool)
         
-    def get_voxel_id_from_point(self, x, y, z):
+    def get_voxel_id_from_point(self, x: float, y: float, z: float) -> int | None:
         key = self.hashcode(x,y,z)
         if key not in self.hash_voxel_id:
             return None
         v = self.hash_voxel_id[key]
         return v
     
-    def visualize(self):
+    def visualize(self) -> list[Any]:
         voxel_meshes = []
 
         normal_lines = []
@@ -824,7 +831,7 @@ def point_in_2d_triangle(x, y, triangle_vertices):
 
 
 
-def voxel_traversal(P0, P1, voxel_size):
+def voxel_traversal(P0: np.ndarray, P1: np.ndarray, voxel_size: float) -> list[tuple[int, int, int]]:
     x0, y0, z0 = P0
     x1, y1, z1 = P1
     dx, dy, dz = x1 - x0, y1 - y0, z1 - z0

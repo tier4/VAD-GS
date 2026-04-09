@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import numpy as np
 import os
+from typing import Any
 from simple_knn._C import distCUDA2
 from lib.config import cfg
 from lib.utils.general_utils import quaternion_to_matrix, \
@@ -27,7 +30,7 @@ from lib.models.color_correction import ColorCorrection
 from lib.models.camera_pose import PoseCorrection
 
 class StreetGaussianModel(nn.Module):
-    def __init__(self, metadata):
+    def __init__(self, metadata: dict[str, Any]) -> None:
         super().__init__()
         self.metadata = metadata
             
@@ -61,10 +64,10 @@ class StreetGaussianModel(nn.Module):
         self.flip_matrix = matrix_to_quaternion(self.flip_matrix.unsqueeze(0))
         self.setup_functions() 
     
-    def set_visibility(self, include_list):
+    def set_visibility(self, include_list: list[str]) -> None:
         self.include_list = include_list # prefix
 
-    def get_visibility(self, model_name):
+    def get_visibility(self, model_name: str) -> bool:
         if model_name == 'background':
             if model_name in self.include_list and self.include_background:
                 return True
@@ -83,7 +86,7 @@ class StreetGaussianModel(nn.Module):
         else:
             raise ValueError(f'Unknown model name {model_name}')
                 
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.array):
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.ndarray) -> None:
         for model_name in self.model_name_id.keys():
             model: GaussianModel = getattr(self, model_name)
             if model_name in ['background', 'sky']:
@@ -91,7 +94,7 @@ class StreetGaussianModel(nn.Module):
             else:
                 model.create_from_pcd(spatial_lr_scale, train_views)
 
-    def save_ply(self, path):
+    def save_ply(self, path: str) -> None:
         mkdir_p(os.path.dirname(path))
         
         plydata_list = []
@@ -104,7 +107,7 @@ class StreetGaussianModel(nn.Module):
 
         PlyData(plydata_list).write(path)
         
-    def load_ply(self, path):
+    def load_ply(self, path: str) -> None:
         plydata_list = PlyData.read(path).elements
         for plydata in plydata_list:
             model_name = plydata.name[7:] # vertex_.....
@@ -116,7 +119,7 @@ class StreetGaussianModel(nn.Module):
                 
         self.active_sh_degree = self.max_sh_degree
   
-    def load_state_dict(self, state_dict, exclude_list=[]):
+    def load_state_dict(self, state_dict: dict[str, Any], exclude_list: list[str] = []) -> None:  # type: ignore[override]
         for model_name in self.model_name_id.keys():
             if startswith_any(model_name, exclude_list):
                 continue
@@ -135,7 +138,7 @@ class StreetGaussianModel(nn.Module):
         if self.pose_correction is not None:
             self.pose_correction.load_state_dict(state_dict['pose_correction'])
                             
-    def save_state_dict(self, is_final, exclude_list=[]):
+    def save_state_dict(self, is_final: bool, exclude_list: list[str] = []) -> dict[str, Any]:
         state_dict = dict()
 
         for model_name in self.model_name_id.keys():
@@ -158,7 +161,7 @@ class StreetGaussianModel(nn.Module):
       
         return state_dict
         
-    def setup_functions(self):
+    def setup_functions(self) -> None:
         obj_tracklets = self.metadata['obj_tracklets']
         obj_info = self.metadata['obj_meta']
         tracklet_timestamps = self.metadata['tracklet_timestamps']
@@ -216,7 +219,7 @@ class StreetGaussianModel(nn.Module):
             self.pose_correction = None
             
         
-    def parse_camera(self, camera: Camera):
+    def parse_camera(self, camera: Camera) -> None:
         # set camera
         self.viewpoint_camera = camera
         
@@ -285,7 +288,7 @@ class StreetGaussianModel(nn.Module):
                 self.flip_mask = torch.cat(self.flip_mask, dim=0)
             
     @property
-    def get_scaling(self): 
+    def get_scaling(self) -> torch.Tensor:
         scalings = []
         
         if self.get_visibility('background'):
@@ -303,7 +306,7 @@ class StreetGaussianModel(nn.Module):
         return scalings
             
     @property
-    def get_rotation(self):
+    def get_rotation(self) -> torch.Tensor:
         rotations = []
 
         if self.get_visibility('background'):            
@@ -333,7 +336,7 @@ class StreetGaussianModel(nn.Module):
         return rotations
     
     @property
-    def get_xyz(self):
+    def get_xyz(self) -> torch.Tensor:
         xyzs = []
         if self.get_visibility('background'):
             xyz_bkgd = self.background.get_xyz
@@ -363,7 +366,7 @@ class StreetGaussianModel(nn.Module):
         return xyzs            
 
     @property
-    def get_features(self):                
+    def get_features(self) -> torch.Tensor:
         features = []
 
         if self.get_visibility('background'):
@@ -379,7 +382,7 @@ class StreetGaussianModel(nn.Module):
        
         return features
     
-    def get_colors(self, camera_center):
+    def get_colors(self, camera_center: torch.Tensor) -> torch.Tensor:
         colors = []
 
         model_names = []
@@ -414,7 +417,7 @@ class StreetGaussianModel(nn.Module):
                 
 
     @property
-    def get_semantic(self):
+    def get_semantic(self) -> torch.Tensor:
         semantics = []
         if self.get_visibility('background'):
             semantic_bkgd = self.background.get_semantic
@@ -431,7 +434,7 @@ class StreetGaussianModel(nn.Module):
         return semantics
     
     @property
-    def get_opacity(self):
+    def get_opacity(self) -> torch.Tensor:
         opacities = []
         
         if self.get_visibility('background'):
@@ -448,7 +451,7 @@ class StreetGaussianModel(nn.Module):
         opacities = torch.cat(opacities, dim=0)
         return opacities
             
-    def get_covariance(self, scaling_modifier = 1):
+    def get_covariance(self, scaling_modifier: float = 1) -> torch.Tensor:
         scaling = self.get_scoaling # [N, 1]
         rotation = self.get_rotation # [N, 4]
         L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -456,7 +459,7 @@ class StreetGaussianModel(nn.Module):
         symm = strip_symmetric(actual_covariance)
         return symm
     
-    def get_normals(self, camera: Camera):
+    def get_normals(self, camera: Camera) -> torch.Tensor:
         normals = []
         
         if self.get_visibility('background'):
@@ -480,7 +483,7 @@ class StreetGaussianModel(nn.Module):
         normals_world = torch.cat(normals, dim=0)
         return normals_world
             
-    def oneupSHdegree(self, exclude_list=[]):
+    def oneupSHdegree(self, exclude_list: list[str] = []) -> None:
         for model_name in self.model_name_id.keys():
             if model_name in exclude_list:
                 continue
@@ -490,7 +493,7 @@ class StreetGaussianModel(nn.Module):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def training_setup(self, exclude_list=[]):
+    def training_setup(self, exclude_list: list[str] = []) -> None:
         self.active_sh_degree = 0
 
         for model_name in self.model_name_id.keys():
@@ -511,7 +514,7 @@ class StreetGaussianModel(nn.Module):
         if self.pose_correction is not None:
             self.pose_correction.training_setup()
         
-    def update_learning_rate(self, iteration, exclude_list=[]):
+    def update_learning_rate(self, iteration: int, exclude_list: list[str] = []) -> None:
         for model_name in self.model_name_id.keys():
             if startswith_any(model_name, exclude_list):
                 continue
@@ -530,7 +533,7 @@ class StreetGaussianModel(nn.Module):
         if self.pose_correction is not None:
             self.pose_correction.update_learning_rate(iteration)
     
-    def update_optimizer(self, exclude_list=[], scaler=None):
+    def update_optimizer(self, exclude_list: list[str] = [], scaler: Any = None) -> None:
         for model_name in self.model_name_id.keys():
             if startswith_any(model_name, exclude_list):
                 continue
@@ -549,7 +552,7 @@ class StreetGaussianModel(nn.Module):
         if self.pose_correction is not None:
             self.pose_correction.update_optimizer(scaler=scaler)
 
-    def set_max_radii2D(self, radii, visibility_filter):
+    def set_max_radii2D(self, radii: torch.Tensor, visibility_filter: torch.Tensor) -> None:
         radii = radii.float()
         
         for model_name in self.graph_gaussian_range.keys():
@@ -560,7 +563,7 @@ class StreetGaussianModel(nn.Module):
             model.max_radii2D[visibility_model] = torch.max(
                 model.max_radii2D[visibility_model], max_radii2D_model[visibility_model])
         
-    def add_densification_stats(self, viewspace_point_tensor, visibility_filter):
+    def add_densification_stats(self, viewspace_point_tensor: torch.Tensor, visibility_filter: torch.Tensor) -> None:
         viewspace_point_tensor_grad = viewspace_point_tensor.grad
         for model_name in self.graph_gaussian_range.keys():
             model: GaussianModel = getattr(self, model_name)
@@ -571,7 +574,7 @@ class StreetGaussianModel(nn.Module):
             model.xyz_gradient_accum[visibility_model, 1:2] += torch.norm(viewspace_point_tensor_grad_model[visibility_model, 2:], dim=-1, keepdim=True)
             model.denom[visibility_model] += 1
         
-    def densify_and_prune(self, max_grad, min_opacity, prune_big_points, exclude_list=[]):
+    def densify_and_prune(self, max_grad: float, min_opacity: float, prune_big_points: bool, exclude_list: list[str] = []) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         scalars = None
         tensors = None
         for model_name in self.model_name_id.keys():
@@ -586,7 +589,7 @@ class StreetGaussianModel(nn.Module):
     
         return scalars, tensors
     
-    def get_box_reg_loss(self):
+    def get_box_reg_loss(self) -> float:
         box_reg_loss = 0.
         for obj_name in self.obj_list:
             obj_model: GaussianModelActor = getattr(self, obj_name)
@@ -595,7 +598,7 @@ class StreetGaussianModel(nn.Module):
 
         return box_reg_loss
             
-    def reset_opacity(self, exclude_list=[]):
+    def reset_opacity(self, exclude_list: list[str] = []) -> None:
         for model_name in self.model_name_id.keys():
             model: GaussianModel = getattr(self, model_name)
             if startswith_any(model_name, exclude_list):

@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Any
+
 import torch
 from lib.utils.sh_utils import eval_sh
 from lib.models.street_gaussian_model import StreetGaussianModel
@@ -6,19 +10,19 @@ from lib.config import cfg
 
 class StreetGaussianRenderer():
     def __init__(
-        self,         
-    ):
+        self,
+    ) -> None:
         self.cfg = cfg.render
               
     def render_all(
-        self, 
+        self,
         viewpoint_camera: Camera,
         pc: StreetGaussianModel,
-        convert_SHs_python = None, 
-        compute_cov3D_python = None, 
-        scaling_modifier = None, 
-        override_color = None
-    ):
+        convert_SHs_python: bool | None = None,
+        compute_cov3D_python: bool | None = None,
+        scaling_modifier: float | None = None,
+        override_color: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
         
         # render all
         render_composition = self.render(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color)
@@ -40,16 +44,16 @@ class StreetGaussianRenderer():
         return result
     
     def render_object(
-        self, 
+        self,
         viewpoint_camera: Camera,
         pc: StreetGaussianModel,
-        convert_SHs_python = None, 
-        compute_cov3D_python = None, 
-        scaling_modifier = None, 
-        override_color = None,
+        convert_SHs_python: bool | None = None,
+        compute_cov3D_python: bool | None = None,
+        scaling_modifier: float | None = None,
+        override_color: torch.Tensor | None = None,
         parse_camera_again: bool = True,
-        render_type="rgb",
-    ):        
+        render_type: str = "rgb",
+    ) -> dict[str, torch.Tensor]:        
         pc.set_visibility(include_list=pc.obj_list)
         if parse_camera_again: pc.parse_camera(viewpoint_camera)        
         result = self.render_kernel(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, white_background=True, render_type=render_type)
@@ -57,16 +61,16 @@ class StreetGaussianRenderer():
         return result
     
     def render_background(
-        self, 
+        self,
         viewpoint_camera: Camera,
         pc: StreetGaussianModel,
-        convert_SHs_python = None, 
-        compute_cov3D_python = None, 
-        scaling_modifier = None, 
-        override_color = None,
+        convert_SHs_python: bool | None = None,
+        compute_cov3D_python: bool | None = None,
+        scaling_modifier: float | None = None,
+        override_color: torch.Tensor | None = None,
         parse_camera_again: bool = True,
-        render_type="rgb",
-    ):
+        render_type: str = "rgb",
+    ) -> dict[str, torch.Tensor]:
         pc.set_visibility(include_list=['background'])
         if parse_camera_again: pc.parse_camera(viewpoint_camera)
         result = self.render_kernel(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, white_background=True, render_type=render_type)
@@ -74,15 +78,15 @@ class StreetGaussianRenderer():
         return result
     
     def render_sky(
-        self, 
+        self,
         viewpoint_camera: Camera,
         pc: StreetGaussianModel,
-        convert_SHs_python = None, 
-        compute_cov3D_python = None, 
-        scaling_modifier = None, 
-        override_color = None,
+        convert_SHs_python: bool | None = None,
+        compute_cov3D_python: bool | None = None,
+        scaling_modifier: float | None = None,
+        override_color: torch.Tensor | None = None,
         parse_camera_again: bool = True,
-    ):  
+    ) -> dict[str, torch.Tensor]:  
         pc.set_visibility(include_list=['sky'])
         if parse_camera_again: pc.parse_camera(viewpoint_camera)
         result = self.render_kernel(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color)
@@ -93,13 +97,13 @@ class StreetGaussianRenderer():
         self,
         viewpoint_camera: Camera,
         pc: StreetGaussianModel,
-        convert_SHs_python = None,
-        compute_cov3D_python = None,
-        scaling_modifier = None,
-        override_color = None,
-        exclude_list = [],
-        render_type = "rgb"
-    ):   
+        convert_SHs_python: bool | None = None,
+        compute_cov3D_python: bool | None = None,
+        scaling_modifier: float | None = None,
+        override_color: torch.Tensor | None = None,
+        exclude_list: list[str] = [],
+        render_type: str = "rgb"
+    ) -> dict[str, torch.Tensor]:   
         include_list = list(set(pc.model_name_id.keys()) - set(exclude_list))
                     
         # Step1: render foreground
@@ -124,16 +128,16 @@ class StreetGaussianRenderer():
     
             
     def render_kernel(
-        self, 
+        self,
         viewpoint_camera: Camera,
         pc: StreetGaussianModel,
-        convert_SHs_python = None, 
-        compute_cov3D_python = None, 
-        scaling_modifier = None, 
-        override_color = None,
-        white_background = cfg.data.white_background,
-        render_type = "rgb"
-    ):
+        convert_SHs_python: bool | None = None,
+        compute_cov3D_python: bool | None = None,
+        scaling_modifier: float | None = None,
+        override_color: torch.Tensor | None = None,
+        white_background: bool = cfg.data.white_background,
+        render_type: str = "rgb"
+    ) -> dict[str, Any]:
         try:
             means3D = pc.get_xyz
             num_gaussians = len(means3D)
@@ -147,11 +151,13 @@ class StreetGaussianRenderer():
                 rendered_color = torch.zeros(3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
             
             rendered_acc = torch.zeros(1, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
+            rendered_depth = torch.zeros(1, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
             rendered_semantic = torch.zeros(0, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
-            
+
             return {
                 "rgb": rendered_color,
                 "acc": rendered_acc,
+                "depth": rendered_depth,
                 "semantic": rendered_semantic,
                 "viewspace_points": torch.zeros(0, 3, device="cuda"),
                 "visibility_filter": torch.zeros(0, dtype=torch.bool, device="cuda"),

@@ -1,24 +1,27 @@
+from __future__ import annotations
+
 import os
 import torch
-from typing import Union
 from lib.datasets.dataset import Dataset
 from lib.models.gaussian_model import GaussianModel
 from lib.models.street_gaussian_model import StreetGaussianModel
+from lib.utils.camera_utils import Camera
 from lib.config import cfg
 from lib.utils.system_utils import searchForMaxIteration
-import numpy as np 
+import numpy as np
 
 class Scene:
 
-    gaussians : Union[GaussianModel, StreetGaussianModel]
+    gaussians : GaussianModel | StreetGaussianModel
     dataset: Dataset
 
-    def __init__(self, gaussians: Union[GaussianModel, StreetGaussianModel], dataset: Dataset):
+    def __init__(self, gaussians: GaussianModel | StreetGaussianModel, dataset: Dataset) -> None:
         self.dataset = dataset
         self.gaussians = gaussians
         
         if cfg.mode == 'train':
             point_cloud = self.dataset.scene_info.point_cloud
+            assert point_cloud is not None, "point_cloud is required in train mode"
             scene_raidus = self.dataset.scene_info.metadata['scene_radius']
             print("Creating gaussian model from point cloud")
             # self.gaussians.create_from_pcd(point_cloud, scene_raidus, len(self.dataset.train_cameras[1]) + len(self.dataset.test_cameras[1]))
@@ -51,15 +54,15 @@ class Scene:
             state_dict = torch.load(checkpoint_path)
             self.gaussians.load_state_dict(state_dict=state_dict)
             
-    def save(self, iteration):
+    def save(self, iteration: int) -> None:
         point_cloud_path = os.path.join(cfg.point_cloud_dir, f"iteration_{iteration}", "point_cloud.ply")
         self.gaussians.save_ply(point_cloud_path)
 
-    def getTrainCameras(self, scale=1):
+    def getTrainCameras(self, scale: int = 1) -> list[Camera]:
         return self.dataset.train_cameras[scale]
 
-    def getTestCameras(self, scale=1):
+    def getTestCameras(self, scale: int = 1) -> list[Camera]:
         return self.dataset.test_cameras[scale]
-    
-    def getNovelViewCameras(self, scale=1):
+
+    def getNovelViewCameras(self, scale: int = 1) -> list[Camera]:
         return self.dataset.novel_view_cameras[scale]
