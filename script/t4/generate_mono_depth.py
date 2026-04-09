@@ -103,7 +103,7 @@ def main():
 
     dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
     print(f"Resolved dataroot: {dataroot}")
-    output_dir = args.output_dir or (dataroot / "depth")
+    output_dir = args.output_dir or (dataroot / "preprocessed" / "depth")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -151,7 +151,7 @@ def main():
         print(f"Auto-detected camera channels: {camera_channels}")
 
     # -- Collect image paths ---------------------------------------------------
-    image_entries = []  # (image_path, image_name)
+    image_entries = []  # (image_path, image_name, camera_channel)
     for sample in samples:
         frame_data = sd_by_sample.get(sample["token"], {})
         for ch in camera_channels:
@@ -162,10 +162,12 @@ def main():
             if not image_path.exists():
                 continue
             image_name = image_path.stem
-            save_path = output_dir / f"{image_name}.npz"
+            cam_out_dir = output_dir / ch
+            cam_out_dir.mkdir(parents=True, exist_ok=True)
+            save_path = cam_out_dir / f"{image_name}.npz"
             if args.skip_existing and save_path.exists():
                 continue
-            image_entries.append((str(image_path), image_name))
+            image_entries.append((str(image_path), image_name, ch))
 
     print(f"Images to process: {len(image_entries)}")
     if len(image_entries) == 0:
@@ -196,10 +198,11 @@ def main():
             target_sizes=original_sizes,
         )
 
-        for i, (_, image_name) in enumerate(batch):
+        for i, (_, image_name, ch) in enumerate(batch):
             predicted_depth = post_processed[i]["predicted_depth"]  # (H, W) tensor
             depth_np = predicted_depth.cpu().numpy().astype(np.float32)
-            save_path = output_dir / f"{image_name}.npz"
+            cam_out_dir = output_dir / ch
+            save_path = cam_out_dir / f"{image_name}.npz"
             np.savez_compressed(str(save_path), depth=depth_np)
             # Save visualization as JPEG
             d_min, d_max = depth_np.min(), depth_np.max()
@@ -207,7 +210,7 @@ def main():
                 depth_vis = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
             else:
                 depth_vis = np.zeros_like(depth_np, dtype=np.uint8)
-            Image.fromarray(depth_vis).save(str(output_dir / f"{image_name}.jpg"), quality=90)
+            Image.fromarray(depth_vis).save(str(cam_out_dir / f"{image_name}.jpg"), quality=90)
 
     print(f"Done. Depth maps saved to {output_dir}")
 

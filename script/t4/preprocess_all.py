@@ -32,10 +32,10 @@ def resolve_dataroot(dataset_id_or_path, revision=0):
 
 
 def dir_has_files(path, extensions=(".png", ".npy", ".npz")):
-    """Check if directory exists and contains at least one file with given extensions."""
+    """Check if directory exists and contains at least one file with given extensions (recursive)."""
     if not path.exists():
         return False
-    for f in path.iterdir():
+    for f in path.rglob("*"):
         if f.suffix in extensions:
             return True
     return False
@@ -96,6 +96,8 @@ def main():
 
     results = {}
 
+    prep = dataroot / "preprocessed"
+
     # Step 1: LiDAR depth
     if "lidar_depth" in steps:
         results["lidar_depth"] = run_step(
@@ -107,7 +109,7 @@ def main():
                 "CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
                 "CAM_BACK_LEFT", "CAM_BACK_RIGHT"
              ]) + ["--lidar-channel", args.lidar_channel],
-            dataroot / "lidar_depth",
+            prep / "lidar_depth",
             force=args.force,
         )
 
@@ -117,7 +119,7 @@ def main():
             "Mono Depth (Depth Anything V2 Small)",
             SCRIPT_DIR / "generate_mono_depth.py",
             common + batch_args,
-            dataroot / "depth",
+            prep / "depth",
             force=args.force,
         )
 
@@ -127,7 +129,7 @@ def main():
             "Sky Masks (SegFormer B5)",
             SCRIPT_DIR / "generate_sky_masks.py",
             common + batch_args,
-            dataroot / "sky_masks",
+            prep / "sky_masks",
             force=args.force,
         )
 
@@ -137,7 +139,7 @@ def main():
             "Dynamic + Background Masks",
             SCRIPT_DIR / "generate_sam_masks.py",
             common + batch_args,
-            dataroot / "sam_masks",
+            prep / "sam_masks",
             force=args.force,
         )
 
@@ -147,7 +149,7 @@ def main():
             "Normal Maps (from depth)",
             SCRIPT_DIR / "generate_normal_maps.py",
             common + batch_args,
-            dataroot / "normal_img",
+            prep / "normal_img",
             force=args.force,
         )
 

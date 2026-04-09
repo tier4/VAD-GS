@@ -106,7 +106,7 @@ def main():
     args = parser.parse_args()
 
     dataroot = args.dataroot
-    output_dir = args.output_dir or (dataroot / "lidar_depth")
+    output_dir = args.output_dir or (dataroot / "preprocessed" / "lidar_depth")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Find annotation directory
@@ -232,7 +232,9 @@ def main():
 
             # Build image name matching T4 reader convention
             image_name = os.path.splitext(os.path.basename(cam_sd["filename"]))[0]
-            save_path = output_dir / f"{image_name}.npy"
+            cam_out_dir = output_dir / ch
+            cam_out_dir.mkdir(parents=True, exist_ok=True)
+            save_path = cam_out_dir / f"{image_name}.npy"
             np.save(str(save_path), depth_data)
 
     print(f"Done. Depth maps saved to {output_dir}")

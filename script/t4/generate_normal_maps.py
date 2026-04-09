@@ -162,9 +162,9 @@ def main():
 
     dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
     print(f"Resolved dataroot: {dataroot}")
-    output_dir = args.output_dir or (dataroot / "normal_img")
+    output_dir = args.output_dir or (dataroot / "preprocessed" / "normal_img")
     output_dir.mkdir(parents=True, exist_ok=True)
-    depth_dir = args.depth_dir or (dataroot / "depth")
+    depth_dir = args.depth_dir or (dataroot / "preprocessed" / "depth")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -216,11 +216,13 @@ def main():
             if not image_path.exists():
                 continue
             image_name = image_path.stem
-            save_path = output_dir / f"{image_name}.png"
+            cam_out_dir = output_dir / ch
+            cam_out_dir.mkdir(parents=True, exist_ok=True)
+            save_path = cam_out_dir / f"{image_name}.png"
             if args.skip_existing and save_path.exists():
                 continue
             K = np.array(cs["camera_intrinsic"], dtype=np.float64)
-            entries.append((str(image_path), image_name, K))
+            entries.append((str(image_path), image_name, K, ch))
 
     print(f"Images to process: {len(entries)}")
     if not entries:
@@ -248,11 +250,14 @@ def main():
     for batch_start in tqdm(range(0, len(entries), batch_size), desc="Normal estimation"):
         batch = entries[batch_start:batch_start + batch_size]
 
-        for image_path, image_name, K in batch:
-            # Get depth
-            depth_npz = depth_dir / f"{image_name}.npz"
-            if use_precomputed_depth and depth_npz.exists():
-                depth = np.load(str(depth_npz))["depth"]
+        for image_path, image_name, K, ch in batch:
+            # Get depth (try camera subdirectory first, then flat)
+            depth_npz_cam = depth_dir / ch / f"{image_name}.npz"
+            depth_npz_flat = depth_dir / f"{image_name}.npz"
+            if use_precomputed_depth and depth_npz_cam.exists():
+                depth = np.load(str(depth_npz_cam))["depth"]
+            elif use_precomputed_depth and depth_npz_flat.exists():
+                depth = np.load(str(depth_npz_flat))["depth"]
             elif depth_model is not None:
                 image = Image.open(image_path).convert("RGB")
                 inputs = depth_processor(images=[image], return_tensors="pt").to(device)
@@ -272,13 +277,14 @@ def main():
             # Compute normals
             normal = depth_to_normal(depth_smooth, K)
 
+            cam_out_dir = output_dir / ch
             # Save as BGR PNG
             bgr = normal_to_png_bgr(normal)
-            cv2.imwrite(str(output_dir / f"{image_name}.png"), bgr)
+            cv2.imwrite(str(cam_out_dir / f"{image_name}.png"), bgr)
 
             # Save visualization JPEG
             vis = ((normal + 1) * 0.5 * 255).clip(0, 255).astype(np.uint8)
-            Image.fromarray(vis).save(str(output_dir / f"{image_name}.jpg"), quality=90)
+            Image.fromarray(vis).save(str(cam_out_dir / f"{image_name}.jpg"), quality=90)
 
     print(f"Done. Normal maps saved to {output_dir}")
 

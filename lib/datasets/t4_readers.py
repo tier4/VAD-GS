@@ -5,6 +5,10 @@ from their JSON annotation files. Mirrors the structure of
 my_drivestudio_readers.py for compatibility with the VAD-GS pipeline.
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 from lib.utils.t4_utils import generate_dataparser_outputs_t4, resolve_t4_dataset_path
 from lib.utils.graphics_utils import focal2fov, BasicPointCloud
 from lib.utils.data_utils import get_val_frames
@@ -22,7 +26,7 @@ import sys
 sys.path.append(os.getcwd())
 
 
-def readT4Info(path, images="images", split_train=-1, split_test=-1, **kwargs):
+def readT4Info(path: str, images: str = "images", split_train: int = -1, split_test: int = -1, **kwargs: Any) -> SceneInfo:
     """Read T4 dataset and return SceneInfo for VAD-GS training/evaluation."""
 
     # Resolve dataset ID to filesystem path (supports UUID-based lookup)
@@ -53,23 +57,37 @@ def readT4Info(path, images="images", split_train=-1, split_test=-1, **kwargs):
         not os.path.exists(bkgd_ply_path) or cfg.data.get("regenerate_pcd", False)
     )
 
-    # Guidance data directories (may or may not exist for T4 datasets)
-    dynamic_mask_dir = os.path.join(path, "sam_masks")
-    bkgd_mask_dir = os.path.join(path, "sam_bkgd_masks")
+    # Guidance data directories — prefer preprocessed/ subdirectory, fall back to legacy flat layout
+    prep = os.path.join(path, "preprocessed")
+
+    def _resolve_guidance_dir(name: str, *legacy_names: str) -> str | None:
+        """Return the first existing directory: preprocessed/<name>, <path>/<name>, <path>/<legacy>."""
+        candidate = os.path.join(prep, name)
+        if os.path.exists(candidate):
+            return candidate
+        candidate = os.path.join(path, name)
+        if os.path.exists(candidate):
+            return candidate
+        for ln in legacy_names:
+            candidate = os.path.join(path, ln)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    dynamic_mask_dir = _resolve_guidance_dir("sam_masks") or os.path.join(prep, "sam_masks")
+    bkgd_mask_dir = _resolve_guidance_dir("sam_bkgd_masks") or os.path.join(prep, "sam_bkgd_masks")
     load_dynamic_mask = os.path.exists(dynamic_mask_dir) and os.path.exists(bkgd_mask_dir)
 
-    sky_mask_dir = os.path.join(path, "sky_masks")
+    sky_mask_dir = _resolve_guidance_dir("sky_masks") or os.path.join(prep, "sky_masks")
     load_sky_mask = (cfg.mode == "train") and os.path.exists(sky_mask_dir)
 
-    lidar_depth_dir = os.path.join(path, "lidar_depth")
+    lidar_depth_dir = _resolve_guidance_dir("lidar_depth") or os.path.join(prep, "lidar_depth")
     load_lidar_depth = (cfg.mode == "train") and os.path.exists(lidar_depth_dir)
 
-    mono_depth_dir = os.path.join(path, "depth")
-    if not os.path.exists(mono_depth_dir):
-        mono_depth_dir = os.path.join(path, "depth_v2")
+    mono_depth_dir = _resolve_guidance_dir("depth", "depth_v2") or os.path.join(prep, "depth")
     load_mono_depth = os.path.exists(mono_depth_dir)
 
-    normal_dir = os.path.join(path, "normal_img")
+    normal_dir = _resolve_guidance_dir("normal_img") or os.path.join(prep, "normal_img")
     load_normal = os.path.exists(normal_dir)
 
     # T4-specific config
@@ -130,6 +148,16 @@ def readT4Info(path, images="images", split_train=-1, split_test=-1, **kwargs):
         camera_timestamps[cam]["train_timestamps"] = []
         camera_timestamps[cam]["test_timestamps"] = []
 
+    def _find_guidance_file(base_dir: str, cam_channel: str, image_name: str, ext: str) -> str | None:
+        """Find guidance file, checking camera subdirectory first then flat."""
+        cam_path = os.path.join(base_dir, cam_channel, f"{image_name}{ext}")
+        if os.path.exists(cam_path):
+            return cam_path
+        flat_path = os.path.join(base_dir, f"{image_name}{ext}")
+        if os.path.exists(flat_path):
+            return flat_path
+        return None
+
     # Build CameraInfo list
     cam_infos = []
     for i in tqdm(range(len(exts)), desc="Loading T4 cameras"):
@@ -139,6 +167,8 @@ def readT4Info(path, images="images", split_train=-1, split_test=-1, **kwargs):
         pose = poses[i]
         image_path = image_filenames[i]
         image_name = os.path.basename(image_path).split(".")[0]
+        # Camera channel = parent directory name (e.g. "CAM_FRONT")
+        cam_channel = os.path.basename(os.path.dirname(image_path))
         # Get dimensions from header only; defer pixel loading to loadCam
         with Image.open(image_path) as img:
             width, height = img.size
@@ -171,12 +201,12 @@ def readT4Info(path, images="images", split_train=-1, split_test=-1, **kwargs):
 
         # Store paths for deferred loading (loaded in loadguidance)
         if load_dynamic_mask:
-            dynamic_mask_path = os.path.join(dynamic_mask_dir, f"{image_name}.png")
-            if os.path.exists(dynamic_mask_path):
+            dynamic_mask_path = _find_guidance_file(dynamic_mask_dir, cam_channel, image_name, ".png")
+            if dynamic_mask_path is not None:
                 guidance["dynamic_mask"] = dynamic_mask_path
 
-                seg_bkgd_mask_path = os.path.join(bkgd_mask_dir, f"{image_name}.png")
-                if os.path.exists(seg_bkgd_mask_path):
+                seg_bkgd_mask_path = _find_guidance_file(bkgd_mask_dir, cam_channel, image_name, ".png")
+                if seg_bkgd_mask_path is not None:
                     guidance["seg_bkgd"] = seg_bkgd_mask_path
 
                 # Save obj_bound to disk to avoid ~700MB of PIL Images in RAM
@@ -188,26 +218,25 @@ def readT4Info(path, images="images", split_train=-1, split_test=-1, **kwargs):
                 guidance["obj_bound"] = obj_bound_path
 
         if load_lidar_depth:
-            depth_path = os.path.join(lidar_depth_dir, f"{image_name}.npy")
-            if os.path.exists(depth_path):
+            depth_path = _find_guidance_file(lidar_depth_dir, cam_channel, image_name, ".npy")
+            if depth_path is not None:
                 guidance["lidar_depth"] = depth_path
 
         if load_sky_mask:
-            sky_mask_path = os.path.join(sky_mask_dir, f"{image_name}.png")
-            if os.path.exists(sky_mask_path):
+            sky_mask_path = _find_guidance_file(sky_mask_dir, cam_channel, image_name, ".png")
+            if sky_mask_path is not None:
                 guidance["sky_mask"] = sky_mask_path
 
         if load_mono_depth:
-            depth_npz_path = os.path.join(mono_depth_dir, f"{image_name}.npz")
-            depth_png_path = os.path.join(mono_depth_dir, f"{image_name}.png")
-            if os.path.exists(depth_npz_path):
-                guidance["mono_depth"] = depth_npz_path
-            elif os.path.exists(depth_png_path):
-                guidance["mono_depth"] = depth_png_path
+            mono_depth_path = _find_guidance_file(mono_depth_dir, cam_channel, image_name, ".npz")
+            if mono_depth_path is None:
+                mono_depth_path = _find_guidance_file(mono_depth_dir, cam_channel, image_name, ".png")
+            if mono_depth_path is not None:
+                guidance["mono_depth"] = mono_depth_path
 
         if load_normal:
-            normal_img_path = os.path.join(normal_dir, f"{image_name}.png")
-            if os.path.exists(normal_img_path):
+            normal_img_path = _find_guidance_file(normal_dir, cam_channel, image_name, ".png")
+            if normal_img_path is not None:
                 guidance["mono_normal"] = normal_img_path
 
         cam_info = CameraInfo(

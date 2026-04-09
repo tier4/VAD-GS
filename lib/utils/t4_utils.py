@@ -865,8 +865,10 @@ def _build_pointcloud_t4(
         print("No COLMAP point cloud available")
         has_colmap = False
 
-    # Check for normal maps
-    normal_dir = os.path.join(datadir, "normal_img")
+    # Check for normal maps (prefer preprocessed/ subdirectory)
+    normal_dir = os.path.join(datadir, "preprocessed", "normal_img")
+    if not os.path.exists(normal_dir):
+        normal_dir = os.path.join(datadir, "normal_img")
     has_normals = os.path.exists(normal_dir)
     if not has_normals:
         print("Warning: normal_img/ not found. Using zero normals for point cloud.")
@@ -935,37 +937,35 @@ def _build_pointcloud_t4(
         for cam, image_filename, idx in zip(cams_frame, image_filenames_frame, idxs):
             image = cv2.imread(image_filename)[..., [2, 1, 0]].astype(np.float32) / 255.0
 
+            # Derive camera channel and image name for normal file lookup
+            _img_name = os.path.splitext(os.path.basename(image_filename))[0]
+            _cam_ch = os.path.basename(os.path.dirname(image_filename))
+
+            _resolved_normal_file = None
             if has_normals:
-                normal_filename = image_filename.replace("images", "normal_img")
-                # Handle different extensions
+                # Try camera subdirectory first, then flat
                 for ext_try in [".png", ".jpg"]:
-                    nf = os.path.splitext(normal_filename)[0] + ext_try
-                    if os.path.exists(nf):
-                        normal_filename = nf
+                    nf_cam = os.path.join(normal_dir, _cam_ch, f"{_img_name}{ext_try}")
+                    if os.path.exists(nf_cam):
+                        _resolved_normal_file = nf_cam
                         break
-                if os.path.exists(normal_filename):
-                    normal_dsine = cv2.imread(normal_filename).astype(np.float32) / 255.0 * 2 - 1
-                    normals_transformed = np.zeros_like(normal_dsine)
-                    normals_transformed[..., 0] = -normal_dsine[..., 2]
-                    normals_transformed[..., 1] = -normal_dsine[..., 1]
-                    normals_transformed[..., 2] = -normal_dsine[..., 0]
-                else:
-                    normals_transformed = np.zeros_like(image)
+                    nf_flat = os.path.join(normal_dir, f"{_img_name}{ext_try}")
+                    if os.path.exists(nf_flat):
+                        _resolved_normal_file = nf_flat
+                        break
+
+            if _resolved_normal_file is not None:
+                normal_dsine = cv2.imread(_resolved_normal_file).astype(np.float32) / 255.0 * 2 - 1
+                normals_transformed = np.zeros_like(normal_dsine)
+                normals_transformed[..., 0] = -normal_dsine[..., 2]
+                normals_transformed[..., 1] = -normal_dsine[..., 1]
+                normals_transformed[..., 2] = -normal_dsine[..., 0]
             else:
                 normals_transformed = np.zeros_like(image)
 
             ixt = ixts_all[idx]
             c2w = c2ws_all[idx]
             normals_world = normals_transformed @ c2w[:3, :3].T
-            # Store metadata instead of full image to save memory
-            _resolved_normal_file = None
-            if has_normals:
-                _nf_candidate = image_filename.replace("images", "normal_img")
-                for ext_try in [".png", ".jpg"]:
-                    _nf = os.path.splitext(_nf_candidate)[0] + ext_try
-                    if os.path.exists(_nf):
-                        _resolved_normal_file = _nf
-                        break
             normals_world_info.append((_resolved_normal_file, c2w[:3, :3].copy()))
 
             # Project points to this camera

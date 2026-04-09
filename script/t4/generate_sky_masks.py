@@ -84,7 +84,7 @@ def main():
 
     dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
     print(f"Resolved dataroot: {dataroot}")
-    output_dir = args.output_dir or (dataroot / "sky_masks")
+    output_dir = args.output_dir or (dataroot / "preprocessed" / "sky_masks")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -140,10 +140,12 @@ def main():
             if not image_path.exists():
                 continue
             image_name = image_path.stem
-            save_path = output_dir / f"{image_name}.png"
+            cam_out_dir = output_dir / ch
+            cam_out_dir.mkdir(parents=True, exist_ok=True)
+            save_path = cam_out_dir / f"{image_name}.png"
             if args.skip_existing and save_path.exists():
                 continue
-            image_entries.append((str(image_path), image_name))
+            image_entries.append((str(image_path), image_name, ch))
 
     print(f"Images to process: {len(image_entries)}")
     if not image_entries:
@@ -171,7 +173,7 @@ def main():
 
         logits = outputs.logits  # (B, num_classes, H/4, W/4)
 
-        for i, (_, image_name) in enumerate(batch):
+        for i, (_, image_name, ch) in enumerate(batch):
             h, w = original_sizes[i]
             upsampled = F.interpolate(
                 logits[i:i+1], size=(h, w), mode="bilinear", align_corners=False
@@ -179,13 +181,14 @@ def main():
             pred = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()  # (H, W)
             sky_mask = (pred == CITYSCAPES_SKY_CLASS).astype(np.uint8) * 255
 
+            cam_out_dir = output_dir / ch
             # Save binary PNG
-            cv2.imwrite(str(output_dir / f"{image_name}.png"), sky_mask)
+            cv2.imwrite(str(cam_out_dir / f"{image_name}.png"), sky_mask)
             # Save visualization JPEG (sky overlay in blue)
             img_np = np.array(images[i])
             vis = img_np.copy()
             vis[sky_mask > 0] = (vis[sky_mask > 0] * 0.4 + np.array([100, 150, 255]) * 0.6).astype(np.uint8)
-            Image.fromarray(vis).save(str(output_dir / f"{image_name}.jpg"), quality=90)
+            Image.fromarray(vis).save(str(cam_out_dir / f"{image_name}.jpg"), quality=90)
 
     print(f"Done. Sky masks saved to {output_dir}")
 

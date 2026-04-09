@@ -184,8 +184,8 @@ def main():
 
     dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
     print(f"Resolved dataroot: {dataroot}")
-    out_dynamic = args.output_dir_dynamic or (dataroot / "sam_masks")
-    out_bkgd = args.output_dir_bkgd or (dataroot / "sam_bkgd_masks")
+    out_dynamic = args.output_dir_dynamic or (dataroot / "preprocessed" / "sam_masks")
+    out_bkgd = args.output_dir_bkgd or (dataroot / "preprocessed" / "sam_bkgd_masks")
     out_dynamic.mkdir(parents=True, exist_ok=True)
     out_bkgd.mkdir(parents=True, exist_ok=True)
 
@@ -266,8 +266,12 @@ def main():
             if not image_path.exists():
                 continue
             image_name = image_path.stem
-            dyn_path = out_dynamic / f"{image_name}.png"
-            bkgd_path = out_bkgd / f"{image_name}.png"
+            dyn_cam_dir = out_dynamic / ch
+            bkgd_cam_dir = out_bkgd / ch
+            dyn_cam_dir.mkdir(parents=True, exist_ok=True)
+            bkgd_cam_dir.mkdir(parents=True, exist_ok=True)
+            dyn_path = dyn_cam_dir / f"{image_name}.png"
+            bkgd_path = bkgd_cam_dir / f"{image_name}.png"
             if args.skip_existing and dyn_path.exists() and bkgd_path.exists():
                 continue
             entries.append((str(image_path), image_name, sample["token"], ch, sd, cs))
@@ -320,7 +324,7 @@ def main():
             )
             dyn_mask[mask_2d > 0] = remapped_id
 
-        cv2.imwrite(str(out_dynamic / f"{image_name}.png"), dyn_mask)
+        cv2.imwrite(str(out_dynamic / ch / f"{image_name}.png"), dyn_mask)
 
     # Save track_id mapping for reference
     mapping_path = out_dynamic / "track_id_mapping.json"
@@ -349,7 +353,7 @@ def main():
 
         logits = outputs.logits
 
-        for i, (_, image_name, *_) in enumerate(batch):
+        for i, (_, image_name, _, ch, *_) in enumerate(batch):
             h, w = original_sizes[i]
             upsampled = F.interpolate(
                 logits[i:i+1], size=(h, w), mode="bilinear", align_corners=False
@@ -361,10 +365,11 @@ def main():
             for cls_id, color in BKGD_CLASS_COLORS.items():
                 bkgd_mask[pred == cls_id] = color
 
-            cv2.imwrite(str(out_bkgd / f"{image_name}.png"), bkgd_mask)
+            bkgd_cam_dir = out_bkgd / ch
+            cv2.imwrite(str(bkgd_cam_dir / f"{image_name}.png"), bkgd_mask)
             # Visualization
             Image.fromarray(bkgd_mask[:, :, ::-1]).save(
-                str(out_bkgd / f"{image_name}.jpg"), quality=90
+                str(bkgd_cam_dir / f"{image_name}.jpg"), quality=90
             )
 
     print(f"Done. Dynamic masks: {out_dynamic}, Background masks: {out_bkgd}")
