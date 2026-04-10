@@ -397,7 +397,7 @@ def training() -> None:
                 # rendered_normal = render_pkg['normals']
                 # radii = render_pkg["radii"]
 
-                rendered_depth = soft_render_pkg['depth'][0] 
+                rendered_depth = soft_render_pkg['depth'][0]
                 rendered_normal = soft_render_pkg['normals']
 
                 # get the propagated depth
@@ -942,7 +942,7 @@ def training() -> None:
                 loss += optim_args.lambda_color_correction * color_correction_reg_loss
 
             if optim_args.normal_loss:
-                if mono_normal is not None:
+                if mono_normal is not None and 'normals' in soft_render_pkg:
                     rendered_normal = soft_render_pkg['normals']
                     normal_gt = mono_normal #
                     if sky_mask is not None: # if viewpoint_cam.sky_mask is not None:

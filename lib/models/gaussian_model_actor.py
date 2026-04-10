@@ -282,7 +282,7 @@ class GaussianModelActor(GaussianModel):
         self.densify_and_split(grads, max_grad, extent)
 
         # Prune points below opacity
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
         
         if prune_big_points:
             # Prune big points in world space
@@ -315,8 +315,10 @@ class GaussianModelActor(GaussianModel):
             #     prune_mask[:] = False
 
             prune_mask = torch.logical_or(prune_mask, points_outside_box)
-            if prune_mask.shape[0] - prune_mask.sum() < 100:
-                prune_mask[:] = False
+
+        # Ensure minimum number of gaussians survive for any actor
+        if prune_mask.shape[0] - prune_mask.sum() < 100:
+            prune_mask[:] = False
 
         self.prune_points(prune_mask)
         

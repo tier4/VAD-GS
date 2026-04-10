@@ -79,7 +79,7 @@ class GaussinaModelSky(GaussianModel):
         self.densify_and_split(grads, max_grad, extent)
 
         # Prune points below opacity
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
         print(f'Prune points below min_opactiy: {prune_mask.sum()}')
         self.scalar_dict['points_below_min_opacity'] = prune_mask.sum().item()
                 

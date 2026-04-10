@@ -138,23 +138,21 @@ class StreetGaussianRenderer():
         white_background: bool = cfg.data.white_background,
         render_type: str = "rgb"
     ) -> dict[str, Any]:
-        try:
-            means3D = pc.get_xyz
-            num_gaussians = len(means3D)
-        except:
-            num_gaussians = 0
-        
-        if num_gaussians == 0:
-            if white_background:
-                rendered_color = torch.ones(3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
-            else:
-                rendered_color = torch.zeros(3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
-            
-            rendered_acc = torch.zeros(1, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
-            rendered_depth = torch.zeros(1, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
-            rendered_semantic = torch.zeros(0, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), device="cuda")
+        means3D = pc.get_xyz
+        num_gaussians = len(means3D)
 
-            return {
+        if num_gaussians == 0:
+            H, W = int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)
+            if white_background:
+                rendered_color = torch.ones(3, H, W, device="cuda")
+            else:
+                rendered_color = torch.zeros(3, H, W, device="cuda")
+
+            rendered_acc = torch.zeros(1, H, W, device="cuda")
+            rendered_depth = torch.zeros(1, H, W, device="cuda")
+            rendered_semantic = torch.zeros(0, H, W, device="cuda")
+
+            result = {
                 "rgb": rendered_color,
                 "acc": rendered_acc,
                 "depth": rendered_depth,
@@ -163,6 +161,9 @@ class StreetGaussianRenderer():
                 "visibility_filter": torch.zeros(0, dtype=torch.bool, device="cuda"),
                 "radii": torch.zeros(0, dtype=torch.int32, device="cuda"),
             }
+            if cfg.render.render_normal and render_type != "hard_depth":
+                result["normals"] = torch.zeros(3, H, W, device="cuda")
+            return result
 
         # Set up rasterization configuration and make rasterizer
         bg_color = [1, 1, 1] if white_background else [0, 0, 0]

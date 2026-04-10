@@ -557,7 +557,7 @@ class GaussianModel(nn.Module):
         self.densify_and_split(grads, max_grad, extent)
 
         # Prune 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
         # prune_mask = torch.logical_or(prune_mask, (self.get_scaling < 0.01).squeeze())
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size

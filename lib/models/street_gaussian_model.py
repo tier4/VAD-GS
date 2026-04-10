@@ -342,9 +342,9 @@ class StreetGaussianModel(nn.Module):
             xyz_bkgd = self.background.get_xyz
             if self.use_pose_correction:
                 xyz_bkgd = self.pose_correction.correct_gaussian_xyz(self.viewpoint_camera, xyz_bkgd)
-            
+
             xyzs.append(xyz_bkgd)
-        
+
         if len(self.graph_obj_list) > 0:
             xyzs_local = []
 
@@ -352,7 +352,7 @@ class StreetGaussianModel(nn.Module):
                 obj_model: GaussianModelActor = getattr(self, obj_name)
                 xyz_local = obj_model.get_xyz
                 xyzs_local.append(xyz_local)
-                
+
             xyzs_local = torch.cat(xyzs_local, dim=0)
             if cfg.mode == 'train':
                 xyzs_local = xyzs_local.clone()
