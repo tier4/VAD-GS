@@ -168,9 +168,6 @@ def main():
         bgr = normal_to_png_bgr(normal)
         cv2.imwrite(str(cam_out_dir / f"{frame.image_name}.png"), bgr)
 
-        vis = ((normal + 1) * 0.5 * 255).clip(0, 255).astype(np.uint8)
-        Image.fromarray(vis).save(str(cam_out_dir / f"{frame.image_name}.jpg"), quality=90)
-
     print(f"Done. Normal maps saved to {output_dir}")
 
 

@@ -288,9 +288,6 @@ def main():
 
             bkgd_cam_dir = out_bkgd / frame.camera_channel
             cv2.imwrite(str(bkgd_cam_dir / f"{frame.image_name}.png"), bkgd_mask)
-            Image.fromarray(bkgd_mask[:, :, ::-1]).save(
-                str(bkgd_cam_dir / f"{frame.image_name}.jpg"), quality=90,
-            )
 
     # Save track_id mapping
     mapping_path = out_dynamic / "track_id_mapping.json"

@@ -106,11 +106,6 @@ def main():
 
             cam_out_dir = output_dir / frame.camera_channel
             cv2.imwrite(str(cam_out_dir / f"{frame.image_name}.png"), sky_mask)
-            # Visualization
-            img_np = np.array(images[i])
-            vis = img_np.copy()
-            vis[sky_mask > 0] = (vis[sky_mask > 0] * 0.4 + np.array([100, 150, 255]) * 0.6).astype(np.uint8)
-            Image.fromarray(vis).save(str(cam_out_dir / f"{frame.image_name}.jpg"), quality=90)
 
     print(f"Done. Sky masks saved to {output_dir}")
 

@@ -99,15 +99,6 @@ def main():
             depth_np = post_processed[i]["predicted_depth"].cpu().numpy().astype(np.float32)
             cam_out_dir = output_dir / frame.camera_channel
             np.savez_compressed(str(cam_out_dir / f"{frame.image_name}.npz"), depth=depth_np)
-            # Visualization
-            d_min, d_max = depth_np.min(), depth_np.max()
-            if d_max - d_min > 1e-6:
-                depth_vis = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-            else:
-                depth_vis = np.zeros_like(depth_np, dtype=np.uint8)
-            Image.fromarray(depth_vis).save(
-                str(cam_out_dir / f"{frame.image_name}.jpg"), quality=90
-            )
 
     print(f"Done. Depth maps saved to {output_dir}")
 
