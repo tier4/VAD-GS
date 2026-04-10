@@ -3,7 +3,7 @@ name = "vad-gs"
 version = "0.1.0"
 description = "Visibility-Aware Densification for 3D Gaussian Splatting in Dynamic Urban Scenes"
 readme = "README.md"
-requires-python = ">=3.8,<3.13"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "bidict",
     "diff_gaussian_rasterization",
@@ -42,6 +42,7 @@ dependencies = [
     "torchvision==0.19.0; sys_platform == 'darwin'",
     "tqdm",
     "transformers>=4.46.3",
+    "t4-devkit",
 ]
 
 [tool.uv]
@@ -76,6 +77,7 @@ nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git" }
 patchmatch_cuda = { path = "submodules/MyPropagation" }
 simple_knn = { path = "submodules/simple-knn" }
 simple_waymo_open_dataset_reader = { path = "submodules/simple-waymo-open-dataset-reader" }
+t4-devkit = { git = "https://github.com/tier4/t4-devkit.git", tag = "v0.6.0" }
 
 [tool.ty.environment]
 python-version = "3.11"

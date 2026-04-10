@@ -13,8 +13,8 @@ Usage:
 """
 
 import argparse
-import json
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
@@ -22,79 +22,8 @@ import imageio
 import numpy as np
 from tqdm import tqdm
 
-from config_utils import add_config_arg, apply_config_defaults, resolve_dataroot
-
-
-# ---------------------------------------------------------------------------
-# T4 helpers
-# ---------------------------------------------------------------------------
-
-def load_t4_tables(annotation_dir):
-    tables = {}
-    for name in ["scene", "sample", "sample_data", "calibrated_sensor", "sensor"]:
-        path = os.path.join(str(annotation_dir), f"{name}.json")
-        if os.path.exists(path):
-            with open(path) as f:
-                tables[name] = json.load(f)
-        else:
-            tables[name] = []
-    return tables
-
-
-def _index(records):
-    return {r["token"]: r for r in records}
-
-
-def collect_frame_paths(dataroot, scene_index, camera_channels, tables):
-    """Collect per-camera ordered lists of (image_path, image_name) for a scene.
-
-    Returns dict: camera_channel -> [(image_path, image_name), ...]
-    """
-    sample_by_token = _index(tables["sample"])
-    cs_by_token = _index(tables["calibrated_sensor"])
-    sensor_by_token = _index(tables["sensor"])
-
-    scene = tables["scene"][scene_index]
-
-    # Build ordered sample chain
-    samples = []
-    token = scene["first_sample_token"]
-    while token:
-        samples.append(sample_by_token[token])
-        token = sample_by_token[token].get("next", "")
-
-    # Map sample_token -> {channel: sample_data} (keyframes only)
-    sd_by_sample = {}
-    for sd in tables["sample_data"]:
-        if not sd.get("is_key_frame", False):
-            continue
-        cs = cs_by_token.get(sd["calibrated_sensor_token"])
-        if cs is None:
-            continue
-        sensor = sensor_by_token.get(cs["sensor_token"])
-        if sensor is None or sensor.get("modality") != "camera":
-            continue
-        sd_by_sample.setdefault(sd["sample_token"], {})[sensor["channel"]] = sd
-
-    # Auto-detect cameras if not specified
-    if camera_channels is None:
-        all_ch = set()
-        for sensor in tables["sensor"]:
-            if sensor.get("modality") == "camera":
-                all_ch.add(sensor["channel"])
-        camera_channels = sorted(all_ch)
-
-    result = {ch: [] for ch in camera_channels}
-    for sample in samples:
-        frame_data = sd_by_sample.get(sample["token"], {})
-        for ch in camera_channels:
-            if ch in frame_data:
-                rel_path = frame_data[ch]["filename"]
-                abs_path = dataroot / rel_path
-                image_name = Path(rel_path).stem
-                result[ch].append((str(abs_path), image_name))
-
-    return result
+from config_utils import add_config_arg, apply_config_defaults
+from t4_dataset import T4Dataset
 
 
 # ---------------------------------------------------------------------------
@@ -253,20 +182,16 @@ def main():
     if args.scene_index is None:
         args.scene_index = 0
 
-    dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
+    ds = T4Dataset.from_args(args)
+    dataroot = ds.dataroot
     print(f"Resolved dataroot: {dataroot}")
 
     output_dir = args.output_dir or (dataroot / "preprocess_vis")
 
-    # Load T4 tables
-    annotation_dir = dataroot / "annotation"
-    if not annotation_dir.exists():
-        raise FileNotFoundError(f"No annotation directory found at {annotation_dir}")
-
-    tables = load_t4_tables(annotation_dir)
-    frame_paths = collect_frame_paths(
-        dataroot, args.scene_index, args.camera_channels, tables
-    )
+    # Build per-camera frame lists using T4Dataset
+    frame_paths = defaultdict(list)  # cam -> [(image_path, image_name), ...]
+    for frame in ds.iter_frames(args.camera_channels):
+        frame_paths[frame.camera_channel].append((frame.image_path, frame.image_name))
 
     cameras = list(frame_paths.keys())
     if not cameras:

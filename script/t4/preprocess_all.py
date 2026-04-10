@@ -10,87 +10,14 @@ Usage:
 """
 
 import argparse
-import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-from config_utils import add_config_arg, apply_config_defaults, resolve_dataroot
+from config_utils import add_config_arg, apply_config_defaults
+from t4_dataset import T4Dataset
 
 SCRIPT_DIR = Path(__file__).parent
-
-
-def load_t4_tables(annotation_dir):
-    """Load T4 annotation tables needed for frame counting."""
-    tables = {}
-    for name in ["scene", "sample", "sample_data", "calibrated_sensor", "sensor"]:
-        path = os.path.join(str(annotation_dir), f"{name}.json")
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                tables[name] = json.load(f)
-        else:
-            tables[name] = []
-    return tables
-
-
-def count_expected_frames(dataroot, scene_index, camera_channels, tables=None):
-    """Count expected output frames per camera for a given scene.
-
-    Returns dict mapping camera channel name -> expected frame count.
-    *tables* can be pre-loaded to avoid re-reading JSON from disk.
-    """
-    annotation_dir = dataroot / "annotation"
-    if not annotation_dir.exists():
-        return {}
-
-    if tables is None:
-        tables = load_t4_tables(annotation_dir)
-
-    sample_by_token = {s["token"]: s for s in tables["sample"]}
-    cs_by_token = {c["token"]: c for c in tables["calibrated_sensor"]}
-    sensor_by_token = {s["token"]: s for s in tables["sensor"]}
-
-    scene = tables["scene"][scene_index]
-
-    # Build sample chain
-    samples = []
-    token = scene["first_sample_token"]
-    while token:
-        samples.append(sample_by_token[token])
-        token = sample_by_token[token].get("next", "")
-
-    # Map sample_token -> {channel: sample_data} (keyframes only)
-    sd_by_sample: dict[str, dict] = {}
-    for sd in tables["sample_data"]:
-        if not sd.get("is_key_frame", False):
-            continue
-        cs = cs_by_token.get(sd["calibrated_sensor_token"])
-        if cs is None:
-            continue
-        sensor = sensor_by_token.get(cs["sensor_token"])
-        if sensor is None or sensor.get("modality") != "camera":
-            continue
-        sd_by_sample.setdefault(sd["sample_token"], {})[sensor["channel"]] = sd
-
-    # Auto-detect cameras if not specified
-    if camera_channels is None:
-        all_ch: set[str] = set()
-        for sensor in tables["sensor"]:
-            if sensor.get("modality") == "camera":
-                all_ch.add(sensor["channel"])
-        camera_channels = sorted(all_ch)
-
-    counts: dict[str, int] = {}
-    for sample in samples:
-        frame_data = sd_by_sample.get(sample["token"], {})
-        for ch in camera_channels:
-            if ch in frame_data:
-                img_path = dataroot / frame_data[ch]["filename"]
-                if img_path.exists():
-                    counts[ch] = counts.get(ch, 0) + 1
-
-    return counts
 
 
 def is_step_complete(output_dir, expected_counts, extension):
@@ -162,7 +89,9 @@ def main():
     if args.lidar_channel is None:
         args.lidar_channel = "LIDAR_CONCAT"
 
-    dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
+    # Use T4Dataset for frame counting
+    ds = T4Dataset.from_args(args)
+    dataroot = ds.dataroot
     print(f"Resolved dataroot: {dataroot}")
 
     # Common args passed to all sub-scripts
@@ -184,16 +113,13 @@ def main():
 
     prep = dataroot / "preprocessed"
 
-    # Count expected frames per camera for completeness checks
-    annotation_dir = dataroot / "annotation"
-    tables = load_t4_tables(annotation_dir) if annotation_dir.exists() else None
+    # Count expected frames per camera using t4-devkit
     lidar_cameras = args.camera_channels or [
         "CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
         "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
     ]
-    lidar_expected = count_expected_frames(dataroot, args.scene_index, lidar_cameras, tables)
-    # Other steps auto-detect cameras when --camera-channels is not given
-    other_expected = count_expected_frames(dataroot, args.scene_index, args.camera_channels, tables)
+    lidar_expected = ds.count_frames_per_camera(lidar_cameras)
+    other_expected = ds.count_frames_per_camera(args.camera_channels)
 
     if lidar_expected:
         total = sum(lidar_expected.values())
