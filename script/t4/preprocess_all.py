@@ -148,7 +148,7 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="Force re-run all steps even if output exists")
     parser.add_argument("--steps", nargs="+", default=None,
-                        help="Run only specific steps (lidar_depth, mono_depth, sky_masks, sam_masks, normal_maps)")
+                        help="Run only specific steps (lidar_depth, mono_depth, sky_masks, sam_masks, normal_maps, visualize)")
     args = parser.parse_args()
 
     # Apply config defaults, then hard defaults
@@ -177,7 +177,7 @@ def main():
     if args.force:
         batch_args += ["--no-skip-existing"]
 
-    all_steps = ["lidar_depth", "mono_depth", "sky_masks", "sam_masks", "normal_maps"]
+    all_steps = ["lidar_depth", "mono_depth", "sky_masks", "sam_masks", "normal_maps", "visualize"]
     steps = args.steps or all_steps
 
     results = {}
@@ -271,6 +271,20 @@ def main():
             force=args.force,
             expected_counts=other_expected,
             extension=".png",
+        )
+
+    # Step 6: Visualize preprocessed data as MP4 videos
+    if "visualize" in steps:
+        vis_args = ["--dataroot", str(dataroot),
+                    "--scene-index", str(args.scene_index)]
+        if args.camera_channels:
+            vis_args += ["--camera-channels"] + args.camera_channels
+        results["visualize"] = run_step(
+            "Visualize Preprocessed Data",
+            SCRIPT_DIR / "visualize_preprocess.py",
+            vis_args,
+            dataroot / "preprocess_vis",
+            force=True,
         )
 
     # Summary
