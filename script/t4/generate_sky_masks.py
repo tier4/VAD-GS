@@ -1,10 +1,11 @@
-"""Generate sky masks using SegFormer B5 (Cityscapes) for T4 datasets.
+"""Generate sky masks using SAM3 (Segment Anything Model 3) for T4 datasets.
 
-Uses t4-devkit for dataset I/O and frame iteration.
+Uses SAM3 with text prompt "sky" for open-vocabulary sky segmentation.
+Pre-computes text embeddings once and reuses them across all images.
 
 Usage:
     python script/t4/generate_sky_masks.py --config configs/example/t4_train_example.yaml
-    python script/t4/generate_sky_masks.py --dataroot caf37e66-... --scene-index 0 --batch-size 4
+    python script/t4/generate_sky_masks.py --dataroot caf37e66-... --scene-index 0
 """
 
 import argparse
@@ -13,20 +14,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
-# Workaround: SegFormer model lacks safetensors, and torch<2.6 triggers CVE check
-import transformers.modeling_utils as _mu
-_mu.check_torch_load_is_safe = lambda: None
-
-from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
+from transformers import Sam3Processor, Sam3Model
 
 from config_utils import add_config_arg, apply_config_defaults
 from t4_dataset import T4Dataset
-
-CITYSCAPES_SKY_CLASS = 10
 
 
 def main():
@@ -76,36 +70,43 @@ def main():
         print("Nothing to do.")
         return
 
-    # Load model
-    model_id = "nvidia/segformer-b5-finetuned-cityscapes-1024-1024"
+    # Load SAM3
+    model_id = "facebook/sam3"
     print(f"Loading model: {model_id}")
-    image_processor = AutoImageProcessor.from_pretrained(model_id)
-    model = AutoModelForSemanticSegmentation.from_pretrained(model_id).to(device)
+    processor = Sam3Processor.from_pretrained(model_id)
+    model = Sam3Model.from_pretrained(model_id).to(device)
     model.eval()
 
-    # Run inference
-    batch_size = args.batch_size
-    for batch_start in tqdm(range(0, len(entries), batch_size), desc="Sky mask inference"):
-        batch = entries[batch_start:batch_start + batch_size]
-        images = [Image.open(f.image_path).convert("RGB") for f in batch]
-        original_sizes = [(img.height, img.width) for img in images]
+    # Pre-compute text embeddings for "sky" (reused across all images)
+    text_inputs = processor(text="sky", return_tensors="pt").to(device)
+    with torch.no_grad():
+        text_embeds = model.get_text_features(**text_inputs).pooler_output
 
-        inputs = image_processor(images=images, return_tensors="pt").to(device)
+    # Process images with pre-computed text embeddings
+    for frame in tqdm(entries, desc="Sky mask (SAM3)"):
+        image = Image.open(frame.image_path).convert("RGB")
+        h, w = image.height, image.width
+
+        img_inputs = processor(images=image, return_tensors="pt").to(device)
         with torch.no_grad():
-            outputs = model(**inputs)
-
-        logits = outputs.logits
-
-        for i, frame in enumerate(batch):
-            h, w = original_sizes[i]
-            upsampled = F.interpolate(
-                logits[i:i+1], size=(h, w), mode="bilinear", align_corners=False
+            outputs = model(
+                pixel_values=img_inputs.pixel_values,
+                text_embeds=text_embeds,
+                attention_mask=text_inputs.attention_mask,
             )
-            pred = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()
-            sky_mask = (pred == CITYSCAPES_SKY_CLASS).astype(np.uint8) * 255
 
-            cam_out_dir = output_dir / frame.camera_channel
-            cv2.imwrite(str(cam_out_dir / f"{frame.image_name}.png"), sky_mask)
+        results = processor.post_process_instance_segmentation(
+            outputs, threshold=0.5, mask_threshold=0.5,
+            target_sizes=img_inputs.get("original_sizes").tolist(),
+        )[0]
+
+        # Combine all detected sky instance masks into a single binary mask
+        sky_mask = np.zeros((h, w), dtype=np.uint8)
+        for mask in results["masks"]:
+            sky_mask[mask.cpu().numpy().astype(bool)] = 255
+
+        cam_out_dir = output_dir / frame.camera_channel
+        cv2.imwrite(str(cam_out_dir / f"{frame.image_name}.png"), sky_mask)
 
     print(f"Done. Sky masks saved to {output_dir}")
 
