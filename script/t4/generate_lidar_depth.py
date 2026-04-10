@@ -129,9 +129,11 @@ def main():
     samples = sample_chain(scene, sample_by_token)
     print(f"Scene: {scene.get('name', 'unknown')}, {len(samples)} samples")
 
-    # Build sample_data -> (channel, sd, cs) map
+    # Build sample_data -> (channel, sd, cs) map (keyframes only)
     sd_by_sample = {}
     for sd in tables["sample_data"]:
+        if not sd.get("is_key_frame", False):
+            continue
         cs = calibrated_sensor_by_token.get(sd["calibrated_sensor_token"])
         if cs is None:
             continue

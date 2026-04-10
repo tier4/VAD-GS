@@ -234,9 +234,11 @@ def main():
     token_to_remapped = {tok: raw_to_remapped[raw_id] for tok, raw_id in raw_track_ids.items()}
     print(f"Found {len(sorted_raw_ids)} dynamic objects, remapped to [0, {len(sorted_raw_ids)-1}]")
 
-    # Build camera channel -> sample_data mapping
+    # Build camera channel -> sample_data mapping (keyframes only)
     sd_by_sample = {}
     for sd in tables["sample_data"]:
+        if not sd.get("is_key_frame", False):
+            continue
         cs = calibrated_sensor_by_token.get(sd["calibrated_sensor_token"])
         if cs is None:
             continue

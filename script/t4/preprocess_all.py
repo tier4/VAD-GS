@@ -71,9 +71,11 @@ def count_expected_frames(dataroot, scene_index, camera_channels, tables=None):
         samples.append(sample_by_token[token])
         token = sample_by_token[token].get("next", "")
 
-    # Map sample_token -> {channel: sample_data}
+    # Map sample_token -> {channel: sample_data} (keyframes only)
     sd_by_sample: dict[str, dict] = {}
     for sd in tables["sample_data"]:
+        if not sd.get("is_key_frame", False):
+            continue
         cs = cs_by_token.get(sd["calibrated_sensor_token"])
         if cs is None:
             continue

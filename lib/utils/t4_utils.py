@@ -84,9 +84,15 @@ def sample_chain(scene, sample_by_token):
 
 
 def build_sample_channel_map(sample_data_items, calibrated_sensor_by_token, sensor_by_token):
-    """Build mapping: sample_token -> {channel_name: (sample_data, calibrated_sensor)}."""
+    """Build mapping: sample_token -> {channel_name: (sample_data, calibrated_sensor)}.
+
+    Only keyframe sample_data records are used to ensure correct alignment
+    with sample_annotation timestamps.
+    """
     mapping = {}
     for sd in sample_data_items:
+        if not sd.get("is_key_frame", False):
+            continue
         cs = calibrated_sensor_by_token.get(sd["calibrated_sensor_token"])
         if cs is None:
             continue

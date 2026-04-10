@@ -186,8 +186,11 @@ def main():
     scene = tables["scene"][args.scene_index]
     samples = sample_chain(scene, sample_by_token)
 
+    # Keyframes only to ensure correct sample-annotation alignment
     sd_by_sample = {}
     for sd in tables["sample_data"]:
+        if not sd.get("is_key_frame", False):
+            continue
         cs = calibrated_sensor_by_token.get(sd["calibrated_sensor_token"])
         if cs is None:
             continue
