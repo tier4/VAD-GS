@@ -162,36 +162,24 @@ class T4Dataset:
         cs = self._t4.get("calibrated_sensor", calibrated_sensor_token)
         return np.array(cs.camera_distortion, dtype=np.float64)
 
-    def get_world_to_sensor(self, frame: FrameInfo) -> HomogeneousMatrix:
-        """Compute map→sensor transform for a frame (inverse of sensor→map)."""
+    def get_world_to_sensor(self, frame: FrameInfo) -> np.ndarray:
+        """Compute map→sensor 4x4 transform matrix for a frame."""
+        return np.linalg.inv(self.get_sensor_to_world(frame))
+
+    def get_sensor_to_world(self, frame: FrameInfo) -> np.ndarray:
+        """Compute sensor→map 4x4 transform matrix for a frame."""
         ego = self._t4.get("ego_pose", frame.ego_pose_token)
         cs = self._t4.get("calibrated_sensor", frame.calibrated_sensor_token)
 
-        map_to_base = HomogeneousMatrix(
-            ego.translation, ego.rotation,
-            src="map", dst="base_link",
-        )
-        base_to_sensor = HomogeneousMatrix(
+        sensor_to_ego = HomogeneousMatrix(
             cs.translation, cs.rotation,
-            src="base_link", dst=frame.camera_channel,
+            src=frame.camera_channel, dst="base_link",
         )
-        sensor_to_map = map_to_base.dot(base_to_sensor)
-        return sensor_to_map.inv()
-
-    def get_sensor_to_world(self, frame: FrameInfo) -> HomogeneousMatrix:
-        """Compute sensor→map transform for a frame."""
-        ego = self._t4.get("ego_pose", frame.ego_pose_token)
-        cs = self._t4.get("calibrated_sensor", frame.calibrated_sensor_token)
-
-        map_to_base = HomogeneousMatrix(
+        ego_to_map = HomogeneousMatrix(
             ego.translation, ego.rotation,
-            src="map", dst="base_link",
+            src="base_link", dst="map",
         )
-        base_to_sensor = HomogeneousMatrix(
-            cs.translation, cs.rotation,
-            src="base_link", dst=frame.camera_channel,
-        )
-        return map_to_base.dot(base_to_sensor)
+        return ego_to_map.matrix @ sensor_to_ego.matrix
 
     # -- 3D annotation helpers -------------------------------------------------
 
@@ -235,37 +223,38 @@ class T4Dataset:
         lidar_sd = self._t4.get("sample_data", lidar_sd_token)
         cam_sd = self._t4.get("sample_data", camera_sd_token)
 
-        # lidar → map
+        # lidar sensor → map  (sensor_to_ego @ ego_to_map)
         lidar_ego = self._t4.get("ego_pose", lidar_sd.ego_pose_token)
         lidar_cs = self._t4.get("calibrated_sensor", lidar_sd.calibrated_sensor_token)
-        lidar_to_base = HomogeneousMatrix(
+        lidar_sensor_to_ego = HomogeneousMatrix(
             lidar_cs.translation, lidar_cs.rotation,
             src="lidar", dst="base_link",
         )
-        base_to_map = HomogeneousMatrix(
+        lidar_ego_to_map = HomogeneousMatrix(
             lidar_ego.translation, lidar_ego.rotation,
             src="base_link", dst="map",
         )
-        lidar_to_map = base_to_map.dot(lidar_to_base)
+        lidar_to_map = lidar_ego_to_map.matrix @ lidar_sensor_to_ego.matrix
 
-        # map → camera
+        # map → camera sensor  (inv(ego_to_map @ sensor_to_ego))
         cam_ego = self._t4.get("ego_pose", cam_sd.ego_pose_token)
         cam_cs = self._t4.get("calibrated_sensor", cam_sd.calibrated_sensor_token)
-        cam_to_base = HomogeneousMatrix(
+        cam_sensor_to_ego = HomogeneousMatrix(
             cam_cs.translation, cam_cs.rotation,
             src="camera", dst="base_link",
         )
-        base_to_map_cam = HomogeneousMatrix(
+        cam_ego_to_map = HomogeneousMatrix(
             cam_ego.translation, cam_ego.rotation,
             src="base_link", dst="map",
         )
-        map_to_cam = base_to_map_cam.dot(cam_to_base).inv()
+        cam_to_map = cam_ego_to_map.matrix @ cam_sensor_to_ego.matrix
+        map_to_cam = np.linalg.inv(cam_to_map)
 
-        # lidar → map → camera
-        full = map_to_cam.dot(lidar_to_map)
+        # Full: lidar → map → camera
+        full = map_to_cam @ lidar_to_map
 
         pts_h = np.hstack([lidar_points, np.ones((len(lidar_points), 1))])
-        pts_cam = (full.matrix @ pts_h.T).T[:, :3]
+        pts_cam = (full @ pts_h.T).T[:, :3]
         return pts_cam
 
     # -- Projection helper -----------------------------------------------------
