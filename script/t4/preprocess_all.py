@@ -4,6 +4,8 @@ Generates: lidar_depth, depth (mono), sky_masks, sam_masks, sam_bkgd_masks, norm
 Skips steps whose output directories already contain data.
 
 Usage:
+    python script/t4/preprocess_all.py --config configs/example/t4_train_example.yaml
+    python script/t4/preprocess_all.py --config configs/example/t4_train_example.yaml --batch-size 8
     python script/t4/preprocess_all.py --dataroot caf37e66-... --scene-index 0 --batch-size 4
 """
 
@@ -14,22 +16,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-_ANNOTATION_DATASET_BASE = os.path.expanduser("~/.webauto/data/data/annotation_dataset")
+from config_utils import add_config_arg, apply_config_defaults, resolve_dataroot
 
 SCRIPT_DIR = Path(__file__).parent
-
-
-def resolve_dataroot(dataset_id_or_path, revision=0):
-    candidate = os.path.expanduser(str(dataset_id_or_path))
-    if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "annotation")):
-        return Path(candidate)
-    id_path = os.path.join(_ANNOTATION_DATASET_BASE, str(dataset_id_or_path))
-    if os.path.isdir(id_path):
-        rev_path = os.path.join(id_path, str(revision))
-        if os.path.isdir(rev_path):
-            return Path(rev_path)
-        return Path(id_path)
-    return Path(candidate)
 
 
 def load_t4_tables(annotation_dir):
@@ -148,11 +137,12 @@ def run_step(name, script, args, output_dir, force=False,
 
 def main():
     parser = argparse.ArgumentParser(description="Run all T4 preprocessing steps")
-    parser.add_argument("--dataroot", type=str, required=True, help="Dataset UUID or path")
-    parser.add_argument("--revision", type=int, default=0)
-    parser.add_argument("--scene-index", type=int, default=0)
+    add_config_arg(parser)
+    parser.add_argument("--dataroot", type=str, default=None, help="Dataset UUID or path")
+    parser.add_argument("--revision", type=int, default=None)
+    parser.add_argument("--scene-index", type=int, default=None)
     parser.add_argument("--camera-channels", nargs="+", default=None)
-    parser.add_argument("--lidar-channel", default="LIDAR_CONCAT")
+    parser.add_argument("--lidar-channel", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--force", action="store_true",
@@ -161,11 +151,22 @@ def main():
                         help="Run only specific steps (lidar_depth, mono_depth, sky_masks, sam_masks, normal_maps)")
     args = parser.parse_args()
 
+    # Apply config defaults, then hard defaults
+    apply_config_defaults(args)
+    if args.dataroot is None:
+        parser.error("--dataroot is required (provide via --config or CLI)")
+    if args.revision is None:
+        args.revision = 0
+    if args.scene_index is None:
+        args.scene_index = 0
+    if args.lidar_channel is None:
+        args.lidar_channel = "LIDAR_CONCAT"
+
     dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
     print(f"Resolved dataroot: {dataroot}")
 
-    # Common args passed to all scripts
-    common = ["--dataroot", args.dataroot, "--revision", str(args.revision),
+    # Common args passed to all sub-scripts
+    common = ["--dataroot", str(args.dataroot), "--revision", str(args.revision),
               "--scene-index", str(args.scene_index)]
     if args.camera_channels:
         common += ["--camera-channels"] + args.camera_channels

@@ -3,7 +3,7 @@ task: t4_exp
 #   - A dataset UUID: caf37e66-a2aa-4f5e-9f87-b4e63a106bbd
 #   - A full path:    /home/user/.webauto/data/data/annotation_dataset/caf37e66-.../0
 #   - A relative path: data/t4/my_dataset
-source_path: caf37e66-a2aa-4f5e-9f87-b4e63a106bbd
+source_path: 835afe23-ff50-4883-a0b2-421e101a124b
 exp_name: t4_scene_000
 
 data:

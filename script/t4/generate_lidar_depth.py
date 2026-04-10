@@ -5,6 +5,7 @@ calibration, projects LiDAR points onto camera images, and saves
 sparse depth maps in the format expected by VAD-GS.
 
 Usage:
+    python script/t4/generate_lidar_depth.py --config configs/example/t4_train_example.yaml
     python script/t4/generate_lidar_depth.py \
         --dataroot /path/to/t4_dataset \
         --output-dir /path/to/t4_dataset/lidar_depth \
@@ -17,6 +18,8 @@ import argparse
 import os
 import json
 from pathlib import Path
+
+from config_utils import add_config_arg, apply_config_defaults, resolve_dataroot
 
 import numpy as np
 from tqdm import tqdm
@@ -92,20 +95,34 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate LiDAR depth maps from T4 dataset"
     )
-    parser.add_argument("--dataroot", type=Path, required=True)
+    add_config_arg(parser)
+    parser.add_argument("--dataroot", type=str, default=None)
+    parser.add_argument("--revision", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--scene-index", type=int, default=0)
-    parser.add_argument(
-        "--camera-channels", nargs="+",
-        default=["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
-                 "CAM_BACK_LEFT", "CAM_BACK_RIGHT"],
-    )
-    parser.add_argument("--lidar-channel", default="LIDAR_CONCAT")
+    parser.add_argument("--scene-index", type=int, default=None)
+    parser.add_argument("--camera-channels", nargs="+", default=None)
+    parser.add_argument("--lidar-channel", default=None)
     parser.add_argument("--min-depth", type=float, default=1.0)
     parser.add_argument("--max-depth", type=float, default=80.0)
     args = parser.parse_args()
 
-    dataroot = args.dataroot
+    # Apply config defaults, then hard defaults
+    apply_config_defaults(args)
+    if args.dataroot is None:
+        parser.error("--dataroot is required (provide via --config or CLI)")
+    if args.revision is None:
+        args.revision = 0
+    if args.scene_index is None:
+        args.scene_index = 0
+    if args.camera_channels is None:
+        args.camera_channels = [
+            "CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
+            "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
+        ]
+    if args.lidar_channel is None:
+        args.lidar_channel = "LIDAR_CONCAT"
+
+    dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
     output_dir = args.output_dir or (dataroot / "preprocessed" / "lidar_depth")
     output_dir.mkdir(parents=True, exist_ok=True)
 

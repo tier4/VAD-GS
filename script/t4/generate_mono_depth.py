@@ -5,6 +5,7 @@ depth-anything/Depth-Anything-V2-Small-hf, and caches the predicted
 depth as .npz files (float32 numpy arrays).
 
 Usage:
+    python script/t4/generate_mono_depth.py --config configs/example/t4_train_example.yaml
     python script/t4/generate_mono_depth.py \
         --dataroot /path/to/t4_dataset \
         --scene-index 0 \
@@ -24,21 +25,7 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
-_ANNOTATION_DATASET_BASE = os.path.expanduser("~/.webauto/data/data/annotation_dataset")
-
-
-def resolve_dataroot(dataset_id_or_path, revision=0):
-    """Resolve a dataset UUID or path to an absolute directory (same logic as cfg_utils)."""
-    candidate = os.path.expanduser(str(dataset_id_or_path))
-    if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "annotation")):
-        return Path(candidate)
-    id_path = os.path.join(_ANNOTATION_DATASET_BASE, str(dataset_id_or_path))
-    if os.path.isdir(id_path):
-        rev_path = os.path.join(id_path, str(revision))
-        if os.path.isdir(rev_path):
-            return Path(rev_path)
-        return Path(id_path)
-    return Path(candidate)
+from config_utils import add_config_arg, apply_config_defaults, resolve_dataroot
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +69,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate monocular depth maps (Depth Anything V2 Small) for T4 dataset"
     )
-    parser.add_argument("--dataroot", type=str, required=True,
+    add_config_arg(parser)
+    parser.add_argument("--dataroot", type=str, default=None,
                         help="Dataset UUID or path")
-    parser.add_argument("--revision", type=int, default=0,
+    parser.add_argument("--revision", type=int, default=None,
                         help="Sub-directory index under the dataset ID (default: 0)")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="Output directory (default: <dataroot>/depth)")
-    parser.add_argument("--scene-index", type=int, default=0)
+    parser.add_argument("--scene-index", type=int, default=None)
     parser.add_argument(
         "--camera-channels", nargs="+", default=None,
         help="Camera channel names (auto-detected if omitted)",
@@ -100,6 +88,15 @@ def main():
                         help="Skip images that already have depth (default: True)")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     args = parser.parse_args()
+
+    # Apply config defaults, then hard defaults
+    apply_config_defaults(args)
+    if args.dataroot is None:
+        parser.error("--dataroot is required (provide via --config or CLI)")
+    if args.revision is None:
+        args.revision = 0
+    if args.scene_index is None:
+        args.scene_index = 0
 
     dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
     print(f"Resolved dataroot: {dataroot}")

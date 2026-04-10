@@ -6,6 +6,7 @@ Dynamic masks: Project 3D bounding boxes from T4 annotations onto camera images.
 Background masks: SegFormer Cityscapes semantic segmentation of background classes.
 
 Usage:
+    python script/t4/generate_sam_masks.py --config configs/example/t4_train_example.yaml
     python script/t4/generate_sam_masks.py --dataroot caf37e66-... --scene-index 0 --batch-size 4
 """
 
@@ -27,7 +28,7 @@ _mu.check_torch_load_is_safe = lambda: None
 
 from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
 
-_ANNOTATION_DATASET_BASE = os.path.expanduser("~/.webauto/data/data/annotation_dataset")
+from config_utils import add_config_arg, apply_config_defaults, resolve_dataroot
 
 # Cityscapes class IDs
 # Sky=10, Person=11, Rider=12, Car=13, Truck=14, Bus=15, Train=16, Motorcycle=17, Bicycle=18
@@ -50,19 +51,6 @@ BKGD_CLASS_COLORS = {
     8: (200, 200, 200),   # vegetation
     9: (220, 220, 220),   # terrain
 }
-
-
-def resolve_dataroot(dataset_id_or_path, revision=0):
-    candidate = os.path.expanduser(str(dataset_id_or_path))
-    if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "annotation")):
-        return Path(candidate)
-    id_path = os.path.join(_ANNOTATION_DATASET_BASE, str(dataset_id_or_path))
-    if os.path.isdir(id_path):
-        rev_path = os.path.join(id_path, str(revision))
-        if os.path.isdir(rev_path):
-            return Path(rev_path)
-        return Path(id_path)
-    return Path(candidate)
 
 
 def load_t4_tables(annotation_dir):
@@ -166,21 +154,33 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate dynamic + background masks for T4 dataset"
     )
-    parser.add_argument("--dataroot", type=str, required=True, help="Dataset UUID or path")
-    parser.add_argument("--revision", type=int, default=0)
+    add_config_arg(parser)
+    parser.add_argument("--dataroot", type=str, default=None, help="Dataset UUID or path")
+    parser.add_argument("--revision", type=int, default=None)
     parser.add_argument("--output-dir-dynamic", type=Path, default=None,
                         help="Output dir for sam_masks (default: <dataroot>/sam_masks)")
     parser.add_argument("--output-dir-bkgd", type=Path, default=None,
                         help="Output dir for sam_bkgd_masks (default: <dataroot>/sam_bkgd_masks)")
-    parser.add_argument("--scene-index", type=int, default=0)
+    parser.add_argument("--scene-index", type=int, default=None)
     parser.add_argument("--camera-channels", nargs="+", default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--box-scale", type=float, default=1.5,
+    parser.add_argument("--box-scale", type=float, default=None,
                         help="Scale factor for 3D bounding boxes (default: 1.5)")
     parser.add_argument("--skip-existing", action="store_true", default=True)
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     args = parser.parse_args()
+
+    # Apply config defaults, then hard defaults
+    apply_config_defaults(args)
+    if args.dataroot is None:
+        parser.error("--dataroot is required (provide via --config or CLI)")
+    if args.revision is None:
+        args.revision = 0
+    if args.scene_index is None:
+        args.scene_index = 0
+    if args.box_scale is None:
+        args.box_scale = 1.5
 
     dataroot = resolve_dataroot(args.dataroot, revision=args.revision)
     print(f"Resolved dataroot: {dataroot}")
