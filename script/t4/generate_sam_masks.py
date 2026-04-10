@@ -91,9 +91,19 @@ def project_box_to_mask(box, intrinsic, H, W, box_scale=1.0):
     uv = np.round(uv).astype(np.int32)
 
     mask = np.zeros((H, W), dtype=np.uint8)
+    # Box3D.corners() ordering:
+    #   0: front-left-top     4: back-left-top
+    #   1: front-right-top    5: back-right-top
+    #   2: front-right-bottom 6: back-right-bottom
+    #   3: front-left-bottom  7: back-left-bottom
+    # Each face must list vertices in order around the quad (CW or CCW).
     faces = [
-        [0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4],
-        [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5],
+        [0, 1, 2, 3],  # front
+        [4, 5, 6, 7],  # back
+        [0, 1, 5, 4],  # top
+        [3, 2, 6, 7],  # bottom
+        [0, 3, 7, 4],  # left
+        [1, 2, 6, 5],  # right
     ]
     for face in faces:
         cv2.fillPoly(mask, [uv[face]], 1)
