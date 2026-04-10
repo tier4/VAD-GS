@@ -311,13 +311,14 @@ def training() -> None:
                 if dynamic_mask is not None:
                     bkgd_mask = bkgd_mask & ~torch.any(dynamic_mask != 255, axis=0, keepdim=True)
                 k = int(len(acc[bkgd_mask]) * 0.25)
-                v = acc[bkgd_mask].kthvalue(k).values
+                if k > 0:
+                    v = acc[bkgd_mask].kthvalue(k).values
 
-                if v.item() < 0.7:
-                    flag_global_reconstruct = True
+                    if v.item() < 0.7:
+                        flag_global_reconstruct = True
 
-                if v.item() < 0.9:
-                    flag_local_reconstruct = True
+                    if v.item() < 0.9:
+                        flag_local_reconstruct = True
 
                 gaussians.set_visibility(include_list)
                 gaussians.parse_camera(viewpoint_cam)
