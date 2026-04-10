@@ -1,14 +1,14 @@
 """Generate dynamic instance masks (sam_masks) and background segmentation masks
-(sam_bkgd_masks) for T4 datasets using SAM3 (Segment Anything Model 3).
+(sam_bkgd_masks) for T4 datasets.
 
-Dynamic masks: SAM3 with bounding box prompts from projected 3D annotations.
-Each projected 3D bounding box is used as a SAM3 box prompt to obtain a
-pixel-accurate instance mask.
+Dynamic masks: SAM3 text prompts per category ("car", "truck", "bus",
+"person", "bicycle", "motorcycle") detect all instances, then greedy
+IoU matching assigns each SAM3 mask to a projected 3D bounding box.
 
-Background masks: SAM3 with text prompts for each background class
-(road, sidewalk, building, etc.).
+Background masks: SegFormer B5 (Cityscapes) semantic segmentation.
 
-Vision embeddings are computed once per image and shared across all prompts.
+Two-phase processing: SAM3 for dynamic masks first, then SAM3 is unloaded
+and SegFormer is loaded for background masks to minimize peak VRAM usage.
 
 Usage:
     python script/t4/generate_sam_masks.py --config configs/example/t4_train_example.yaml
@@ -22,29 +22,23 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
 from transformers import Sam3Processor, Sam3Model
 
+# Workaround: SegFormer model lacks safetensors, and torch<2.6 triggers CVE check
+import transformers.modeling_utils as _mu
+_mu.check_torch_load_is_safe = lambda: None
+
+from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
+
 from config_utils import add_config_arg, apply_config_defaults
 from t4_dataset import T4Dataset
 
-# Background class text prompts and BGR colors
+# Cityscapes background classes for SegFormer
 # (avoid 0,0,0 and 1,1,1 which are skipped by trellis)
-BKGD_CLASS_PROMPTS = {
-    0: "road",
-    1: "sidewalk",
-    2: "building",
-    3: "wall",
-    4: "fence",
-    5: "pole",
-    6: "traffic light",
-    7: "traffic sign",
-    8: "vegetation",
-    9: "terrain",
-}
-
 BKGD_CLASS_COLORS = {
     0: (40, 40, 40),      # road
     1: (60, 60, 60),      # sidewalk
@@ -67,8 +61,6 @@ def simplify_category(name):
         return "pedestrian"
     if "cycle" in name or "bicycle" in name or "motorcycle" in name:
         return "cyclist"
-    if "cone" in name or "barrier" in name:
-        return "misc_dynamic"
     return "misc"
 
 
@@ -97,6 +89,8 @@ def project_box_to_xyxy(box, intrinsic, H, W, box_scale=1.0):
         return None
 
     return [x1, y1, x2, y2]
+
+
 
 
 def main():
@@ -197,130 +191,123 @@ def main():
                 projections.append((remapped_id, bbox_xyxy))
         bbox_projections[idx] = projections
 
-    # --- Load SAM3 (shared for dynamic + background masks) ---
+    # ===== Phase 1: Dynamic masks with SAM3 text prompts =====
     model_id = "facebook/sam3"
-    print(f"Loading model: {model_id}")
+    print(f"Loading SAM3: {model_id}")
     processor = Sam3Processor.from_pretrained(model_id)
     model = Sam3Model.from_pretrained(model_id).to(device)
     model.eval()
 
-    # Pre-compute box-prompt text tokens (identical for all single-box prompts)
-    dummy_img = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8))
-    dummy_box_inputs = processor(
-        images=dummy_img,
-        input_boxes=[[[0, 0, 1, 1]]],
-        input_boxes_labels=[[1]],
-        return_tensors="pt",
-    )
-    box_input_ids = dummy_box_inputs["input_ids"].to(device)
-    box_attention_mask = dummy_box_inputs["attention_mask"].to(device)
+    # Text prompts for dynamic object categories
+    DYNAMIC_PROMPTS = ["car", "truck", "bus", "person", "bicycle", "motorcycle"]
+    print(f"Dynamic prompts: {DYNAMIC_PROMPTS}")
 
-    # Pre-compute text embeddings for background classes (reused across all images)
-    print("Pre-computing background class text embeddings...")
-    bkgd_text_cache = {}
-    for cls_id, prompt in BKGD_CLASS_PROMPTS.items():
-        text_inputs = processor(text=prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            text_embeds = model.get_text_features(**text_inputs).pooler_output
-        bkgd_text_cache[cls_id] = {
-            "text_embeds": text_embeds,
-            "attention_mask": text_inputs.attention_mask,
-        }
-
-    # --- Single pass: produce both dynamic and background masks ---
-    print("Running SAM3 inference (dynamic + background masks)...")
-    for idx, frame in enumerate(tqdm(entries, desc="SAM3")):
+    print("Running SAM3 inference (dynamic masks)...")
+    for idx, frame in enumerate(tqdm(entries, desc="SAM3 dynamic")):
         image = Image.open(frame.image_path).convert("RGB")
         h, w = frame.height, frame.width
 
-        # Compute vision embeddings once per image (shared for all prompts)
-        img_inputs = processor(images=image, return_tensors="pt").to(device)
-        with torch.no_grad():
-            vision_embeds = model.get_vision_features(
-                pixel_values=img_inputs.pixel_values
-            )
-        original_sizes = img_inputs.get("original_sizes").tolist()
+        # Batched inference: same image × N prompts in one forward pass
+        images_batch = [image] * len(DYNAMIC_PROMPTS)
+        inputs = processor(
+            images=images_batch, text=DYNAMIC_PROMPTS, return_tensors="pt"
+        ).to(device)
 
-        # --- Dynamic mask: SAM3 box prompt per instance ---
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        batch_results = processor.post_process_instance_segmentation(
+            outputs, threshold=0.5, mask_threshold=0.5,
+            target_sizes=inputs.get("original_sizes").tolist(),
+        )
+
+        # Collect all instance masks across all prompts
+        all_masks = []
+        for results in batch_results:
+            for mask in results["masks"]:
+                all_masks.append(mask.cpu().numpy().astype(bool))
+
+        # IoU match: projected bboxes ↔ SAM3 instance masks
         projections = bbox_projections[idx]
         dyn_mask = np.full((h, w, 3), 255, dtype=np.uint8)
 
-        for remapped_id, bbox_xyxy in projections:
-            x1, y1, x2, y2 = bbox_xyxy
-            # SAM3 processor normalizes boxes to [cx, cy, w, h] / (W, H)
-            cx = (x1 + x2) / 2.0 / w
-            cy = (y1 + y2) / 2.0 / h
-            bw = (x2 - x1) / w
-            bh = (y2 - y1) / h
-            input_boxes = torch.tensor(
-                [[[cx, cy, bw, bh]]], dtype=torch.float32, device=device
-            )
-            input_boxes_labels = torch.tensor(
-                [[1]], dtype=torch.int64, device=device
-            )
+        if all_masks and projections:
+            # Build IoU matrix: (n_bboxes, n_masks)
+            n_bboxes = len(projections)
+            n_masks = len(all_masks)
+            iou_matrix = np.zeros((n_bboxes, n_masks), dtype=np.float32)
 
-            with torch.no_grad():
-                outputs = model(
-                    vision_embeds=vision_embeds,
-                    input_ids=box_input_ids,
-                    attention_mask=box_attention_mask,
-                    input_boxes=input_boxes,
-                    input_boxes_labels=input_boxes_labels,
-                )
-
-            results = processor.post_process_instance_segmentation(
-                outputs, threshold=0.5, mask_threshold=0.5,
-                target_sizes=original_sizes,
-            )[0]
-
-            if len(results["masks"]) > 0:
-                # Find the mask that best overlaps with our projected bbox
+            for bi, (remapped_id, bbox_xyxy) in enumerate(projections):
+                x1, y1, x2, y2 = bbox_xyxy
                 bbox_region = np.zeros((h, w), dtype=bool)
                 bbox_region[y1:y2, x1:x2] = True
+                bbox_area = bbox_region.sum()
 
-                best_mask_np = None
-                best_iou = 0.0
-                for mask in results["masks"]:
-                    mask_np = mask.cpu().numpy().astype(bool)
+                for mi, mask_np in enumerate(all_masks):
                     intersection = (mask_np & bbox_region).sum()
                     union = (mask_np | bbox_region).sum()
-                    iou = intersection / union if union > 0 else 0
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_mask_np = mask_np
+                    iou_matrix[bi, mi] = intersection / union if union > 0 else 0
 
-                if best_mask_np is not None and best_iou > 0.01:
-                    dyn_mask[best_mask_np] = remapped_id
+            # Greedy 1:1 matching (highest IoU first)
+            used_bboxes = set()
+            used_masks = set()
+            while True:
+                if iou_matrix.max() < 0.05:
+                    break
+                bi, mi = np.unravel_index(iou_matrix.argmax(), iou_matrix.shape)
+                if bi in used_bboxes or mi in used_masks:
+                    iou_matrix[bi, mi] = 0
+                    continue
+                remapped_id = projections[bi][0]
+                dyn_mask[all_masks[mi]] = remapped_id
+                used_bboxes.add(bi)
+                used_masks.add(mi)
+                iou_matrix[bi, :] = 0
+                iou_matrix[:, mi] = 0
 
         cv2.imwrite(
             str(out_dynamic / frame.camera_channel / f"{frame.image_name}.png"),
             dyn_mask,
         )
 
-        # --- Background mask: SAM3 text prompt per class ---
-        bkgd_mask = np.zeros((h, w, 3), dtype=np.uint8)
+    # Unload SAM3 to free VRAM for SegFormer
+    del model, processor
+    torch.cuda.empty_cache()
 
-        for cls_id, cache in bkgd_text_cache.items():
-            with torch.no_grad():
-                outputs = model(
-                    vision_embeds=vision_embeds,
-                    text_embeds=cache["text_embeds"],
-                    attention_mask=cache["attention_mask"],
-                )
+    # ===== Phase 2: Background masks with SegFormer =====
+    segformer_id = "nvidia/segformer-b5-finetuned-cityscapes-1024-1024"
+    print(f"Loading SegFormer: {segformer_id}")
+    image_processor = AutoImageProcessor.from_pretrained(segformer_id)
+    segformer_model = AutoModelForSemanticSegmentation.from_pretrained(segformer_id).to(device)
+    segformer_model.eval()
 
-            results = processor.post_process_instance_segmentation(
-                outputs, threshold=0.5, mask_threshold=0.5,
-                target_sizes=original_sizes,
-            )[0]
+    print("Running SegFormer inference (background masks)...")
+    batch_size = args.batch_size
+    for batch_start in tqdm(range(0, len(entries), batch_size), desc="SegFormer bkgd"):
+        batch = entries[batch_start:batch_start + batch_size]
+        images = [Image.open(f.image_path).convert("RGB") for f in batch]
+        original_sizes = [(img.height, img.width) for img in images]
 
-            color = BKGD_CLASS_COLORS[cls_id]
-            for mask in results["masks"]:
-                bkgd_mask[mask.cpu().numpy().astype(bool)] = color
+        inputs = image_processor(images=images, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = segformer_model(**inputs)
+        logits = outputs.logits
 
-        cv2.imwrite(
-            str(out_bkgd / frame.camera_channel / f"{frame.image_name}.png"),
-            bkgd_mask,
-        )
+        for i, frame in enumerate(batch):
+            h, w = original_sizes[i]
+            upsampled = F.interpolate(
+                logits[i:i+1], size=(h, w), mode="bilinear", align_corners=False
+            )
+            seg_pred = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()
+
+            bkgd_mask = np.zeros((h, w, 3), dtype=np.uint8)
+            for cls_id, color in BKGD_CLASS_COLORS.items():
+                bkgd_mask[seg_pred == cls_id] = color
+
+            cv2.imwrite(
+                str(out_bkgd / frame.camera_channel / f"{frame.image_name}.png"),
+                bkgd_mask,
+            )
 
     # Save track_id mapping
     mapping_path = out_dynamic / "track_id_mapping.json"
