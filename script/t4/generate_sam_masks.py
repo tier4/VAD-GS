@@ -1,10 +1,14 @@
 """Generate dynamic instance masks (sam_masks) and background segmentation masks
 (sam_bkgd_masks) for T4 datasets.
 
-Dynamic masks: Project 3D bounding boxes from T4 annotations onto camera images
-  using t4-devkit for coordinate transforms and projection.
-  Each dynamic object gets a unique uint8 ID. Background = 255.
+Dynamic masks are produced by combining:
+  1. SegFormer semantic segmentation (pixel-accurate dynamic class boundaries)
+  2. 3D bounding box projection (instance ID assignment)
+The intersection gives pixel-accurate instance masks.
+
 Background masks: SegFormer Cityscapes semantic segmentation of background classes.
+
+Both masks share a single SegFormer inference pass for efficiency.
 
 Usage:
     python script/t4/generate_sam_masks.py --config configs/example/t4_train_example.yaml
@@ -77,33 +81,22 @@ def project_box_to_mask(box, intrinsic, H, W, box_scale=1.0):
     corners = box.corners(box_scale=box_scale)  # (8, 3) in sensor coord
     depths = corners[:, 2]
 
-    # Skip boxes entirely behind camera
     if not np.any(depths > 0):
         return None
 
-    # For corners behind camera, clip depth to small positive value
-    # so they project to extreme image coordinates (handled by fillPoly clipping)
     corners_clipped = corners.copy()
     corners_clipped[:, 2] = np.clip(corners_clipped[:, 2], a_min=0.1, a_max=None)
 
-    # Project to 2D using t4-devkit
     uv, _ = T4Dataset.project_points_to_image(corners_clipped, intrinsic)
     uv = np.round(uv).astype(np.int32)
 
-    # Fill all 6 faces of the bounding box
     mask = np.zeros((H, W), dtype=np.uint8)
-    # Face vertex indices (each face is a quad)
     faces = [
-        [0, 1, 3, 2],  # left
-        [4, 5, 7, 6],  # right
-        [0, 1, 5, 4],  # bottom
-        [2, 3, 7, 6],  # top
-        [0, 2, 6, 4],  # front
-        [1, 3, 7, 5],  # back
+        [0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4],
+        [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5],
     ]
     for face in faces:
-        pts = uv[face]
-        cv2.fillPoly(mask, [pts], 1)
+        cv2.fillPoly(mask, [uv[face]], 1)
 
     return mask
 
@@ -129,7 +122,6 @@ def main():
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     args = parser.parse_args()
 
-    # Apply config defaults, then hard defaults
     apply_config_defaults(args)
     if args.dataroot is None:
         parser.error("--dataroot is required (provide via --config or CLI)")
@@ -155,30 +147,24 @@ def main():
     print(f"Scene: {ds.scene.name}, {ds.num_samples} samples")
 
     # Build instance_token -> remapped track_id (same logic as t4_utils.py)
-    raw_track_ids = {}  # instance_token -> raw_id
+    raw_track_ids = {}
     for sample in ds.samples:
         for ann_token in sample.ann_3ds:
             ann = t4.get("sample_annotation", ann_token)
-            cat_name = ann.category_name
-            class_name = simplify_category(cat_name)
+            class_name = simplify_category(ann.category_name)
             if class_name == "misc":
                 continue
             raw_id = int(ann.instance_token[:8], 16)
             raw_track_ids[ann.instance_token] = raw_id
 
-    # Remap to sequential IDs (matching t4_utils.py remapping)
     sorted_raw_ids = sorted(set(raw_track_ids.values()))
     raw_to_remapped = {raw_id: new_id for new_id, raw_id in enumerate(sorted_raw_ids)}
     token_to_remapped = {tok: raw_to_remapped[raw_id] for tok, raw_id in raw_track_ids.items()}
     print(f"Found {len(sorted_raw_ids)} dynamic objects, remapped to [0, {len(sorted_raw_ids)-1}]")
 
     # Collect frames to process
-    frames = list(ds.iter_frames(args.camera_channels))
-    print(f"Total frames: {len(frames)}")
-
-    # Filter by skip_existing
     entries = []
-    for frame in frames:
+    for frame in ds.iter_frames(args.camera_channels):
         ch = frame.camera_channel
         dyn_cam_dir = out_dynamic / ch
         bkgd_cam_dir = out_bkgd / ch
@@ -195,74 +181,92 @@ def main():
         print("Nothing to do.")
         return
 
-    # --- Generate dynamic masks using t4-devkit projection ---
-    print("Generating dynamic masks from 3D bounding box projections...")
-    for frame in tqdm(entries, desc="Dynamic masks"):
-        # Get 3D boxes already transformed to sensor (camera) coordinates
+    # --- Pre-compute 3D bbox projections per frame ---
+    # Store: frame index -> list of (remapped_id, bbox_mask)
+    print("Projecting 3D bounding boxes...")
+    bbox_projections: dict[int, list[tuple[int, np.ndarray]]] = {}
+    for idx, frame in enumerate(tqdm(entries, desc="BBox projection")):
         boxes, cam_intrinsic = ds.get_boxes_in_sensor(frame.sample_data_token)
         K = np.array(cam_intrinsic, dtype=np.float64)
         H, W = frame.height, frame.width
 
-        # 3-channel mask: background = 255
-        dyn_mask = np.full((H, W, 3), 255, dtype=np.uint8)
-
+        projections = []
         for box in boxes:
-            # Look up remapped ID via instance token (uuid)
             if box.uuid is None or box.uuid not in token_to_remapped:
-                # Try matching via instance_token from annotation
                 continue
             remapped_id = token_to_remapped[box.uuid]
-
             mask_2d = project_box_to_mask(box, K, H, W, box_scale=args.box_scale)
             if mask_2d is not None:
-                dyn_mask[mask_2d > 0] = remapped_id
+                projections.append((remapped_id, mask_2d))
+        bbox_projections[idx] = projections
 
-        cv2.imwrite(str(out_dynamic / frame.camera_channel / f"{frame.image_name}.png"), dyn_mask)
-
-    # Save track_id mapping for reference
-    mapping_path = out_dynamic / "track_id_mapping.json"
-    mapping_data = {str(raw_id): new_id for raw_id, new_id in raw_to_remapped.items()}
-    with open(mapping_path, "w") as f:
-        json.dump(mapping_data, f, indent=2)
-    print(f"Track ID mapping saved to {mapping_path}")
-
-    # --- Generate background masks (SegFormer semantic segmentation) ---
-    print("Generating background segmentation masks...")
+    # --- Load SegFormer (shared for dynamic + background masks) ---
     model_id = "nvidia/segformer-b5-finetuned-cityscapes-1024-1024"
     print(f"Loading model: {model_id}")
     image_processor = AutoImageProcessor.from_pretrained(model_id)
     model = AutoModelForSemanticSegmentation.from_pretrained(model_id).to(device)
     model.eval()
 
+    # --- Single SegFormer pass: produce both dynamic and background masks ---
+    print("Running SegFormer inference (dynamic + background masks)...")
     batch_size = args.batch_size
-    for batch_start in tqdm(range(0, len(entries), batch_size), desc="Bkgd masks"):
-        batch = entries[batch_start:batch_start + batch_size]
-        images = [Image.open(f.image_path).convert("RGB") for f in batch]
+    for batch_start in tqdm(range(0, len(entries), batch_size), desc="SegFormer"):
+        batch_indices = list(range(batch_start, min(batch_start + batch_size, len(entries))))
+        batch_frames = [entries[i] for i in batch_indices]
+
+        images = [Image.open(f.image_path).convert("RGB") for f in batch_frames]
         original_sizes = [(img.height, img.width) for img in images]
 
         inputs = image_processor(images=images, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model(**inputs)
-
         logits = outputs.logits
 
-        for i, frame in enumerate(batch):
+        for i, global_idx in enumerate(batch_indices):
+            frame = batch_frames[i]
             h, w = original_sizes[i]
             upsampled = F.interpolate(
                 logits[i:i+1], size=(h, w), mode="bilinear", align_corners=False
             )
-            pred = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()
+            seg_pred = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()  # (H, W)
 
-            # Background mask: each background class gets a unique color
+            # --- Dynamic mask: SegFormer semantic mask × 3D bbox instance ID ---
+            # Build a binary mask of all dynamic-class pixels from SegFormer
+            seg_dynamic = np.zeros((h, w), dtype=bool)
+            for cls_id in DYNAMIC_CLASSES:
+                seg_dynamic |= (seg_pred == cls_id)
+
+            # 3-channel mask: background = 255
+            dyn_mask = np.full((h, w, 3), 255, dtype=np.uint8)
+
+            for remapped_id, bbox_mask in bbox_projections[global_idx]:
+                # Intersection: pixel is this instance only if
+                # SegFormer says it's a dynamic class AND 3D bbox covers it
+                instance_mask = (bbox_mask > 0) & seg_dynamic
+                dyn_mask[instance_mask] = remapped_id
+
+            cv2.imwrite(
+                str(out_dynamic / frame.camera_channel / f"{frame.image_name}.png"),
+                dyn_mask,
+            )
+
+            # --- Background mask: same as before ---
             bkgd_mask = np.zeros((h, w, 3), dtype=np.uint8)
             for cls_id, color in BKGD_CLASS_COLORS.items():
-                bkgd_mask[pred == cls_id] = color
+                bkgd_mask[seg_pred == cls_id] = color
 
             bkgd_cam_dir = out_bkgd / frame.camera_channel
             cv2.imwrite(str(bkgd_cam_dir / f"{frame.image_name}.png"), bkgd_mask)
             Image.fromarray(bkgd_mask[:, :, ::-1]).save(
-                str(bkgd_cam_dir / f"{frame.image_name}.jpg"), quality=90
+                str(bkgd_cam_dir / f"{frame.image_name}.jpg"), quality=90,
             )
+
+    # Save track_id mapping
+    mapping_path = out_dynamic / "track_id_mapping.json"
+    mapping_data = {str(raw_id): new_id for raw_id, new_id in raw_to_remapped.items()}
+    with open(mapping_path, "w") as f:
+        json.dump(mapping_data, f, indent=2)
+    print(f"Track ID mapping saved to {mapping_path}")
 
     print(f"Done. Dynamic masks: {out_dynamic}, Background masks: {out_bkgd}")
 
