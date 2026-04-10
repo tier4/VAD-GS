@@ -240,20 +240,41 @@ def main():
             )
             seg_pred = upsampled.argmax(dim=1).squeeze(0).cpu().numpy()  # (H, W)
 
-            # --- Dynamic mask: SegFormer semantic mask × 3D bbox instance ID ---
-            # Build a binary mask of all dynamic-class pixels from SegFormer
+            # --- Dynamic mask: IoU-based matching of SegFormer segments to BBox IDs ---
+            # 1. Build binary mask of all dynamic-class pixels from SegFormer
             seg_dynamic = np.zeros((h, w), dtype=bool)
             for cls_id in DYNAMIC_CLASSES:
                 seg_dynamic |= (seg_pred == cls_id)
 
-            # 3-channel mask: background = 255
+            # 2. Find connected components in the dynamic mask
+            seg_dynamic_u8 = seg_dynamic.astype(np.uint8)
+            num_labels, label_map = cv2.connectedComponents(seg_dynamic_u8)
+
+            # 3. For each segment, find the best-matching BBox by IoU
+            projections = bbox_projections[global_idx]
             dyn_mask = np.full((h, w, 3), 255, dtype=np.uint8)
 
-            for remapped_id, bbox_mask in bbox_projections[global_idx]:
-                # Intersection: pixel is this instance only if
-                # SegFormer says it's a dynamic class AND 3D bbox covers it
-                instance_mask = (bbox_mask > 0) & seg_dynamic
-                dyn_mask[instance_mask] = remapped_id
+            for seg_id in range(1, num_labels):  # skip 0 = background
+                seg_pixels = label_map == seg_id
+                seg_area = seg_pixels.sum()
+                if seg_area == 0:
+                    continue
+
+                best_iou = 0.0
+                best_id = -1
+                for remapped_id, bbox_mask in projections:
+                    bbox_pixels = bbox_mask > 0
+                    intersection = (seg_pixels & bbox_pixels).sum()
+                    union = (seg_pixels | bbox_pixels).sum()
+                    if union == 0:
+                        continue
+                    iou = intersection / union
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_id = remapped_id
+
+                if best_id >= 0 and best_iou > 0.01:
+                    dyn_mask[seg_pixels] = best_id
 
             cv2.imwrite(
                 str(out_dynamic / frame.camera_channel / f"{frame.image_name}.png"),
