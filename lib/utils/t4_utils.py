@@ -146,7 +146,7 @@ def make_transform(translation, rotation_wxyz):
 def simplify_category(name):
     """Simplify T4/nuScenes category name to vehicle/pedestrian/cyclist/misc."""
     name = name.lower()
-    if "vehicle" in name:
+    if "vehicle" in name or "car" in name or "truck" in name or "bus" in name or "trailer" in name:
         return "vehicle"
     if "pedestrian" in name:
         return "pedestrian"
