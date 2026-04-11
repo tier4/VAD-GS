@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import torch
+from tqdm import tqdm
 from lib.datasets.dataset import Dataset
 from lib.models.gaussian_model import GaussianModel
 from lib.models.street_gaussian_model import StreetGaussianModel
@@ -29,8 +30,7 @@ class Scene:
             del point_cloud
 
             if cfg.get('to_cuda', False):
-                print('Moving training cameras to GPU')
-                for camera in self.getTrainCameras():
+                for camera in tqdm(self.getTrainCameras(), desc="Moving cameras to GPU"):
                     camera.set_device('cuda')
                     
         else:

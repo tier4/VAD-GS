@@ -87,7 +87,9 @@ class StreetGaussianModel(nn.Module):
             raise ValueError(f'Unknown model name {model_name}')
                 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.ndarray) -> None:
-        for model_name in self.model_name_id.keys():
+        from tqdm import tqdm
+        models = list(self.model_name_id.keys())
+        for model_name in tqdm(models, desc="Creating models", leave=True):
             model: GaussianModel = getattr(self, model_name)
             if model_name in ['background', 'sky']:
                 model.create_from_pcd(pcd, spatial_lr_scale, train_views)

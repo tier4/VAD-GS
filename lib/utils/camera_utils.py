@@ -182,7 +182,7 @@ def _load_guidance_from_path(k: str, path: str) -> Image.Image | np.ndarray | No
         mask = depth["mask"]
         value = depth["value"]
         depth_arr = np.zeros_like(mask).astype(np.float32)
-        depth_arr[mask] = value
+        depth_arr[mask] = value.ravel()
         return depth_arr
     elif k == 'mono_depth':
         if path.endswith('.npz'):

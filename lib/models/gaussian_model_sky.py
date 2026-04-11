@@ -19,19 +19,28 @@ class GaussinaModelSky(GaussianModel):
         self.sphere_center = torch.from_numpy(sphere_center).float().cuda()
         self.sphere_radius = torch.Tensor([sphere_radius]).float().cuda()
         
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.array):    
-        print('Create sky model')
-            
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.array):
+        from tqdm import tqdm
+        pbar = tqdm(total=2, desc="Create sky model", leave=True)
+
+        pbar.set_postfix_str("loading sky PLY")
         pointcloud_path_sky = os.path.join(cfg.model_path, 'input_ply', 'points3D_sky.ply')
         assert os.path.exists(pointcloud_path_sky), f'Pointcloud {pointcloud_path_sky} does not exist'
-        
+
         pcd_sky = fetchPly(pointcloud_path_sky)
         pointcloud_xyz = pcd_sky.points
         pointcloud_rgb = pcd_sky.colors
         pointcloud_normal = np.zeros_like(pointcloud_xyz)
         pcd = BasicPointCloud(pointcloud_xyz, pointcloud_rgb, pointcloud_normal)
-            
-        return super().create_from_pcd(pcd, self.sphere_radius.item(), train_views)
+        pbar.update(1)
+
+        pbar.set_postfix_str("init gaussian params (super)")
+        result = super().create_from_pcd(pcd, self.sphere_radius.item(), train_views)
+        pbar.update(1)
+
+        pbar.set_postfix_str("done")
+        pbar.close()
+        return result
     
     def get_extent(self):
         max_scaling = torch.max(self.get_scaling, dim=1).values

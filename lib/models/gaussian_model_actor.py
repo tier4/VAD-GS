@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+from tqdm import tqdm
 from lib.config import cfg
 from lib.models.gaussian_model import GaussianModel
 from lib.utils.general_utils import quaternion_to_matrix, inverse_sigmoid, matrix_to_quaternion, get_expon_lr_func, quaternion_raw_multiply
@@ -11,6 +12,7 @@ from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 
 from lib.models.trellis import GrapeTrellis
+from lib.models.gaussian_model_bkgd import _load_packed_visibility
 
 import open3d as o3d
 import matplotlib.pyplot as plt
@@ -86,10 +88,12 @@ class GaussianModelActor(GaussianModel):
         return features
            
     def create_from_pcd(self, spatial_lr_scale: float, train_views: np.array):
-        pointcloud_path = os.path.join(cfg.model_path, 'input_ply', f'points3D_{self.model_name}.ply')   
+        pbar = tqdm(total=6, desc=f"  Init actor ({self.model_name})", leave=True)
+        pointcloud_path = os.path.join(cfg.model_path, 'input_ply', f'points3D_{self.model_name}.ply')
         pointcloud_normal = None
         self.grape_trellis = None
 
+        pbar.set_postfix_str("loading point cloud")
         if os.path.exists(pointcloud_path):
             pcd = fetchPly(pointcloud_path)
             pointcloud_xyz = np.asarray(pcd.points)
@@ -97,15 +101,21 @@ class GaussianModelActor(GaussianModel):
             # pointcloud_normal = np.asarray(pcd.normals)
             pointcloud_normal = np.asarray(pcd.normals) # 一阶球谐省略求解，直接计算方向
             pointcloud_normal = pointcloud_normal / np.linalg.norm(pointcloud_normal, axis=1, keepdims=True)
-            points_visibility = np.load(os.path.join(cfg.model_path, f"input_ply/points3D_{self.model_name}.npy"))
+            vis_data, n_views = _load_packed_visibility(os.path.join(cfg.model_path, f"input_ply/points3D_{self.model_name}"))
+            # Actor points are small — unpack is fine
+            if vis_data.dtype == np.uint8 and vis_data.ndim == 2 and vis_data.shape[1] != n_views:
+                points_visibility = np.unpackbits(vis_data, axis=1)[:, :n_views].astype(bool)
+            else:
+                points_visibility = vis_data.astype(bool)
+            del vis_data
 
             preserve_mask = np.zeros_like(points_visibility, dtype=bool)
             preserve_mask[:, train_views] = True
             filtered_visibility = np.logical_and(points_visibility, preserve_mask)
-            
+
             # self.voxel_size = 0.15 # Waymo
             self.voxel_size = 0.15 # Nuscenes
-            
+
             self.grape_trellis = GrapeTrellis(pointcloud_xyz, pointcloud_rgb, pointcloud_normal, filtered_visibility, voxel_size=self.voxel_size)
 
             if pointcloud_xyz.shape[0] < 20:
@@ -117,25 +127,24 @@ class GaussianModelActor(GaussianModel):
 
         if self.random_initialization is True:
             points_dim = 20
-            print(f'Creating random pointcloud for {self.model_name}')
             points_x, points_y, points_z = np.meshgrid(
                 np.linspace(-1., 1., points_dim), np.linspace(-1., 1., points_dim), np.linspace(-1., 1., points_dim),
             )
-            
+
             points_x = points_x.reshape(-1)
             points_y = points_y.reshape(-1)
             points_z = points_z.reshape(-1)
 
             bbox_xyz_scale = self.bbox / 2.
-            
+
             rand_pointcloud_xyz = np.stack([points_x, points_y, points_z], axis=-1)
-            rand_pointcloud_xyz = rand_pointcloud_xyz * bbox_xyz_scale            
-            rand_pointcloud_rgb = np.random.rand(*rand_pointcloud_xyz.shape).astype(np.float32)  
-            
+            rand_pointcloud_xyz = rand_pointcloud_xyz * bbox_xyz_scale
+            rand_pointcloud_rgb = np.random.rand(*rand_pointcloud_xyz.shape).astype(np.float32)
+
             pointcloud_xyz = np.asarray(rand_pointcloud_xyz)
             pointcloud_rgb = np.asarray(rand_pointcloud_rgb)
 
-        elif not self.deformable and self.flip_prob > 0.:          
+        elif not self.deformable and self.flip_prob > 0.:
             pcd = fetchPly(pointcloud_path)
             pointcloud_xyz = np.asarray(pcd.points)
             pointcloud_rgb = np.asarray(pcd.colors)
@@ -156,20 +165,28 @@ class GaussianModelActor(GaussianModel):
             pcd = fetchPly(pointcloud_path)
             pointcloud_xyz = np.asarray(pcd.points)
             pointcloud_rgb = np.asarray(pcd.colors)
-            
+        pbar.update(1)
+
+        pbar.set_postfix_str("points to CUDA")
         fused_point_cloud = torch.tensor(np.asarray(pointcloud_xyz)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pointcloud_rgb)).float().cuda())
+        pbar.update(1)
 
-        # features = torch.zeros((fused_color.shape[0], 3, 
+        pbar.set_postfix_str("SH features")
+        # features = torch.zeros((fused_color.shape[0], 3,
         #                         (self.max_sh_degree + 1) ** 2 * self.fourier_dim)).float().cuda()
         # features[:, :3, 0] = fused_color
         features_dc = torch.zeros((fused_color.shape[0], 3, self.fourier_dim)).float().cuda()
         features_rest = torch.zeros(fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1).float().cuda()
         features_dc[:, :3, 0] = fused_color
+        pbar.update(1)
 
-        print(f"Number of points at initialization for {self.model_name}: ", fused_point_cloud.shape[0])
+        pbar.set_postfix_str(f"distCUDA2 ({fused_point_cloud.shape[0]} pts)")
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pointcloud_xyz)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        pbar.update(1)
+
+        pbar.set_postfix_str("rotations")
         # scales[:, -1] -= 0.2
         # if self.grape_trellis is None:
         if pointcloud_normal is None:
@@ -189,11 +206,13 @@ class GaussianModelActor(GaussianModel):
             q_w = np.cos(half_theta).reshape(-1,1)
             q_xyz = axis * np.sin(half_theta).reshape(-1,1)
             rots = torch.from_numpy(np.concatenate([q_w, q_xyz], axis=1)).float().cuda()
+        pbar.update(1)
 
+        pbar.set_postfix_str("nn.Parameter init")
 
 ##################### Normal Check #########################
-        # scales, rotations = self.get_scaling, self.get_rotation    
-        # rotations_mat = quaternion_to_matrix(rotations)    
+        # scales, rotations = self.get_scaling, self.get_rotation
+        # rotations_mat = quaternion_to_matrix(rotations)
         # min_scales = torch.argmin(scales, dim=-1)
         # indices = torch.arange(min_scales.shape[0])
         # normals = rotations_mat[indices, :, min_scales]
@@ -202,24 +221,28 @@ class GaussianModelActor(GaussianModel):
         # dir_pp = (self.get_xyz - camera.camera_center.repeat(self._xyz.shape[0], 1))
         # dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True) # (N, 3)
         # dotprod = torch.sum(-dir_pp_normalized * normals, dim=1, keepdim=True) # (N, 1)
-        # normals = torch.where(dotprod >= 0, normals, -normals) 
+        # normals = torch.where(dotprod >= 0, normals, -normals)
 ###############################################
 
 
         opacities = inverse_sigmoid(0.3 * torch.ones((fused_point_cloud.shape[0], 1))).float().cuda()
         semantics = torch.zeros((fused_point_cloud.shape[0], self.num_classes)).float().cuda()
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        
+
         # self._features_dc = nn.Parameter(features[:, :, :self.fourier_dim].transpose(1, 2).contiguous().requires_grad_(True))
         # self._features_rest = nn.Parameter(features[:, :, self.fourier_dim:].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_dc = nn.Parameter(features_dc.transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features_rest.transpose(1, 2).contiguous().requires_grad_(True))
-        
+
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._semantic = nn.Parameter(semantics.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        pbar.update(1)
+
+        pbar.set_postfix_str("done")
+        pbar.close()
 
 
     def training_setup(self):

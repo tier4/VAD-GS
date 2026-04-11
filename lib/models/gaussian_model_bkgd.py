@@ -5,6 +5,7 @@ import numpy as np
 import torch.nn as nn
 import os
 from typing import Any
+from tqdm import tqdm
 from lib.config import cfg
 from lib.utils.graphics_utils import BasicPointCloud
 from lib.datasets.base_readers import fetchPly
@@ -12,6 +13,21 @@ from lib.models.gaussian_model import GaussianModel
 from lib.utils.camera_utils import Camera, make_rasterizer
 
 from lib.models.trellis import GrapeTrellis
+
+
+def _load_packed_visibility(path_prefix):
+    """Load visibility as (packed_uint8, n_views) tuple from npz, or bool array from legacy npy."""
+    npz_path = path_prefix + ".npz"
+    npy_path = path_prefix + ".npy"
+    if os.path.exists(npz_path):
+        data = np.load(npz_path)
+        n_views = int(data["shape"][1])
+        return data["packed"], n_views  # packed uint8, no unpack
+    elif os.path.exists(npy_path):
+        arr = np.load(npy_path)
+        return arr, arr.shape[1]  # legacy: full bool array
+    else:
+        raise FileNotFoundError(f"No visibility file found at {path_prefix}.npz or .npy")
 
 from lib.utils.sh_utils import RGB2SH, IDFT, SH2RGB
 from simple_knn._C import distCUDA2
@@ -42,28 +58,47 @@ class GaussianModelBkgd(GaussianModel):
         super().__init__(model_name=model_name, num_classes=num_classes)
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.ndarray) -> None:
-        print('Create background model')
+        pbar = tqdm(total=5, desc="Create background model", leave=True)
 
         # Use pcd argument directly (already loaded from bkgd PLY) instead of re-loading
+        pbar.set_postfix_str("extracting point cloud")
         points_xyz = np.asarray(pcd.points)
         points_rgb = np.asarray(pcd.colors)
         points_normal = np.asarray(pcd.normals)[:,[2,0,1]] # 一阶球谐省略求解，直接计算方向
         norms = np.linalg.norm(points_normal, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-8)
         points_normal = points_normal / norms
+        pbar.update(1)
 
-        # Load visibility and filter to train views in-place (avoids 2 extra full-size copies)
-        points_visibility = np.load(os.path.join(cfg.model_path, "input_ply/points3D_bkgd.npy"))
-        test_views = np.setdiff1d(np.arange(points_visibility.shape[1]), train_views)
-        if len(test_views) > 0:
-            points_visibility[:, test_views] = False
+        # Load visibility (packed format to save memory)
+        pbar.set_postfix_str("loading visibility")
+        vis_data, n_views = _load_packed_visibility(os.path.join(cfg.model_path, "input_ply/points3D_bkgd"))
+        pbar.update(1)
 
+        # Zero out test views in packed representation
+        pbar.set_postfix_str("zeroing test views")
+        test_views = np.setdiff1d(np.arange(n_views), train_views)
+        if len(test_views) > 0 and vis_data.dtype == np.uint8 and vis_data.ndim == 2:
+            # Packed format: clear bits for test views
+            for tv in test_views:
+                byte_idx = tv // 8
+                bit_idx = 7 - (tv % 8)
+                vis_data[:, byte_idx] &= ~np.uint8(1 << bit_idx)
+        pbar.update(1)
+
+        pbar.set_postfix_str("building GrapeTrellis")
         self.voxel_size = 0.15
+        self.grape_trellis = GrapeTrellis.from_packed(points_xyz, points_rgb, points_normal, vis_data, n_views, voxel_size=self.voxel_size)
+        del vis_data
+        pbar.update(1)
 
-        self.grape_trellis = GrapeTrellis(points_xyz, points_rgb, points_normal, points_visibility, voxel_size=self.voxel_size)
-        del points_visibility  # Free the loaded copy; GrapeTrellis.RootTable holds its own
+        pbar.set_postfix_str("init gaussian params (super)")
+        result = super().create_from_pcd(pcd, spatial_lr_scale, train_views)
+        pbar.update(1)
 
-        return super().create_from_pcd(pcd, spatial_lr_scale, train_views)
+        pbar.set_postfix_str("done")
+        pbar.close()
+        return result
 
 
         # #   gaussians: [xyz, features, scaling, rotation, opacity, max_radii2D(?), anchor_id] 
