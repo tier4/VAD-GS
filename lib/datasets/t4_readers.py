@@ -212,9 +212,11 @@ def readT4Info(path: str, images: str = "images", split_train: int = -1, split_t
                         guidance["seg_bkgd"] = seg_bkgd_mask_path
 
                 # Save obj_bound to disk to avoid ~700MB of PIL Images in RAM
+                # Use cam_channel prefix to avoid filename collisions between cameras
+                # (T4 images share the same basename across cameras, e.g. 00193.jpg)
                 obj_bound_dir = os.path.join(cfg.model_path, "obj_bounds")
                 os.makedirs(obj_bound_dir, exist_ok=True)
-                obj_bound_path = os.path.join(obj_bound_dir, f"{image_name}.png")
+                obj_bound_path = os.path.join(obj_bound_dir, f"{cam_channel}_{image_name}.png")
                 if not os.path.exists(obj_bound_path):
                     cv2.imwrite(obj_bound_path, obj_bounds[i].astype(np.uint8) * 255)
                 guidance["obj_bound"] = obj_bound_path
