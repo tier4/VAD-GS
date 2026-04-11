@@ -76,7 +76,8 @@ def readT4Info(path: str, images: str = "images", split_train: int = -1, split_t
 
     dynamic_mask_dir = _resolve_guidance_dir("sam_masks") or os.path.join(prep, "sam_masks")
     bkgd_mask_dir = _resolve_guidance_dir("sam_bkgd_masks") or os.path.join(prep, "sam_bkgd_masks")
-    load_dynamic_mask = os.path.exists(dynamic_mask_dir) and os.path.exists(bkgd_mask_dir)
+    load_dynamic_mask = os.path.exists(dynamic_mask_dir)
+    load_seg_bkgd = cfg.data.get("use_seg_bkgd", True) and os.path.exists(bkgd_mask_dir)
 
     sky_mask_dir = _resolve_guidance_dir("sky_masks") or os.path.join(prep, "sky_masks")
     load_sky_mask = (cfg.mode == "train") and os.path.exists(sky_mask_dir)
@@ -205,9 +206,10 @@ def readT4Info(path: str, images: str = "images", split_train: int = -1, split_t
             if dynamic_mask_path is not None:
                 guidance["dynamic_mask"] = dynamic_mask_path
 
-                seg_bkgd_mask_path = _find_guidance_file(bkgd_mask_dir, cam_channel, image_name, ".png")
-                if seg_bkgd_mask_path is not None:
-                    guidance["seg_bkgd"] = seg_bkgd_mask_path
+                if load_seg_bkgd:
+                    seg_bkgd_mask_path = _find_guidance_file(bkgd_mask_dir, cam_channel, image_name, ".png")
+                    if seg_bkgd_mask_path is not None:
+                        guidance["seg_bkgd"] = seg_bkgd_mask_path
 
                 # Save obj_bound to disk to avoid ~700MB of PIL Images in RAM
                 obj_bound_dir = os.path.join(cfg.model_path, "obj_bounds")

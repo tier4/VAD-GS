@@ -39,9 +39,30 @@ class GrapeTrellis:
 
         self.root_table.build_hash_table(points_xyz, points_rgb, points_normal, points_visibility)
 
+    @classmethod
+    def from_packed(cls, points_xyz, points_rgb, points_normal, vis_packed, n_views, voxel_size=0.15):
+        """Construct from packed visibility (uint8) without unpacking the full bool matrix."""
+        obj = cls.__new__(cls)
+        obj.voxel_size = voxel_size
+        obj.min_bound = (points_xyz.min(axis=0) // voxel_size) * voxel_size
+        obj.max_bound = (points_xyz.max(axis=0) // voxel_size + 1) * voxel_size
+        obj.N_views = n_views
+        obj.root_table = RootTable(obj.min_bound, obj.max_bound, voxel_size)
+        obj.vine_table = VineTable(obj.min_bound, obj.max_bound, n_views, voxel_size)
+        obj.c2ws = None
+        obj.ixts = None
+        ctr2corners = []
+        for i in [-1, 1]:
+            for j in [-1, 1]:
+                for k in [-1, 1]:
+                    ctr2corners.append([i, j, k])
+        obj.ctr2corners = np.array(ctr2corners) * voxel_size / 2
+        obj.root_table.build_hash_table_packed(points_xyz, points_rgb, points_normal, vis_packed, n_views)
+        return obj
+
         # xyz:        geo
-        # xyz_offset:       photo 
-        # rgb:              photo 
+        # xyz_offset:       photo
+        # rgb:              photo
         # scale:      geo & photo
         # rot:        geo 
         # rot_offset:       photo
@@ -713,6 +734,27 @@ class RootTable: # 对于root，每个voxel有且仅有一个点。不需要额�
         self._n_views = vis.shape[1]
         self._visibility_packed = np.packbits(vis, axis=1)
         return self.points_xyz, self.points_color, self.points_normal, vis
+
+    def build_hash_table_packed(self, points_xyz, points_color, points_normal, vis_packed, n_views):
+        """Like build_hash_table but accepts already-packed visibility (uint8)."""
+        self.hash_voxel_id = defaultdict(list)
+        keep_idx = []
+
+        valid_i = 0
+        for i in range(points_xyz.shape[0]):
+            key = self.hashcode(points_xyz[i, 0], points_xyz[i, 1], points_xyz[i, 2])
+            if key in self.hash_voxel_id:
+                continue
+            self.hash_voxel_id[key] = valid_i
+            valid_i += 1
+            keep_idx.append(i)
+        keep_idx = np.array(keep_idx)
+
+        self.points_xyz = points_xyz[keep_idx]
+        self.points_color = points_color[keep_idx]
+        self.points_normal = points_normal[keep_idx]
+        self._n_views = n_views
+        self._visibility_packed = vis_packed[keep_idx]
 
     # --- Packed visibility accessors (avoid unpacking the full matrix) ---
 

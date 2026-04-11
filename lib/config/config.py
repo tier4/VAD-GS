@@ -125,6 +125,7 @@ cfg.data.eval = True
 cfg.data.type = 'Colmap'
 cfg.data.images = 'images'
 cfg.data.use_semantic = False
+cfg.data.use_seg_bkgd = True
 cfg.data.use_mono_depth = False
 cfg.data.use_mono_normal = False
 cfg.data.use_colmap = True

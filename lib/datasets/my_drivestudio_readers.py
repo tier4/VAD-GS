@@ -36,7 +36,8 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
     # dynamic mask
     dynamic_mask_dir = os.path.join(path, 'sam_masks')
     bkgd_mask_dir = os.path.join(path, 'sam_bkgd_masks')
-    load_dynamic_mask = os.path.exists(dynamic_mask_dir) and os.path.exists(bkgd_mask_dir)
+    load_dynamic_mask = os.path.exists(dynamic_mask_dir)
+    load_seg_bkgd = cfg.data.get("use_seg_bkgd", True) and os.path.exists(bkgd_mask_dir)
 
     # sky mask
     sky_mask_dir = os.path.join(path, 'sky_masks')
@@ -149,9 +150,10 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
             dynamic_mask = cv2.imread(dynamic_mask_path)
             guidance['dynamic_mask'] = dynamic_mask
 
-            seg_bkgd_mask_path = os.path.join(bkgd_mask_dir, f'{image_name}.png')
-            seg_bkgd_mask = cv2.imread(seg_bkgd_mask_path)
-            guidance["seg_bkgd"] = seg_bkgd_mask
+            if load_seg_bkgd:
+                seg_bkgd_mask_path = os.path.join(bkgd_mask_dir, f'{image_name}.png')
+                seg_bkgd_mask = cv2.imread(seg_bkgd_mask_path)
+                guidance["seg_bkgd"] = seg_bkgd_mask
 
             guidance['obj_bound'] = Image.fromarray(obj_bounds[i])
 

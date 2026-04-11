@@ -20,7 +20,7 @@ from lib.utils.colmap_utils import read_points3D_binary, read_extrinsics_binary
 from lib.utils.data_utils import get_val_frames
 from lib.utils.graphics_utils import get_rays, sphere_intersection
 from lib.utils.general_utils import matrix_to_quaternion, quaternion_to_matrix_numpy
-from lib.datasets.base_readers import storePly, get_Sphere_Norm
+from lib.datasets.base_readers import storePly, fetchPly, get_Sphere_Norm
 
 # Class name mapping (same as drivestudio_utils.py)
 waymo_track2label = {
@@ -820,6 +820,59 @@ def generate_dataparser_outputs_t4(
     return result
 
 
+def _regenerate_visibility_only(pointcloud_dir, result, num_cameras, num_frames, image_heights, image_widths):
+    """Regenerate packed visibility from existing PLY files (no point cloud rebuild)."""
+    import glob as _glob
+    c2ws_all = result["c2ws"]
+    ixts_all = result["ixts"]
+    N_VIEWS = num_frames * num_cameras
+
+    for ply_path in sorted(_glob.glob(os.path.join(pointcloud_dir, "points3D_*.ply"))):
+        key = os.path.basename(ply_path).replace("points3D_", "").replace(".ply", "")
+        if key == "lidar":
+            continue
+        npz_path = ply_path[:-3] + "npz"
+        if os.path.exists(npz_path):
+            continue
+
+        pcd = fetchPly(ply_path)
+        voxel_xyz = np.asarray(pcd.points, dtype=np.float32)
+        num_voxels = voxel_xyz.shape[0]
+        if num_voxels == 0:
+            continue
+
+        print(f"[pointcloud] Regenerating visibility for {key} ({num_voxels} points, {N_VIEWS} views)...")
+        packed_cols = (N_VIEWS + 7) // 8
+        vis_packed = np.zeros([num_voxels, packed_cols], dtype=np.uint8)
+        pts_h = np.concatenate([voxel_xyz, np.ones((num_voxels, 1), dtype=np.float32)], axis=1)
+
+        num_total_views = min(N_VIEWS, len(c2ws_all))
+        for idx in range(num_total_views):
+            cam_idx = idx % num_cameras
+            w2c = np.linalg.inv(c2ws_all[idx]).astype(np.float32)
+            ixt = ixts_all[idx].astype(np.float32)
+            pts_cam = pts_h @ w2c.T
+            pts_proj = pts_cam[:, :3] @ ixt.T
+            depth = pts_proj[:, 2]
+            us = pts_proj[:, 0] / (depth + 1e-8)
+            vs = pts_proj[:, 1] / (depth + 1e-8)
+            h, w = image_heights[cam_idx], image_widths[cam_idx]
+            vis = (us >= 0) & (us < w) & (vs >= 0) & (vs < h) & (depth > 2)
+            byte_idx = idx // 8
+            bit_idx = 7 - (idx % 8)
+            vis_packed[vis, byte_idx] |= np.uint8(1 << bit_idx)
+
+        del pts_h
+        np.savez_compressed(npz_path, packed=vis_packed, shape=np.array([num_voxels, N_VIEWS]))
+        print(f"[pointcloud] Saved {npz_path} ({vis_packed.nbytes / 1e6:.0f} MB)")
+        del vis_packed
+
+    # Clean up legacy .npy files
+    for npy_path in _glob.glob(os.path.join(pointcloud_dir, "*.npy")):
+        os.remove(npy_path)
+        print(f"[pointcloud] Removed legacy {npy_path}")
+
+
 def _build_pointcloud_t4(
     result, datadir, tables, samples, sample_channel_map,
     ego_pose_by_token, calibrated_sensor_by_token, sensor_by_token,
@@ -838,8 +891,16 @@ def _build_pointcloud_t4(
 
     pointcloud_dir = os.path.join(cfg.model_path, "input_ply")
     bkgd_ply = os.path.join(pointcloud_dir, "points3D_bkgd.ply")
-    if os.path.exists(bkgd_ply):
+    bkgd_vis = os.path.join(pointcloud_dir, "points3D_bkgd.npz")
+    # Also accept legacy .npy
+    bkgd_vis_legacy = os.path.join(pointcloud_dir, "points3D_bkgd.npy")
+    if os.path.exists(bkgd_ply) and (os.path.exists(bkgd_vis) or os.path.exists(bkgd_vis_legacy)):
         print(f"Point cloud cache found at {pointcloud_dir}, skipping rebuild.")
+        return
+    if os.path.exists(bkgd_ply) and not os.path.exists(bkgd_vis):
+        # PLY exists but visibility is missing — regenerate visibility only
+        print(f"[pointcloud] PLY cache found but visibility missing. Regenerating visibility...")
+        _regenerate_visibility_only(pointcloud_dir, result, num_cameras, num_frames, image_heights, image_widths)
         return
 
     print("Building point cloud from T4 LiDAR data...")
@@ -942,6 +1003,7 @@ def _build_pointcloud_t4(
 
         for cam, image_filename, idx in zip(cams_frame, image_filenames_frame, idxs):
             image = cv2.imread(image_filename)[..., [2, 1, 0]].astype(np.float32) / 255.0
+            img_h, img_w = image.shape[:2]
 
             # Derive camera channel and image name for normal file lookup
             _img_name = os.path.splitext(os.path.basename(image_filename))[0]
@@ -960,21 +1022,10 @@ def _build_pointcloud_t4(
                         _resolved_normal_file = nf_flat
                         break
 
-            if _resolved_normal_file is not None:
-                normal_dsine = cv2.imread(_resolved_normal_file).astype(np.float32) / 255.0 * 2 - 1
-                normals_transformed = np.zeros_like(normal_dsine)
-                normals_transformed[..., 0] = -normal_dsine[..., 2]
-                normals_transformed[..., 1] = -normal_dsine[..., 1]
-                normals_transformed[..., 2] = -normal_dsine[..., 0]
-            else:
-                normals_transformed = np.zeros_like(image)
-
             ixt = ixts_all[idx]
             c2w = c2ws_all[idx]
-            normals_world = normals_transformed @ c2w[:3, :3].T
-            normals_world_info.append((_resolved_normal_file, c2w[:3, :3].copy()))
 
-            # Project points to this camera
+            # Project points to this camera first, then load normal only for visible region
             view_pos_world = np.concatenate(
                 [points_xyz_world_filtered[:, :3], np.ones_like(points_xyz_world_filtered[:, :1])], axis=-1
             )
@@ -983,17 +1034,31 @@ def _build_pointcloud_t4(
             us = tmp[:, 0] / tmp[:, 2]
             vs = tmp[:, 1] / tmp[:, 2]
 
-            vis_mask = (us >= 0) & (us < image.shape[1]) & (vs >= 0) & (vs < image.shape[0]) & (tmp[:, 2] > 2)
+            vis_mask = (us >= 0) & (us < img_w) & (vs >= 0) & (vs < img_h) & (tmp[:, 2] > 2)
+            del view_pos_world, view_pos_cam, tmp
 
             mask_projw = us.astype(np.int16)[vis_mask]
             mask_projh = vs.astype(np.int16)[vis_mask]
+            del us, vs
 
-            mask_rgb = image[mask_projh, mask_projw]
-            mask_normal = normals_world[mask_projh, mask_projw]
+            points_rgb[vis_mask] = image[mask_projh, mask_projw]
+            del image  # Free image memory immediately
 
-            points_rgb[vis_mask] = mask_rgb
-            points_normal[vis_mask] = mask_normal
+            if _resolved_normal_file is not None:
+                normal_dsine = cv2.imread(_resolved_normal_file).astype(np.float32) / 255.0 * 2 - 1
+                normals_transformed = np.zeros_like(normal_dsine)
+                normals_transformed[..., 0] = -normal_dsine[..., 2]
+                normals_transformed[..., 1] = -normal_dsine[..., 1]
+                normals_transformed[..., 2] = -normal_dsine[..., 0]
+                del normal_dsine
+                normals_world = normals_transformed @ c2w[:3, :3].T
+                del normals_transformed
+                points_normal[vis_mask] = normals_world[mask_projh, mask_projw]
+                del normals_world
+            normals_world_info.append((_resolved_normal_file, c2w[:3, :3].copy()))
+
             points_visibility[vis_mask, idx] = True
+            del mask_projw, mask_projh, vis_mask
 
         # Filter points in object bounding boxes
         points_xyz_obj_mask = np.zeros(points_xyz_vehicle.shape[0], dtype=bool)
@@ -1051,50 +1116,68 @@ def _build_pointcloud_t4(
     initial_num_obj = 20000
     voxel_size = 0.15
 
-    # Background points
-    points_bkgd_lidar_xyz = np.concatenate(points_xyz_dict["bkgd"], axis=0)
-    points_bkgd_lidar_rgb = np.concatenate(points_rgb_dict["bkgd"], axis=0)
-    points_bkgd_lidar_normal = np.concatenate(points_normal_dict["bkgd"], axis=0)
-
-    # Free background data from dicts immediately after concatenation
-    points_xyz_dict["bkgd"] = []
-    points_rgb_dict["bkgd"] = []
-    points_normal_dict["bkgd"] = []
     import gc
+
+    # --- Step 1: Concatenate normal separately (needed for voxel normals, freed early) ---
+    print("[pointcloud] Concatenating background normals...")
+    points_bkgd_lidar_normal = np.concatenate(points_normal_dict["bkgd"], axis=0)
+    points_normal_dict["bkgd"] = []
+
+    # --- Step 2: Concatenate xyz+rgb, compute sphere norm, build Open3D pcd ---
+    print("[pointcloud] Concatenating background xyz+rgb...")
+    points_bkgd_lidar_xyz = np.concatenate(points_xyz_dict["bkgd"], axis=0)
+    points_xyz_dict["bkgd"] = []
+    points_bkgd_lidar_rgb = np.concatenate(points_rgb_dict["bkgd"], axis=0)
+    points_rgb_dict["bkgd"] = []
     gc.collect()
 
+    print(f"[pointcloud] Background points: {points_bkgd_lidar_xyz.shape[0]}")
     lidar_sphere_normalization = get_Sphere_Norm(points_bkgd_lidar_xyz)
     sphere_center = lidar_sphere_normalization["center"]
     sphere_radius = lidar_sphere_normalization["radius"]
 
+    print("[pointcloud] Voxel downsampling background...")
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_bkgd_lidar_xyz[:, :3])
     pcd.colors = o3d.utility.Vector3dVector(points_bkgd_lidar_rgb)
+    # Free raw arrays — Open3D holds its own copy
+    del points_bkgd_lidar_xyz, points_bkgd_lidar_rgb
+    gc.collect()
 
     downsampled_pcd, _, point_indices_for_each_voxel = pcd.voxel_down_sample_and_trace(
         voxel_size=voxel_size,
         min_bound=(pcd.get_min_bound() // voxel_size) * voxel_size,
         max_bound=(pcd.get_max_bound() // voxel_size + 1) * voxel_size,
     )
+    del pcd
+    gc.collect()
+
     downsample_outlier_pcd, downsample_outlier_indice = downsampled_pcd.remove_radius_outlier(
         nb_points=10, radius=0.5
     )
+    print(f"[pointcloud] Voxels after downsample: {len(downsampled_pcd.points)}, after outlier removal: {len(downsample_outlier_pcd.points)}")
+    del downsampled_pcd
+    gc.collect()
 
-    # Compute per-voxel normals by averaging points in each voxel
+    # --- Step 3: Compute per-voxel normals, then free normal array + indices ---
+    print("[pointcloud] Computing per-voxel normals...")
     normals_for_voxels = []
     for _tmp in downsample_outlier_indice:
         indices = point_indices_for_each_voxel[_tmp]
         normals_voxel = [points_bkgd_lidar_normal[p3d_idx] for p3d_idx in indices]
         normals_for_voxels.append(np.mean(np.array(normals_voxel).reshape(-1, 3), axis=0))
 
-    del points_bkgd_lidar_normal, point_indices_for_each_voxel
+    del points_bkgd_lidar_normal, point_indices_for_each_voxel, downsample_outlier_indice
     gc.collect()
 
-    # Compute per-voxel visibility by projecting voxel centers to all cameras
-    # This replaces the expensive per-point visibility tracking (saves GBs of memory)
+    # --- Step 4: Compute per-voxel visibility (packed to save memory) ---
+    # Instead of bool array (num_voxels × N_VIEWS = ~22GB), store as packed bits (~2.8GB).
+    # Each row has ceil(N_VIEWS/8) bytes.
+    print(f"[pointcloud] Computing voxel visibility for {N_VIEWS} views (packed)...")
     voxel_xyz = np.array(downsample_outlier_pcd.points, dtype=np.float32)
     num_voxels = voxel_xyz.shape[0]
-    views_for_voxels_arr = np.zeros([num_voxels, N_VIEWS], dtype=bool)
+    packed_cols = (N_VIEWS + 7) // 8
+    views_packed_lidar = np.zeros([num_voxels, packed_cols], dtype=np.uint8)
     pts_h = np.concatenate([voxel_xyz, np.ones((num_voxels, 1), dtype=np.float32)], axis=1)
     num_total_views = min(N_VIEWS, len(c2ws_all))
     for idx in range(num_total_views):
@@ -1108,9 +1191,12 @@ def _build_pointcloud_t4(
         vs = pts_proj[:, 1] / (depth + 1e-8)
         h, w = image_heights[cam_idx], image_widths[cam_idx]
         vis = (us >= 0) & (us < w) & (vs >= 0) & (vs < h) & (depth > 2)
-        views_for_voxels_arr[:, idx] = vis
-    views_for_voxels = [views_for_voxels_arr[i] for i in range(num_voxels)]
-    del views_for_voxels_arr, pts_h
+        byte_idx = idx // 8
+        bit_idx = 7 - (idx % 8)  # packbits uses big-endian bit order
+        views_packed_lidar[vis, byte_idx] |= np.uint8(1 << bit_idx)
+    del pts_h
+    gc.collect()
+    print(f"[pointcloud] Visibility packed: {num_voxels} voxels × {packed_cols} bytes = {views_packed_lidar.nbytes / 1e9:.1f} GB")
 
     # Helper: load normal image on demand with simple cache
     _normal_cache = {}  # view_id -> normals_world image
@@ -1134,6 +1220,8 @@ def _build_pointcloud_t4(
         return normals_world
 
     # Combine with COLMAP points
+    print("[pointcloud] Combining with COLMAP points...")
+    colmap_views_list = []
     try:
         if has_colmap and cfg.data.get("filter_colmap", True):
             points_colmap_mask = np.ones(points_colmap_xyz.shape[0], dtype=bool)
@@ -1153,7 +1241,7 @@ def _build_pointcloud_t4(
             for p3d_colmap_id in range(len(points_colmap_tracks)):
                 if not points_colmap_mask[p3d_colmap_id]:
                     continue
-                views_voxel = np.zeros([N_VIEWS], dtype=bool)
+                views_packed_row = np.zeros([packed_cols], dtype=np.uint8)
                 normals_voxel = []
                 p_tracks = points_colmap_tracks[p3d_colmap_id]
                 for track_id_idx in range(len(p_tracks)):
@@ -1169,12 +1257,14 @@ def _build_pointcloud_t4(
                             p_n = nw[u, v]
                         else:
                             p_n = np.zeros(3, dtype=np.float32)
-                        views_voxel[_my_view_id] = True
+                        byte_idx = _my_view_id // 8
+                        bit_idx = 7 - (_my_view_id % 8)
+                        views_packed_row[byte_idx] |= np.uint8(1 << bit_idx)
                         normals_voxel.append(p_n)
 
                 if not normals_voxel:
                     normals_voxel = [np.zeros(3)]
-                views_for_voxels.append(views_voxel)
+                colmap_views_list.append(views_packed_row)
                 normals_for_voxels.append(np.mean(np.array(normals_voxel).reshape(-1, 3), axis=0))
 
             points_bkgd_xyz = np.concatenate(
@@ -1183,24 +1273,40 @@ def _build_pointcloud_t4(
             points_bkgd_rgb = np.concatenate(
                 [np.array(downsample_outlier_pcd.colors), points_colmap_rgb], axis=0
             )
+            if colmap_views_list:
+                colmap_views_arr = np.array(colmap_views_list, dtype=np.uint8)
+                del colmap_views_list
+                views_packed_combined = np.concatenate([views_packed_lidar, colmap_views_arr], axis=0)
+                del views_packed_lidar, colmap_views_arr
+            else:
+                views_packed_combined = views_packed_lidar
+                del views_packed_lidar
         else:
             raise Exception("Skip COLMAP")
     except Exception:
         print("Using LiDAR-only point cloud")
         points_bkgd_xyz = np.array(downsample_outlier_pcd.points)
         points_bkgd_rgb = np.array(downsample_outlier_pcd.colors)
+        views_packed_combined = views_packed_lidar
+        del views_packed_lidar
 
     normals = np.array(normals_for_voxels).reshape(-1, 3)
+    del normals_for_voxels
     norms = np.linalg.norm(normals, axis=1, keepdims=True)
     norms = np.where(norms < 1e-8, 1.0, norms)
     points_bkgd_normal = normals / norms
+    del normals
 
     voxels_xyz_dict = {"bkgd": points_bkgd_xyz}
     voxels_rgb_dict = {"bkgd": points_bkgd_rgb}
     voxels_normal_sh_dict = {"bkgd": points_bkgd_normal}
-    voxels_view_dict = {"bkgd": np.array(views_for_voxels)}
+    # bkgd visibility is stored packed; object visibility stored as bool (small enough)
+    voxels_view_packed_dict = {"bkgd": views_packed_combined}
+    voxels_view_dict = {}
+    del views_packed_combined
 
     # Object points
+    print(f"[pointcloud] Processing object points ({len([k for k in points_xyz_dict if k != 'bkgd' and len(points_xyz_dict[k]) > 0])} objects)...")
     for k, v in points_xyz_dict.items():
         if len(v) == 0 or k == "bkgd":
             continue
@@ -1265,11 +1371,12 @@ def _build_pointcloud_t4(
             voxels_normal_sh_dict[k] = point_normal
 
     # Save PLY files
-    for k in voxels_xyz_dict.keys():
+    all_keys = list(voxels_xyz_dict.keys())
+    print(f"[pointcloud] Saving PLY files ({len(all_keys)} entries)...")
+    for k in all_keys:
         pts_xyz = voxels_xyz_dict[k]
         pts_rgb = voxels_rgb_dict[k]
         pts_normal = voxels_normal_sh_dict[k]
-        pts_vis = voxels_view_dict[k]
 
         if np.isnan(pts_normal).sum():
             print(f"NaN in normals for {k}")
@@ -1278,10 +1385,22 @@ def _build_pointcloud_t4(
             continue
 
         ply_path = os.path.join(pointcloud_dir, f"points3D_{k}.ply")
+        vis_path = ply_path[:-3] + "npz"
         try:
             storePly(ply_path, pts_xyz, pts_rgb, normals=pts_normal[:, 0:])
-            np.save(ply_path[:-3] + "npy", pts_vis)
-            print(f"Saved point cloud for {k}: {pts_xyz.shape[0]} points")
+            if k in voxels_view_packed_dict:
+                # Already packed (bkgd)
+                packed = voxels_view_packed_dict[k]
+                np.savez_compressed(vis_path, packed=packed, shape=np.array([pts_xyz.shape[0], N_VIEWS]))
+                print(f"Saved {k}: {pts_xyz.shape[0]} points, vis packed {packed.shape} -> {vis_path}")
+                del voxels_view_packed_dict[k]
+            elif k in voxels_view_dict:
+                # Bool array (objects, small)
+                pts_vis = voxels_view_dict[k]
+                packed = np.packbits(pts_vis.astype(np.uint8), axis=1)
+                np.savez_compressed(vis_path, packed=packed, shape=np.array(pts_vis.shape))
+                print(f"Saved {k}: {pts_xyz.shape[0]} points, vis {pts_vis.shape} -> {vis_path}")
+                del packed
         except Exception as e:
             print(f"Failed to save point cloud for {k}: {e}")
 
