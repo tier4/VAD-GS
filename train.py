@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import torch
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 import patchmatch_cuda
 
 from random import randint
@@ -144,7 +144,7 @@ def training() -> None:
     gaussians_renderer = StreetGaussianRenderer()
 
     use_amp = optim_args.use_amp
-    scaler = GradScaler('cuda', enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
     print(f'AMP (Automatic Mixed Precision): {"ON" if use_amp else "OFF"}')
 
     iter_start = torch.cuda.Event(enable_timing = True)
@@ -851,7 +851,7 @@ def training() -> None:
 
         if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end and "mono_depth" in viewpoint_cam.guidance:
             loss_hard = 0
-            with autocast('cuda', enabled=use_amp):
+            with autocast(enabled=use_amp):
                 hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
                 hard_depth = hard_render_pkg["depth"]
 
@@ -875,7 +875,7 @@ def training() -> None:
             del hard_render_pkg, hard_depth, loss_hard, loss_l2_dpt, loss_global
             torch.cuda.empty_cache()
 
-        with autocast('cuda', enabled=use_amp):
+        with autocast(enabled=use_amp):
             soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
             image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
 
