@@ -976,17 +976,9 @@ def training() -> None:
             row0 = torch.cat([gt_image, image, depth_colored], dim=2)
             acc = acc.repeat(3, 1, 1)
             with torch.no_grad():
-                # Check if any objects are visible in this frame before rendering
-                gaussians.set_visibility(include_list=gaussians.obj_list)
-                gaussians.parse_camera(viewpoint_cam)
-                has_objects = len(gaussians.graph_obj_list) > 0
-                if has_objects:
-                    render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=False)
-                    image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
-                    del render_pkg_obj
-                else:
-                    image_obj = torch.zeros_like(gt_image)
-                    acc_obj = torch.zeros(1, gt_image.shape[1], gt_image.shape[2], device=gt_image.device)
+                render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians)
+                image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
+                del render_pkg_obj
             acc_obj = acc_obj.repeat(3, 1, 1)
             # row1 = torch.cat([acc, image_obj, acc_obj], dim=2)
             row1 = torch.cat([voxel_depth_tensor[None,:,:].repeat(3,1,1) / voxel_depth_tensor.max(), image_obj, mono_depth.repeat(3,1,1)], dim=2)

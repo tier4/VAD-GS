@@ -304,17 +304,19 @@ class StreetGaussianModel(nn.Module):
             
             scalings.append(scaling)
         
+        if len(scalings) == 0:
+            return torch.empty(0, 3, device='cuda')
         scalings = torch.cat(scalings, dim=0)
         return scalings
-            
+
     @property
     def get_rotation(self) -> torch.Tensor:
         rotations = []
 
-        if self.get_visibility('background'):            
+        if self.get_visibility('background'):
             rotations_bkgd = self.background.get_rotation
             if self.use_pose_correction:
-                rotations_bkgd = self.pose_correction.correct_gaussian_rotation(self.viewpoint_camera, rotations_bkgd)            
+                rotations_bkgd = self.pose_correction.correct_gaussian_rotation(self.viewpoint_camera, rotations_bkgd)
             rotations.append(rotations_bkgd)
 
         if len(self.graph_obj_list) > 0:
@@ -334,6 +336,8 @@ class StreetGaussianModel(nn.Module):
             rotations_obj = torch.nn.functional.normalize(rotations_obj)
             rotations.append(rotations_obj)
 
+        if len(rotations) == 0:
+            return torch.empty(0, 4, device='cuda')
         rotations = torch.cat(rotations, dim=0)
         return rotations
     
@@ -363,9 +367,11 @@ class StreetGaussianModel(nn.Module):
             xyzs_obj = torch.einsum('bij, bj -> bi', obj_rots, xyzs_local) + self.obj_trans
             xyzs.append(xyzs_obj)
 
+        if len(xyzs) == 0:
+            return torch.empty(0, 3, device='cuda')
         xyzs = torch.cat(xyzs, dim=0)
 
-        return xyzs            
+        return xyzs
 
     @property
     def get_features(self) -> torch.Tensor:
@@ -380,8 +386,10 @@ class StreetGaussianModel(nn.Module):
             feature_obj = obj_model.get_features_fourier(self.frame)
             features.append(feature_obj)
             
+        if len(features) == 0:
+            return torch.empty(0, 0, 0, device='cuda')
         features = torch.cat(features, dim=0)
-       
+
         return features
     
     def get_colors(self, camera_center: torch.Tensor) -> torch.Tensor:
@@ -414,6 +422,8 @@ class StreetGaussianModel(nn.Module):
             color = torch.clamp_min(sh2rgb + 0.5, 0.)
             colors.append(color)
 
+        if len(colors) == 0:
+            return torch.empty(0, 3, device='cuda')
         colors = torch.cat(colors, dim=0)
         return colors
                 
@@ -432,6 +442,8 @@ class StreetGaussianModel(nn.Module):
         
             semantics.append(semantic)
 
+        if len(semantics) == 0:
+            return torch.empty(0, 0, device='cuda')
         semantics = torch.cat(semantics, dim=0)
         return semantics
     
@@ -450,6 +462,8 @@ class StreetGaussianModel(nn.Module):
         
             opacities.append(opacity)
         
+        if len(opacities) == 0:
+            return torch.empty(0, 1, device='cuda')
         opacities = torch.cat(opacities, dim=0)
         return opacities
             
@@ -482,6 +496,8 @@ class StreetGaussianModel(nn.Module):
             normals_obj_global = torch.nn.functional.normalize(normals_obj_global)                
             normals.append(normals_obj_global)
 
+        if len(normals) == 0:
+            return torch.empty(0, 3, device='cuda')
         normals_world = torch.cat(normals, dim=0)
         return normals_world
             
