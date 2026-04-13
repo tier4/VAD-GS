@@ -57,10 +57,10 @@ optim:
   densification_interval: 100
   prop_voxel_interval: 5
 
-  densify_from_iter: 500
-  densify_grad_threshold_bkgd: 0.001
+  densify_from_iter: 3000              # 500 → 3000 (T4: 全 1500 枚を 2 epoch 見てから prune/densify 判定を開始)
+  densify_grad_threshold_bkgd: 0.002   # T4(~1500枚)は nuscenes の 7.5 倍の勾配蓄積、閾値を 2x に
   densify_grad_abs_bkgd: True
-  densify_grad_threshold_obj: 0.0002
+  densify_grad_threshold_obj: 0.0004   # obj 側も 2x
   densify_grad_abs_obj: False
   densify_until_iter: 24000
 
@@ -73,10 +73,10 @@ optim:
   lambda_scale_pena: 0
 
   feature_lr: 0.0025
-  max_screen_size: 20
+  max_screen_size: 10                  # 20 → 10 (大きい Gaussian を積極的に prune)
   min_opacity: 0.01
   opacity_lr: 0.05
-  opacity_reset_interval: 3000
+  opacity_reset_interval: 9000         # 3000 → 9000 (reset 後の densify 爆発を抑制)
   percent_big_ws: 0.1
   percent_dense: 0.01
   position_lr_delay_mult: 0.01
