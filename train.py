@@ -246,9 +246,12 @@ def training() -> None:
             #     viewpoint_cam.guidance['mono_normal'] = viewpoint_cam.guidance['mono_normal'].cuda(non_blocking=True)
 
         current_view, img_H, img_W = randidx, gt_image.shape[1], gt_image.shape[2]
-        if "bkgd_voxel" not in viewpoint_cam.guidance: # zyk: fixed here, not growing for now.
+        if "bkgd_voxel_depth" not in viewpoint_cam.guidance:
             voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W, scaled_K=viewpoint_cam.K.cpu().numpy())
-            viewpoint_cam.guidance["bkgd_voxel"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32), mask_visible, uvs.astype(np.int16))
+            # Cache only pixel-level data (~3 MB); voxel-level data (mask_visible, uvs)
+            # is ~37 MB per camera and only needed for propagation — recomputed on demand.
+            viewpoint_cam.guidance["bkgd_voxel_depth"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32))
+            del mask_visible, uvs
         
 
         flag_global_reconstruct = False
@@ -275,7 +278,7 @@ def training() -> None:
                 hard_depth = hard_render_pkg["depth"][0]
                 del hard_render_pkg
 
-                voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
+                voxel_depth_value, voxel_depth_source = viewpoint_cam.guidance["bkgd_voxel_depth"]
                 voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
 
                 m1 = (voxel_depth_tensor > 0) & (hard_depth > voxel_depth_tensor * 1.1) # 有初值。但是空了 missing points
@@ -515,8 +518,7 @@ def training() -> None:
 ##################################### BACKGROUND DISCIRETE ##########################################################
             if flag_local_reconstruct and not optim_args.skip_view_selection: #  or iteration > FULL_STACK_LENGTH * 5 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
 
-                # voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W)
-                voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
+                voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W, scaled_K=viewpoint_cam.K.cpu().numpy())
                 
                 # segment_img = cv2.imread(os.path.join(dataset.source_path, "sam_bkgd_masks/000%.3d_%d.png"%(current_view//3, current_view%3)))[:,:,:3]
                 # segment_img = cv2.resize(segment_img, (voxel_depth_value.shape[1], voxel_depth_value.shape[0]), interpolation=cv2.INTER_NEAREST)
@@ -856,7 +858,7 @@ def training() -> None:
             torch.cuda.empty_cache()
 
 
-        voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
+        voxel_depth_value, voxel_depth_source = viewpoint_cam.guidance["bkgd_voxel_depth"]
         voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
 
         if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end and "mono_depth" in viewpoint_cam.guidance:
