@@ -686,7 +686,7 @@ class VineTable:
 
 
     def _enlarge_and_copy(self, x: np.ndarray, size: int) -> np.ndarray:
-        new_x = np.zeros([size, x.shape[1]]) 
+        new_x = np.zeros([size, x.shape[1]], dtype=x.dtype)
         new_x[:self.valid_cnt] = x[:self.valid_cnt]
         return new_x
 
