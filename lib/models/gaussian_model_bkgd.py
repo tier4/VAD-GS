@@ -75,15 +75,21 @@ class GaussianModelBkgd(GaussianModel):
         vis_data, n_views = _load_packed_visibility(os.path.join(cfg.model_path, "input_ply/points3D_bkgd"))
         pbar.update(1)
 
-        # Zero out test views in packed representation
+        # Zero out test views and ensure packed format
         pbar.set_postfix_str("zeroing test views")
         test_views = np.setdiff1d(np.arange(n_views), train_views)
-        if len(test_views) > 0 and vis_data.dtype == np.uint8 and vis_data.ndim == 2:
-            # Packed format: clear bits for test views
-            for tv in test_views:
-                byte_idx = tv // 8
-                bit_idx = 7 - (tv % 8)
-                vis_data[:, byte_idx] &= ~np.uint8(1 << bit_idx)
+        if vis_data.dtype == np.uint8 and vis_data.shape[1] == (n_views + 7) // 8:
+            # Already packed: clear bits for test views
+            if len(test_views) > 0:
+                for tv in test_views:
+                    byte_idx = tv // 8
+                    bit_idx = 7 - (tv % 8)
+                    vis_data[:, byte_idx] &= ~np.uint8(1 << bit_idx)
+        else:
+            # Legacy bool array: zero test views, then pack
+            if len(test_views) > 0:
+                vis_data[:, test_views] = False
+            vis_data = np.packbits(vis_data.astype(np.uint8), axis=1)
         pbar.update(1)
 
         pbar.set_postfix_str("building GrapeTrellis")
