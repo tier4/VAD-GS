@@ -251,14 +251,16 @@ def training() -> None:
             viewpoint_cam.guidance["bkgd_voxel"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32), mask_visible, uvs.astype(np.int16))
         
 
-        flag_global_reconstruct = False 
+        flag_global_reconstruct = False
         flag_local_reconstruct = False
         flag_actor_reconstruct = False
+        _propagation_ran = False
 
         ###################### hard depth #######################
         # check_views = [5, 10, 20, 40, 60, 80, 100]
         # if view_stack_iter in check_views : # and iteration % optim_args.propagation_interval == 0:
         if view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end:
+            _propagation_ran = True
             soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
             image = soft_render_pkg["rgb"]
             _similarity = ssim(image, gt_image, mask=loss_mask)
@@ -843,6 +845,14 @@ def training() -> None:
                             continue
                         obj_model.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), render_acc, gt_image, obj_rots, obj_trans, init_opacity=0.3, target_count=target_count) 
                     
+            # Free source camera images/guidance loaded during depth propagation
+            if _propagation_ran:
+                for _vp in viewpoint_full_stack:
+                    if _vp is not viewpoint_cam:
+                        _vp.unload_image()
+                        if hasattr(_vp.guidance, 'unload'):
+                            _vp.guidance.unload()
+                del soft_render_pkg, image
             torch.cuda.empty_cache()
 
 
