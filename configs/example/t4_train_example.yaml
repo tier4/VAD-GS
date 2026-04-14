@@ -54,13 +54,13 @@ optim:
   use_amp: False
   error_tolerance: 0.01
   prune_box_interval: 100
-  densification_interval: 100
+  densification_interval: 200          # 100 → 200 (T4 は 1500 枚: 200iter で ~13% の view を見てから prune 判定。max_radii2D の蓄積不足による誤 prune を抑制)
   prop_voxel_interval: 5
 
-  densify_from_iter: 3000              # 500 → 3000 (T4: 全 1500 枚を 2 epoch 見てから prune/densify 判定を開始)
-  densify_grad_threshold_bkgd: 0.002   # T4(~1500枚)は nuscenes の 7.5 倍の勾配蓄積、閾値を 2x に
+  densify_from_iter: 1500              # 3000 → 1500 (~1 epoch で densify 開始。早めに表現を構築)
+  densify_grad_threshold_bkgd: 0.0008  # 0.002 → 0.0008 (勾配は denom で正規化済みなので nuscenes(0.001) と同等でよい。densify 促進)
   densify_grad_abs_bkgd: True
-  densify_grad_threshold_obj: 0.0004   # obj 側も 2x
+  densify_grad_threshold_obj: 0.0002   # 0.0004 → 0.0002 (nuscenes デフォルトに戻す)
   densify_grad_abs_obj: False
   densify_until_iter: 24000
 
@@ -73,12 +73,13 @@ optim:
   lambda_scale_pena: 0
 
   feature_lr: 0.0025
-  max_screen_size: 10                  # 20 → 10 (大きい Gaussian を積極的に prune)
-  min_opacity: 0.01
+  max_screen_size: 20                  # 10 → 20 (デフォルトに戻す)
+  min_opacity: 0.005                   # 0.01 → 0.005 (opacity reset 直後の Gaussian が即 prune されるのを防止)
   opacity_lr: 0.05
-  opacity_reset_interval: 9000         # 3000 → 9000 (reset 後の densify 爆発を抑制)
+  opacity_reset_interval: 15000        # 9000 → 15000 (densify 期間 1500-24000 中の reset を 1 回(15000)に抑制。復帰時間を確保)
   percent_big_ws: 0.1
   percent_dense: 0.01
+  prune_small_radii: 0                 # screen 上 ≤N pixel の Gaussian を prune する閾値。0=無効化 (T4 は view 数が多く誤 prune が激しいため)
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 1.6e-05

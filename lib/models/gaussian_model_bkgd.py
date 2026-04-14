@@ -223,10 +223,12 @@ class GaussianModelBkgd(GaussianModel):
             big_points_ws = torch.max(self.get_scaling, dim=1).values > extent * self.percent_big_ws
             big_points_ws[dists > 2 * self.sphere_radius] = False
             
-            over_small_points_ws = (self.max_radii2D > 0) & (self.max_radii2D <= 1)
-
             prune_mask = torch.logical_or(prune_mask, big_points_ws)
-            prune_mask = torch.logical_or(prune_mask, over_small_points_ws) # zyk: overfitting
+
+            small_radii_thresh = cfg.optim.get('prune_small_radii', 1)
+            if small_radii_thresh > 0:
+                over_small_points_ws = (self.max_radii2D > 0) & (self.max_radii2D <= small_radii_thresh)
+                prune_mask = torch.logical_or(prune_mask, over_small_points_ws)
             
             self.scalar_dict['points_big_ws'] = big_points_ws.sum().item()
 

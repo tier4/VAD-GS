@@ -311,8 +311,8 @@ class GaussianModelActor(GaussianModel):
             # Prune big points in world space
             extent = self.extent
             big_points_ws = self.get_scaling.max(dim=1).values > extent * self.percent_big_ws
-            over_small_points_ws = (self.max_radii2D > 0) & (self.max_radii2D <= 1)
-            
+            small_radii_thresh = cfg.optim.get('prune_small_radii', 1)
+
             # Prune points outside the tracking box
             repeat_num = 2
             stds = self.get_scaling.clamp(min=0.0)
@@ -333,7 +333,9 @@ class GaussianModelActor(GaussianModel):
             points_outside_box = torch.logical_not(points_inside_box)           
             
             prune_mask = torch.logical_or(prune_mask, big_points_ws)
-            prune_mask = torch.logical_or(prune_mask, over_small_points_ws) # zyk: overfitting
+            if small_radii_thresh > 0:
+                over_small_points_ws = (self.max_radii2D > 0) & (self.max_radii2D <= small_radii_thresh)
+                prune_mask = torch.logical_or(prune_mask, over_small_points_ws)
             # if prune_mask.shape[0] - prune_mask.sum() < 1000:
             #     prune_mask[:] = False
 

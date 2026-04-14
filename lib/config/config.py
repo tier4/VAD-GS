@@ -67,6 +67,7 @@ cfg.optim.densify_grad_abs_obj = False
 cfg.optim.max_screen_size = 20
 cfg.optim.min_opacity = 0.005
 cfg.optim.percent_big_ws = 0.1
+cfg.optim.prune_small_radii = 1  # prune Gaussians with 0 < max_radii2D <= this value. Set 0 to disable.
 # loss weight
 cfg.optim.lambda_l1 = 1.
 cfg.optim.lambda_dssim = 0.2
