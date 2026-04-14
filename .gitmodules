@@ -1,0 +1,4 @@
+[submodule "submodules/InfiniDepth"]
+	path = submodules/InfiniDepth
+	url = https://github.com/hakuturu583/InfiniDepth.git
+	branch = add-uv-support
