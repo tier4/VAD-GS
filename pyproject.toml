@@ -43,6 +43,14 @@ dependencies = [
     "tqdm",
     "transformers>=5.2.0",
     "t4-devkit",
+    "tyro>=1.0.12",
+    "einops>=0.8.2",
+    # InfiniDepth runtime deps (submodule at submodules/InfiniDepth, imported via sys.path)
+    "onnxruntime",
+    "jaxtyping",
+    "beartype",
+    "h5py",
+    "openexr",
 ]
 
 [tool.uv]

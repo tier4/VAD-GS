@@ -143,10 +143,10 @@ def main():
             extension=".npy",
         )
 
-    # Step 2: Mono depth (Depth Anything V2 Small)
+    # Step 2: Metric depth (InfiniDepth with RGB + LiDAR sparse depth)
     if "mono_depth" in steps:
         results["mono_depth"] = run_step(
-            "Mono Depth (Depth Anything V2 Small)",
+            "Metric Depth (InfiniDepth, RGB + LiDAR)",
             SCRIPT_DIR / "generate_mono_depth.py",
             common + batch_args,
             prep / "depth",
