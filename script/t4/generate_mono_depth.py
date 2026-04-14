@@ -36,6 +36,36 @@ if not INFINIDEPTH_DIR.exists():
 sys.path.insert(0, str(INFINIDEPTH_DIR))
 
 
+# HuggingFace repo / filename mapping for auto-download
+_HF_CHECKPOINTS = {
+    "infinidepth_depthsensor.ckpt": ("ritianyu/InfiniDepth", "infinidepth_depthsensor.ckpt"),
+    "infinidepth.ckpt": ("ritianyu/InfiniDepth", "infinidepth.ckpt"),
+    "model.pt": ("Ruicheng/moge-2-vitl-normal", "model.pt"),
+}
+
+
+def _ensure_checkpoint(path: Path) -> Path:
+    """Download checkpoint from HuggingFace if it doesn't exist locally."""
+    if path.exists():
+        return path
+    filename = path.name
+    if filename not in _HF_CHECKPOINTS:
+        raise FileNotFoundError(
+            f"Checkpoint not found: {path}\n"
+            f"Unknown file '{filename}' — cannot auto-download."
+        )
+    repo_id, hf_filename = _HF_CHECKPOINTS[filename]
+    print(f"Checkpoint not found at {path}, downloading from {repo_id}...")
+    from huggingface_hub import hf_hub_download
+    downloaded = hf_hub_download(
+        repo_id=repo_id,
+        filename=hf_filename,
+        local_dir=str(path.parent),
+    )
+    print(f"Downloaded to {downloaded}")
+    return path
+
+
 def _import_infinidepth():
     """Deferred import so that --help works without InfiniDepth deps."""
     from inference_depth import (
@@ -153,6 +183,9 @@ def main():
     if not entries:
         print("Nothing to do.")
         return
+
+    # Auto-download checkpoints if missing
+    args.depth_model_path = _ensure_checkpoint(args.depth_model_path)
 
     DepthInferenceArgs, load_depth_model, run_depth_inference = _import_infinidepth()
 
