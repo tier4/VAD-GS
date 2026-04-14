@@ -45,6 +45,7 @@ cfg.train.start_checkpoint = None
 cfg.train.importance_sampling = False
 
 cfg.optim = CN()
+cfg.optim.use_amp = False # If set to True, use Automatic Mixed Precision (AMP) for training.
 # learning rate
 cfg.optim.position_lr_init = 0.00016 # position_lr_init_{bkgd, obj ...}, similar to the following
 cfg.optim.position_lr_final = 0.0000016
@@ -66,6 +67,7 @@ cfg.optim.densify_grad_abs_obj = False
 cfg.optim.max_screen_size = 20
 cfg.optim.min_opacity = 0.005
 cfg.optim.percent_big_ws = 0.1
+cfg.optim.prune_small_radii = 1  # prune Gaussians with 0 < max_radii2D <= this value. Set 0 to disable.
 # loss weight
 cfg.optim.lambda_l1 = 1.
 cfg.optim.lambda_dssim = 0.2
@@ -124,6 +126,7 @@ cfg.data.eval = True
 cfg.data.type = 'Colmap'
 cfg.data.images = 'images'
 cfg.data.use_semantic = False
+cfg.data.use_seg_bkgd = True
 cfg.data.use_mono_depth = False
 cfg.data.use_mono_normal = False
 cfg.data.use_colmap = True

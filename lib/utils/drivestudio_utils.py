@@ -54,10 +54,16 @@ def load_camera_info_ds(datadir, colmap_basedir):
     lidar_pose_dir = os.path.join(datadir, 'lidar_pose')
     extrinsics_dir = os.path.join(datadir, 'extrinsics')
     intrinsics_dir = os.path.join(datadir, 'intrinsics')
-    
-    intrinsics = [] # 5cam
-    extrinsics = [] # 5cam
-    for i in range(6):
+
+    camera_ids = sorted(
+        int(os.path.splitext(filename)[0])
+        for filename in os.listdir(intrinsics_dir)
+        if filename.endswith(".txt")
+    )
+
+    intrinsics = []
+    extrinsics = []
+    for i in camera_ids:
         intrinsic = np.loadtxt(os.path.join(intrinsics_dir,  f"{i}.txt"))
         fx, fy, cx, cy = intrinsic[0], intrinsic[1], intrinsic[2], intrinsic[3]
         intrinsic = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
@@ -97,7 +103,8 @@ def load_camera_info_ds(datadir, colmap_basedir):
 
     # except:
     ## Nuscenes
-    ego_cam_poses = [[] for i in range(6)]
+    num_cams = max(camera_ids) + 1 if camera_ids else 0
+    ego_cam_poses = [[] for _ in range(num_cams)]
     extrinsics_paths = sorted(os.listdir(extrinsics_dir))
     for ext_path in extrinsics_paths:
         cam2world = np.loadtxt(os.path.join(extrinsics_dir, ext_path))
@@ -558,7 +565,9 @@ def generate_dataparser_outputs(
         end_frame = num_frames_all - 1
         selected_frames = [start_frame, end_frame]
     else:
-        start_frame, end_frame = selected_frames[0], selected_frames[1]
+        start_frame = max(0, selected_frames[0])
+        end_frame = min(num_frames_all - 1, selected_frames[1])
+        selected_frames = [start_frame, end_frame]
     num_frames = end_frame - start_frame + 1
 
     # load calibration and ego pose
@@ -724,7 +733,7 @@ def generate_dataparser_outputs(
     
     # run colmap
     colmap_basedir = os.path.join(f'{cfg.model_path}/colmap')
-    if not os.path.exists(os.path.join(colmap_basedir, 'triangulated/sparse/model')):
+    if build_pointcloud and not os.path.exists(os.path.join(colmap_basedir, 'triangulated/sparse/model')):
         from script.waymo.colmap_drivestudio_full import run_colmap_waymo
         run_colmap_waymo(result)
     

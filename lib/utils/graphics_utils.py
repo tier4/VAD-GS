@@ -183,8 +183,10 @@ def get_rays(H, W, K, R, T, perturb=False):
     rays_o = np.broadcast_to(rays_o, rays_d.shape)
     return rays_o, rays_d
 
+@torch.amp.autocast('cuda', enabled=False)
 def get_rays_torch(H, W, K, R, T, perturb=False):
     # calculate the camera origin
+    K, R, T = K.float(), R.float(), T.float()
     rays_o = -torch.matmul(R.T, T).squeeze()
     # calculate the world coodinates of pixels
     i, j = torch.meshgrid(torch.arange(W, dtype=torch.float32, device=K.device),

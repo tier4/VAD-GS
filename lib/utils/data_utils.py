@@ -1,13 +1,16 @@
+from __future__ import annotations
+
 import numpy as np
 import torch
 import os
 import math
+from typing import Any
 from lib.utils.graphics_utils import focal2fov
 from lib.datasets.base_readers import CameraInfo
 from PIL import Image
 from tqdm import tqdm
 
-def to_cuda(batch):
+def to_cuda(batch: Any) -> Any:
     if isinstance(batch, tuple) or isinstance(batch, list):
         batch = [to_cuda(b) for b in batch]
         return batch
@@ -24,7 +27,7 @@ def to_cuda(batch):
     else:
         raise NotImplementedError
 
-def get_split_data(split_train, split_test, data):
+def get_split_data(split_train: int, split_test: int, data: list[Any]) -> tuple[list[Any], list[Any]]:
     if split_train != -1:
         train_data = [d for idx, d in enumerate(data) if idx % split_train == 0]
         test_data = [d for idx, d in enumerate(data) if idx % split_train != 0]
@@ -33,7 +36,7 @@ def get_split_data(split_train, split_test, data):
         test_data = [d for idx, d in enumerate(data) if idx % split_test == 0]
     return train_data, test_data
 
-def get_val_frames(num_frames: int, test_every: int, train_every: int):
+def get_val_frames(num_frames: int, test_every: int | None, train_every: int | None) -> tuple[list[int], list[int]]:
     if train_every is None or train_every < 0:
         val_frames = set(np.arange(test_every, num_frames, test_every))
         train_frames = (set(np.arange(num_frames)) - val_frames) if test_every > 1 else set()

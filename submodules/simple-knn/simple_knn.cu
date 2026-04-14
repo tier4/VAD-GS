@@ -16,11 +16,11 @@
 #include "simple_knn.h"
 #include <cub/cub.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cfloat>
 #include <vector>
 #include <cuda_runtime_api.h>
 #include <thrust/device_vector.h>
 #include <thrust/sequence.h>
-#define __CUDACC__
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 

@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import torch
 import numpy as np
 import torch.nn as nn
 import os
+from typing import Any
+from tqdm import tqdm
 from lib.config import cfg
 from lib.utils.graphics_utils import BasicPointCloud
 from lib.datasets.base_readers import fetchPly
@@ -9,6 +13,21 @@ from lib.models.gaussian_model import GaussianModel
 from lib.utils.camera_utils import Camera, make_rasterizer
 
 from lib.models.trellis import GrapeTrellis
+
+
+def _load_packed_visibility(path_prefix):
+    """Load visibility as (packed_uint8, n_views) tuple from npz, or bool array from legacy npy."""
+    npz_path = path_prefix + ".npz"
+    npy_path = path_prefix + ".npy"
+    if os.path.exists(npz_path):
+        data = np.load(npz_path)
+        n_views = int(data["shape"][1])
+        return data["packed"], n_views  # packed uint8, no unpack
+    elif os.path.exists(npy_path):
+        arr = np.load(npy_path)
+        return arr, arr.shape[1]  # legacy: full bool array
+    else:
+        raise FileNotFoundError(f"No visibility file found at {path_prefix}.npz or .npy")
 
 from lib.utils.sh_utils import RGB2SH, IDFT, SH2RGB
 from simple_knn._C import distCUDA2
@@ -22,13 +41,13 @@ from lib.utils.waymo_utils import my_vis
 
 class GaussianModelBkgd(GaussianModel):
     def __init__(
-        self, 
-        model_name='background', 
-        scene_center=np.array([0, 0, 0]),
-        scene_radius=20,
-        sphere_center=np.array([0, 0, 0]),
-        sphere_radius=20,
-    ):
+        self,
+        model_name: str = 'background',
+        scene_center: np.ndarray = np.array([0, 0, 0]),
+        scene_radius: int = 20,
+        sphere_center: np.ndarray = np.array([0, 0, 0]),
+        sphere_radius: int = 20,
+    ) -> None:
         self.scene_center = torch.from_numpy(scene_center).float().cuda()
         self.scene_radius = torch.tensor([scene_radius]).float().cuda()
         self.sphere_center = torch.from_numpy(sphere_center).float().cuda()
@@ -38,44 +57,54 @@ class GaussianModelBkgd(GaussianModel):
 
         super().__init__(model_name=model_name, num_classes=num_classes)
 
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.array): 
-        print('Create background model')
-        # pointcloud_path_sky =  os.path.join(cfg.model_path, 'input_ply', 'points3D_sky.ply')
-        # include_sky = cfg.model.nsg.get('include_sky', False)
-        # if os.path.exists(pointcloud_path_sky) and not include_sky:
-        #     pcd_sky = fetchPly(pointcloud_path_sky)
-        #     pointcloud_xyz = np.concatenate((pcd.points, pcd_sky.points), axis=0)
-        #     pointcloud_rgb = np.concatenate((pcd.colors, pcd_sky.colors), axis=0)
-        #     pointcloud_normal = np.zeros_like(pointcloud_xyz)
-        #     pcd = BasicPointCloud(pointcloud_xyz, pointcloud_rgb, pointcloud_normal)
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, train_views: np.ndarray) -> None:
+        pbar = tqdm(total=5, desc="Create background model", leave=True)
 
-        # return super().create_from_pcd(pcd, spatial_lr_scale, N_views)
+        # Use pcd argument directly (already loaded from bkgd PLY) instead of re-loading
+        pbar.set_postfix_str("extracting point cloud")
+        points_xyz = np.asarray(pcd.points)
+        points_rgb = np.asarray(pcd.colors)
+        points_normal = np.asarray(pcd.normals)[:,[2,0,1]] # 一阶球谐省略求解，直接计算方向
+        norms = np.linalg.norm(points_normal, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        points_normal = points_normal / norms
+        pbar.update(1)
 
-        # self.spatial_lr_scale = spatial_lr_scale
+        # Load visibility (packed format to save memory)
+        pbar.set_postfix_str("loading visibility")
+        vis_data, n_views = _load_packed_visibility(os.path.join(cfg.model_path, "input_ply/points3D_bkgd"))
+        pbar.update(1)
 
-        bkgd_path  = os.path.join(cfg.model_path, 'input_ply/points3D_bkgd.ply')   
-        assert os.path.exists(bkgd_path) 
+        # Zero out test views and ensure packed format
+        pbar.set_postfix_str("zeroing test views")
+        test_views = np.setdiff1d(np.arange(n_views), train_views)
+        if vis_data.dtype == np.uint8 and vis_data.shape[1] == (n_views + 7) // 8:
+            # Already packed: clear bits for test views
+            if len(test_views) > 0:
+                for tv in test_views:
+                    byte_idx = tv // 8
+                    bit_idx = 7 - (tv % 8)
+                    vis_data[:, byte_idx] &= ~np.uint8(1 << bit_idx)
+        else:
+            # Legacy bool array: zero test views, then pack
+            if len(test_views) > 0:
+                vis_data[:, test_views] = False
+            vis_data = np.packbits(vis_data.astype(np.uint8), axis=1)
+        pbar.update(1)
 
-        bkgd_pcd = fetchPly(bkgd_path)
+        pbar.set_postfix_str("building GrapeTrellis")
+        self.voxel_size = 0.15
+        self.grape_trellis = GrapeTrellis.from_packed(points_xyz, points_rgb, points_normal, vis_data, n_views, voxel_size=self.voxel_size)
+        del vis_data
+        pbar.update(1)
 
-        points_xyz = np.asarray(bkgd_pcd.points)
-        points_rgb = np.asarray(bkgd_pcd.colors)
-        points_normal = np.asarray(bkgd_pcd.normals)[:,[2,0,1]] # 一阶球谐省略求解，直接计算方向
-        points_normal = points_normal / np.linalg.norm(points_normal, axis=1, keepdims=True)
-        points_visibility = np.load(os.path.join(cfg.model_path, "input_ply/points3D_bkgd.npy"))
- 
-        preserve_mask = np.zeros_like(points_visibility, dtype=bool)
-        preserve_mask[:, train_views] = True
-        filtered_visibility = np.logical_and(points_visibility, preserve_mask)
+        pbar.set_postfix_str("init gaussian params (super)")
+        result = super().create_from_pcd(pcd, spatial_lr_scale, train_views)
+        pbar.update(1)
 
-        # self.voxel_size = 0.15 # Waymo
-        self.voxel_size = 0.15 # Nuscenes
-
-        self.grape_trellis = GrapeTrellis(points_xyz, points_rgb, points_normal, filtered_visibility, voxel_size=self.voxel_size)
-        # self.last_update_root = self.grape_trellis.root_table.points_xyz.shape[0]
-        # self.last_update_vine = self.grape_trellis.vine_table.valid_cnt
-
-        return super().create_from_pcd(pcd, spatial_lr_scale, train_views)
+        pbar.set_postfix_str("done")
+        pbar.close()
+        return result
 
 
         # #   gaussians: [xyz, features, scaling, rotation, opacity, max_radii2D(?), anchor_id] 
@@ -124,50 +153,50 @@ class GaussianModelBkgd(GaussianModel):
 
 
 
-    def set_background_mask(self, camera: Camera):
+    def set_background_mask(self, camera: Camera) -> None:
         pass
-    
+
     @property
-    def get_scaling(self):
+    def get_scaling(self) -> torch.Tensor:
         scaling = super().get_scaling
         # scaling = self.scaling_activation(self._scaling)
         return scaling if self.background_mask is None else scaling[self.background_mask]
 
     @property
-    def get_rotation(self):
+    def get_rotation(self) -> torch.Tensor:
         rotation = super().get_rotation
         # rotation = quaternion_raw_multiply(self._rotation_anchor[self._anchor_id], self._rotation_offset)
         return rotation if self.background_mask is None else rotation[self.background_mask]
 
     @property
-    def get_xyz(self):
+    def get_xyz(self) -> torch.Tensor:
         xyz = super().get_xyz
         # xyz = self._xyz_anchor[self._anchor_id] + self._xyz_offset
         return xyz if self.background_mask is None else xyz[self.background_mask]        
     
     @property
-    def get_features(self):
+    def get_features(self) -> torch.Tensor:
         features = super().get_features
         # features = torch.cat([self._features_dc, self._features_rest], dim=1)
         return features if self.background_mask is None else features[self.background_mask]        
     
     @property
-    def get_opacity(self):
+    def get_opacity(self) -> torch.Tensor:
         opacity = super().get_opacity
         # opacity = self.opacity_activation(self._opacity)
         return opacity if self.background_mask is None else opacity[self.background_mask]
     
     @property
-    def get_semantic(self):
+    def get_semantic(self) -> torch.Tensor:
         semantic = super().get_semantic
         return semantic if self.background_mask is None else semantic[self.background_mask]
 
 
-    def get_anchor_id(self):
+    def get_anchor_id(self) -> torch.Tensor:
         return self._anchor_id if self.background_mask is None else self._anchor_id [self.background_mask]
 
 
-    def densify_and_prune(self, max_grad, min_opacity, prune_big_points):
+    def densify_and_prune(self, max_grad: float, min_opacity: float, prune_big_points: bool) -> tuple[dict[str, Any], dict[str, Any]]:
         max_grad = cfg.optim.get('densify_grad_threshold_bkgd', max_grad)
         if cfg.optim.get('densify_grad_abs_bkgd', False):
             grads = self.xyz_gradient_accum[:, 1:2] / self.denom
@@ -184,8 +213,8 @@ class GaussianModelBkgd(GaussianModel):
         self.densify_and_split(grads, max_grad, extent)
 
         # Prune points below opacity
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
-        prune_mask = torch.logical_or(prune_mask, torch.all(self.get_scaling < 0.001, axis=1).squeeze())
+        prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
+        prune_mask = torch.logical_or(prune_mask, torch.all(self.get_scaling < 0.001, dim=1).squeeze())
         self.scalar_dict['points_below_min_opacity'] = prune_mask.sum().item()
 
         # Prune big points in world space 
@@ -194,10 +223,12 @@ class GaussianModelBkgd(GaussianModel):
             big_points_ws = torch.max(self.get_scaling, dim=1).values > extent * self.percent_big_ws
             big_points_ws[dists > 2 * self.sphere_radius] = False
             
-            over_small_points_ws = (self.max_radii2D > 0) & (self.max_radii2D <= 1)
-
             prune_mask = torch.logical_or(prune_mask, big_points_ws)
-            prune_mask = torch.logical_or(prune_mask, over_small_points_ws) # zyk: overfitting
+
+            small_radii_thresh = cfg.optim.get('prune_small_radii', 1)
+            if small_radii_thresh > 0:
+                over_small_points_ws = (self.max_radii2D > 0) & (self.max_radii2D <= small_radii_thresh)
+                prune_mask = torch.logical_or(prune_mask, over_small_points_ws)
             
             self.scalar_dict['points_big_ws'] = big_points_ws.sum().item()
 

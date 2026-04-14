@@ -75,9 +75,20 @@ class ActorPose(nn.Module):
                     lr = self.opt_rots_scheduler_args(iteration)
                     param_group['lr'] = lr
         
-    def update_optimizer(self):
+    def update_optimizer(self, scaler=None):
         if self.opt_track:
-            self.optimizer.step()
+            if scaler is not None:
+                # Skip if no gradients exist (e.g. hard_depth loss doesn't flow here)
+                has_grads = any(
+                    p.grad is not None
+                    for group in self.optimizer.param_groups
+                    for p in group["params"]
+                )
+                if has_grads:
+                    scaler.unscale_(self.optimizer)
+                    scaler.step(self.optimizer)
+            else:
+                self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
         
     def find_closest_indices(self, track_id, timestamp):

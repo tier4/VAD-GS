@@ -2,6 +2,21 @@ import os
 import numpy as np
 from lib.config import yacs
 
+_ANNOTATION_DATASET_BASE = os.path.expanduser("~/.webauto/data/data/annotation_dataset")
+
+def _resolve_t4_dataset_path(dataset_id_or_path, revision=0):
+    """Resolve a T4 dataset UUID to a filesystem path (no heavy imports)."""
+    candidate = os.path.expanduser(str(dataset_id_or_path))
+    if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "annotation")):
+        return candidate
+    id_path = os.path.join(_ANNOTATION_DATASET_BASE, str(dataset_id_or_path))
+    if os.path.isdir(id_path):
+        rev_path = os.path.join(id_path, str(revision))
+        if os.path.isdir(rev_path):
+            return rev_path
+        return id_path
+    return candidate
+
 def parse_cfg(cfg, args):
     if len(cfg.task) == 0:
         raise ValueError('task must be specified')
@@ -51,15 +66,21 @@ def parse_cfg(cfg, args):
     cfg.point_cloud_dir = os.path.join(cfg.model_path, 'point_cloud')
 
     # data directory
+    # For T4 datasets, resolve UUID-based dataset IDs before path validation
+    if cfg.data.get('type', '') == 'T4':
+        resolved = _resolve_t4_dataset_path(cfg.source_path, revision=cfg.data.get('revision', 0))
+        if os.path.isdir(resolved):
+            cfg.source_path = resolved
+
     if not os.path.isabs(cfg.source_path):
         cfg.source_path = os.path.join(cfg.workspace, cfg.source_path)
         cfg.source_path = os.path.normpath(cfg.source_path)
-    
+
     if not os.path.exists(cfg.source_path):
         relative_path = os.path.relpath(cfg.source_path, cfg.workspace)
         cfg.source_path = os.path.join(cur_workspace, relative_path)
         if not os.path.exists(cfg.source_path):
-            __import__('ipdb').set_trace()
+            raise FileNotFoundError(f"Dataset source_path does not exist: {cfg.source_path}")
     
     # log directory
     if cfg.record_dir is None:

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+from tqdm import tqdm
 from simple_knn._C import distCUDA2
 from lib.config import cfg
 from lib.utils.general_utils import inverse_sigmoid, get_expon_lr_func, quaternion_to_matrix
@@ -52,23 +53,34 @@ class GaussianModel(nn.Module):
         self.spatial_lr_scale = 0
         self.setup_functions()
     
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, N_views: np.array):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, N_views: np.ndarray):
         self.spatial_lr_scale = spatial_lr_scale
+        pbar = tqdm(total=6, desc=f"  Init gaussians ({self.model_name})", leave=True)
+
+        pbar.set_postfix_str("points to CUDA")
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        pbar.update(1)
+
+        pbar.set_postfix_str("normals")
         points_normal = np.asarray(pcd.normals)
-        points_normal = points_normal / np.linalg.norm(points_normal, axis=1, keepdims=True)
-        
-        
+        norms = np.linalg.norm(points_normal, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        points_normal = points_normal / norms
+        pbar.update(1)
+
+        pbar.set_postfix_str("SH features")
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[..., 0] = fused_color
+        pbar.update(1)
 
-        print(f"Number of points at initialisation for {self.model_name}: ", fused_point_cloud.shape[0])
+        pbar.set_postfix_str(f"distCUDA2 ({fused_point_cloud.shape[0]} pts)")
         dist2 = torch.clamp_max(torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001), 3) # clamp max important
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         scales[:,-1] -= 0.2
+        pbar.update(1)
 
-
+        pbar.set_postfix_str("rotations from normals")
         axis = np.array([-points_normal[:,1], points_normal[:,0], np.zeros_like(points_normal[:,0])]).T
         axis_norm = np.linalg.norm(axis, axis=1)
 
@@ -82,11 +94,12 @@ class GaussianModel(nn.Module):
         q_w = np.cos(half_theta).reshape(-1,1)
         q_xyz = axis * np.sin(half_theta).reshape(-1,1)
         rots = torch.from_numpy(np.concatenate([q_w, q_xyz], axis=1)).float().cuda()
+        pbar.update(1)
 
-
+        pbar.set_postfix_str("nn.Parameter init")
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
         semamtics = torch.zeros((fused_point_cloud.shape[0], self.num_classes), dtype=torch.float, device="cuda")
-        
+
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -95,6 +108,10 @@ class GaussianModel(nn.Module):
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         # self._semantic = nn.Parameter(semamtics.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        pbar.update(1)
+
+        pbar.set_postfix_str("done")
+        pbar.close()
 
     def make_ply(self):
         xyz = self._xyz.detach().cpu().numpy()
@@ -332,8 +349,12 @@ class GaussianModel(nn.Module):
         self.scalar_dict = dict()
         self.tensor_dict = dict()  
         
-    def update_optimizer(self):
-        self.optimizer.step()
+    def update_optimizer(self, scaler=None):
+        if scaler is not None:
+            scaler.unscale_(self.optimizer)
+            scaler.step(self.optimizer)
+        else:
+            self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 
     def update_learning_rate(self, iteration):
@@ -551,7 +572,7 @@ class GaussianModel(nn.Module):
         self.densify_and_split(grads, max_grad, extent)
 
         # Prune 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
         # prune_mask = torch.logical_or(prune_mask, (self.get_scaling < 0.01).squeeze())
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size

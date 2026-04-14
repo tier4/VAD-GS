@@ -35,9 +35,9 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
     
     # dynamic mask
     dynamic_mask_dir = os.path.join(path, 'sam_masks')
-    # dynamic_mask_dir = os.path.join(path, 'fine_dynamic_masks/all')
     bkgd_mask_dir = os.path.join(path, 'sam_bkgd_masks')
-    load_dynamic_mask = True
+    load_dynamic_mask = os.path.exists(dynamic_mask_dir)
+    load_seg_bkgd = cfg.data.get("use_seg_bkgd", True) and os.path.exists(bkgd_mask_dir)
 
     # sky mask
     sky_mask_dir = os.path.join(path, 'sky_masks')
@@ -49,10 +49,10 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
 
     # zyk
     mono_depth_dir = os.path.join(path, 'depth_v2')
-    load_mono_depth = True # (cfg.mode == 'train') and os.path.exists(mono_depth_dir)
+    load_mono_depth = os.path.exists(mono_depth_dir)
 
     normal_dir = os.path.join(path, "normal_img")
-    load_normal = True
+    load_normal = os.path.exists(normal_dir)
 
 
     output = generate_dataparser_outputs(
@@ -144,51 +144,25 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
         
         guidance = dict()
 
-        # load dynamic mask
+        # Store file paths for lazy loading via LazyGuidanceDict (saves ~9 GB RAM).
+        # Data is loaded on-demand in _load_guidance_from_path().
         if load_dynamic_mask:
-            dynamic_mask_path = os.path.join(dynamic_mask_dir, f'{image_name}.png')
-            dynamic_mask = cv2.imread(dynamic_mask_path)
-            guidance['dynamic_mask'] = dynamic_mask
-
-            seg_bkgd_mask_path = os.path.join(bkgd_mask_dir, f'{image_name}.png')
-            seg_bkgd_mask = cv2.imread(seg_bkgd_mask_path)
-            guidance["seg_bkgd"] = seg_bkgd_mask
-
+            guidance['dynamic_mask'] = os.path.join(dynamic_mask_dir, f'{image_name}.png')
+            if load_seg_bkgd:
+                guidance["seg_bkgd"] = os.path.join(bkgd_mask_dir, f'{image_name}.png')
             guidance['obj_bound'] = Image.fromarray(obj_bounds[i])
 
-        # load lidar depth
         if load_lidar_depth:
-            depth_path = os.path.join(lidar_depth_dir, f'{image_name}.npy')
-            depth = np.load(depth_path, allow_pickle=True)
-            depth = dict(depth.item())
-            mask = depth['mask']
-            value = depth['value']
-            depth = np.zeros_like(mask).astype(np.float32)
-            depth[mask] = value
-            guidance['lidar_depth'] = depth
-            
-        # load sky mask
+            guidance['lidar_depth'] = os.path.join(lidar_depth_dir, f'{image_name}.npy')
+
         if load_sky_mask:
-            sky_mask_path = os.path.join(sky_mask_dir, f'{image_name}.png')
-            sky_mask = (cv2.imread(sky_mask_path)[..., 0]) > 0.
-            guidance['sky_mask'] = Image.fromarray(sky_mask)
+            guidance['sky_mask'] = os.path.join(sky_mask_dir, f'{image_name}.png')
 
-        # # zyk
         if load_mono_depth:
-            depth_v2_path = os.path.join(mono_depth_dir, f'{image_name}.png')
-            mono_depth = 255 - cv2.imread(depth_v2_path)[:,:,0]
-            guidance['mono_depth'] = Image.fromarray(mono_depth)
+            guidance['mono_depth'] = os.path.join(mono_depth_dir, f'{image_name}.png')
 
-        # # # zyk: load normal map. Taking too much time if using npy. Use png instead.
         if load_normal:
-            normal_img_path = os.path.join(normal_dir, f'{image_name}.png')
-            tmp = cv2.imread(normal_img_path) / 255 * 2 - 1
-            ref_norm = np.zeros(tmp.shape)
-            # normal = cv2.cvtColor(tmp, cv2.COLOR_BGR2RGB) / 255 * 2 - 1
-            ref_norm[:,:,0] = -tmp[:,:,2]
-            ref_norm[:,:,1] = -tmp[:,:,1]
-            ref_norm[:,:,2] = -tmp[:,:,0]
-            guidance['mono_normal'] = ref_norm
+            guidance['mono_normal'] = os.path.join(normal_dir, f'{image_name}.png')
 
 
         mask = None        
@@ -239,16 +213,28 @@ def readDriveStudioInfo(path, images='images', split_train=-1, split_test=-1, **
     lidar_ply_path = os.path.join(cfg.model_path, 'input_ply/points3D_lidar.ply')
     if os.path.exists(lidar_ply_path):
         sphere_pcd: BasicPointCloud = fetchPly(lidar_ply_path)
-    else:
+    elif os.path.exists(bkgd_ply_path):
         sphere_pcd: BasicPointCloud = fetchPly(bkgd_ply_path)
+    else:
+        # In evaluation-before-training flows there may be no generated point cloud yet.
+        cam_centers = []
+        for cam_info in train_cam_infos:
+            RT = np.eye(4)
+            RT[:3, :3] = cam_info.R.T
+            RT[:3, 3] = cam_info.T
+            cam_centers.append(np.linalg.inv(RT)[:3, 3])
+        cam_centers = np.asarray(cam_centers, dtype=np.float32)
+        sphere_pcd = BasicPointCloud(points=cam_centers, colors=np.zeros_like(cam_centers), normals=np.zeros_like(cam_centers))
     
     sphere_normalization = get_Sphere_Norm(sphere_pcd.points)
     scene_metadata['sphere_center'] = sphere_normalization['center']
     scene_metadata['sphere_radius'] = sphere_normalization['radius']
     print(f'Sphere extent: {sphere_normalization["radius"]}')
 
-    pcd: BasicPointCloud = fetchPly(bkgd_ply_path)
+    pcd: BasicPointCloud = fetchPly(bkgd_ply_path) if os.path.exists(bkgd_ply_path) else None
     if cfg.mode == 'train':
+        if pcd is None:
+            raise FileNotFoundError(f"Missing generated background point cloud: {bkgd_ply_path}")
         point_cloud = pcd
     else:
         point_cloud = None
