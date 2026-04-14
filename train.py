@@ -38,9 +38,45 @@ marker_queue: queue.Queue[str] = queue.Queue()
 ############################
 import gc
 import shutil
+from collections import OrderedDict
 from plyfile import PlyData, PlyElement
 inverse_opacity = lambda x: np.log(x/(1-x))
 inverse_scale = lambda x: np.log(x)
+
+# LRU cap for the bkgd_voxel_depth guidance cache. Each entry is ~3-15 MB
+# (float16 depth + int32 source arrays scaled with image resolution). Keeping
+# all views in RAM (e.g. 1250 views for T4) grows the cache to several GB.
+# Holding only the most recently used views trades a small amount of recompute
+# for bounded CPU RAM.
+BKGD_VOXEL_CACHE_MAX = 128
+
+
+def _lru_touch_bkgd_voxel_cache(tracker: OrderedDict, cam, max_size: int = BKGD_VOXEL_CACHE_MAX) -> None:
+    """Record that *cam* now holds a bkgd_voxel_depth entry and evict the
+    oldest tracked camera's cached entry when the tracker exceeds max_size."""
+    cam_id = id(cam)
+    if cam_id in tracker:
+        tracker.move_to_end(cam_id)
+    else:
+        tracker[cam_id] = cam
+    while len(tracker) > max_size:
+        _, evicted_cam = tracker.popitem(last=False)
+        guidance = getattr(evicted_cam, 'guidance', None)
+        if guidance is None:
+            continue
+        # LazyGuidanceDict stores user-set values in _cache and marks them
+        # _persistent; plain dict guidance just needs a del.
+        cache = getattr(guidance, '_cache', None)
+        persistent = getattr(guidance, '_persistent', None)
+        if cache is not None:
+            cache.pop('bkgd_voxel_depth', None)
+            if persistent is not None:
+                persistent.discard('bkgd_voxel_depth')
+        else:
+            try:
+                del guidance['bkgd_voxel_depth']
+            except (KeyError, TypeError):
+                pass
 
 
 try:
@@ -156,6 +192,9 @@ def training() -> None:
     progress_bar = tqdm(range(start_iter, training_args.iterations))
     start_iter += 1
 
+    # LRU tracker for bkgd_voxel_depth guidance cache (see module-level helper).
+    bkgd_voxel_cache_tracker: OrderedDict[int, Camera] = OrderedDict()
+
     viewpoint_full_stack = [] # for view ID consistency. Test visibility would not be set to zero during training.
     l1 = scene.getTrainCameras().copy()
     l2 = scene.getTestCameras().copy()
@@ -252,6 +291,8 @@ def training() -> None:
             # is ~37 MB per camera and only needed for propagation — recomputed on demand.
             viewpoint_cam.guidance["bkgd_voxel_depth"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32))
             del mask_visible, uvs
+        # Bound the per-camera cache via LRU eviction across all previously-visited cameras.
+        _lru_touch_bkgd_voxel_cache(bkgd_voxel_cache_tracker, viewpoint_cam)
         
 
         flag_global_reconstruct = False
@@ -1072,31 +1113,35 @@ def training() -> None:
                 state_dict['iter'] = iteration
                 ckpt_path = os.path.join(cfg.trained_model_dir, f'iteration_{iteration}.pth')
                 torch.save(state_dict, ckpt_path)
+                del state_dict
+                gc.collect()
 
-                ###################### 
-                # viewpoint_camera = viewpoint_full_stack[60]
-                # frame_id=randidx
-
+            # Viewer PLY export is memory-heavy (several GB of CPU RAM spike for
+            # multi-million Gaussians). Only run on save_iterations to avoid OOM
+            # during routine checkpoints.
+            if (iteration in training_args.save_iterations):
                 gaussians.set_visibility(list(set(gaussians.model_name_id.keys())))
                 gaussians.parse_camera(camera=viewpoint_cam)
 
-                xyz = gaussians.get_xyz.detach().cpu().numpy()    
-                normals = np.zeros_like(xyz)
-                
-                f = gaussians.get_features.detach().transpose(1, 2).contiguous() # [n, 3, sh_degree]
+                # Pull each tensor to CPU individually and drop GPU/intermediate
+                # references as soon as possible to keep peak RAM low.
+                xyz = gaussians.get_xyz.detach().cpu().numpy()
+                N = xyz.shape[0]
+
+                f = gaussians.get_features.detach().transpose(1, 2).contiguous()  # [N, 3, sh_degree]
                 f_dc = f[..., :1].flatten(start_dim=1).cpu().numpy()
                 f_rest = f[..., 1:].flatten(start_dim=1).cpu().numpy()
+                del f
+                torch.cuda.empty_cache()
+
                 opacities = gaussians.get_opacity.detach().cpu().numpy()
-                opacities = np.clip(opacities, a_min=1e-6, a_max=1.-1e-6)
+                np.clip(opacities, a_min=1e-6, a_max=1. - 1e-6, out=opacities)
                 opacities = inverse_opacity(opacities)
-                
-                scale = gaussians.get_scaling.detach().cpu().numpy()
-                scale = inverse_scale(scale)
-                
+
+                scale = inverse_scale(gaussians.get_scaling.detach().cpu().numpy())
                 rotation = gaussians.get_rotation.detach().cpu().numpy()
 
                 l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-                # All channels except the 3 DC
                 for i in range(f_dc.shape[1]):
                     l.append('f_dc_{}'.format(i))
                 for i in range(f_rest.shape[1]):
@@ -1108,10 +1153,34 @@ def training() -> None:
                     l.append('rot_{}'.format(i))
                 dtype_full = [(attribute, 'f4') for attribute in l]
 
-                elements = np.empty(xyz.shape[0], dtype=dtype_full)
-                attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-                elements[:] = list(map(tuple, attributes))
-                
+                # Build the structured array field-by-field. This avoids the
+                # Python `list(map(tuple, attributes))` which allocates N tuple
+                # objects (hundreds of MB of overhead for N ~ 6M) and also
+                # avoids the full np.concatenate copy.
+                elements = np.empty(N, dtype=dtype_full)
+                elements['x'] = xyz[:, 0]
+                elements['y'] = xyz[:, 1]
+                elements['z'] = xyz[:, 2]
+                elements['nx'] = 0.0
+                elements['ny'] = 0.0
+                elements['nz'] = 0.0
+                del xyz
+                for i in range(f_dc.shape[1]):
+                    elements['f_dc_{}'.format(i)] = f_dc[:, i]
+                del f_dc
+                for i in range(f_rest.shape[1]):
+                    elements['f_rest_{}'.format(i)] = f_rest[:, i]
+                del f_rest
+                elements['opacity'] = opacities[:, 0]
+                del opacities
+                for i in range(scale.shape[1]):
+                    elements['scale_{}'.format(i)] = scale[:, i]
+                del scale
+                for i in range(rotation.shape[1]):
+                    elements['rot_{}'.format(i)] = rotation[:, i]
+                del rotation
+                gc.collect()
+
                 save_dir = os.path.join(cfg.model_path, 'viewer', f'iteration_{iteration}_{current_view:06d}')
                 pointcloud_dir = os.path.join(save_dir, 'point_cloud', f'iteration_{iteration}')
                 os.makedirs(save_dir, exist_ok=True)
@@ -1119,9 +1188,11 @@ def training() -> None:
                 shutil.copyfile(os.path.join(cfg.model_path, 'cameras.json'), os.path.join(save_dir, 'cameras.json'))
                 shutil.copyfile(os.path.join(cfg.model_path, 'cfg_args'), os.path.join(save_dir, 'cfg_args'))
                 shutil.copyfile(os.path.join(cfg.model_path, 'input.ply'), os.path.join(save_dir, 'input.ply'))
-                
-                elements = PlyElement.describe(elements, 'vertex')
-                PlyData([elements]).write(os.path.join(pointcloud_dir, 'point_cloud.ply'))
+
+                ply_element = PlyElement.describe(elements, 'vertex')
+                PlyData([ply_element]).write(os.path.join(pointcloud_dir, 'point_cloud.ply'))
+                del elements, ply_element
+                gc.collect()
 
             # End-of-iteration cleanup: free lazily-loaded data to prevent RAM accumulation
             if hasattr(viewpoint_cam.guidance, 'unload'):
