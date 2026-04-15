@@ -976,8 +976,9 @@ def training() -> None:
                     depth_error = torch.abs((expected_depth[depth_mask] - lidar_depth[depth_mask]))
                     depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
                     lidar_depth_loss = depth_error.mean()
-                    scalar_dict['lidar_depth_loss'] = lidar_depth_loss
+                    scalar_dict['lidar_depth_loss'] = lidar_depth_loss.item()
                     loss += optim_args.lambda_depth_lidar * lidar_depth_loss
+                    del expected_depth, depth_error, lidar_depth_loss
 
                 if optim_args.use_voxel_depth:
                     depth_mask = torch.logical_and((voxel_depth_tensor > 0.), loss_mask)
@@ -985,8 +986,9 @@ def training() -> None:
                     depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
                     depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
                     voxel_depth_loss = depth_error.mean()
-                    scalar_dict['lidar_depth_loss'] = voxel_depth_loss
+                    scalar_dict['lidar_depth_loss'] = voxel_depth_loss.item()
                     loss += optim_args.lambda_depth_lidar * voxel_depth_loss
+                    del expected_depth, depth_error, voxel_depth_loss
 
 
             # color correction loss
@@ -1100,6 +1102,7 @@ def training() -> None:
                     gaussians.reset_opacity()
 
             training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer)
+            del scalar_dict, tensor_dict, soft_render_pkg, image, acc, viewspace_point_tensor, visibility_filter, radii, loss
 
             # Optimizer step
             if iteration < training_args.iterations:
