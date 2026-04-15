@@ -90,7 +90,8 @@ class GrapeTrellis:
             "vine_points_xyz": self.vine_table.points_xyz,
             "vine_points_color": self.vine_table.points_color,
             "vine_points_normal": self.vine_table.points_normal,
-            "vine_points_visibility": self.vine_table.points_visibility,
+            "vine_visibility_packed": self.vine_table._visibility_packed,
+            "vine_n_views": self.vine_table._n_views,
             "vine_points_ray_vector": self.vine_table.points_ray_vector,
             "vine_view_diversity": self.vine_table.view_diversity,
             "vine_hash_voxel_table_id": self.vine_table.hash_voxel_table_id,
@@ -119,11 +120,17 @@ class GrapeTrellis:
         self.vine_table.points_xyz = data["vine_points_xyz"]
         self.vine_table.points_color = data["vine_points_color"]
         self.vine_table.points_normal = data["vine_points_normal"]
-        self.vine_table.points_visibility = data["vine_points_visibility"]
+        # Load packed visibility (new format) or pack from legacy format
+        if "vine_visibility_packed" in data:
+            self.vine_table._visibility_packed = data["vine_visibility_packed"]
+            self.vine_table._n_views = int(data["vine_n_views"])
+        else:
+            # Backward compat: old saves stored unpacked bool array
+            self.vine_table.points_visibility = data["vine_points_visibility"]
         self.vine_table.points_ray_vector = data["vine_points_ray_vector"]
         self.vine_table.view_diversity = data["vine_view_diversity"]
         self.vine_table.hash_voxel_table_id = data["vine_hash_voxel_table_id"].item()
-        self.vine_table.N_views = data["N_views"].item()
+        self.vine_table._n_views = data["N_views"].item()
         self.vine_table.voxel_size = data["voxel_size"].item()
         self.vine_table.min_bound = data["min_bound"]
         self.vine_table.max_bound = data["max_bound"]
@@ -162,7 +169,7 @@ class GrapeTrellis:
     def get_visibility_column(self, view_id: int) -> np.ndarray:
         """Get visibility for a single view without unpacking the full matrix."""
         root_col = self.root_table.vis_column(view_id)
-        vine_col = self.vine_table.points_visibility[:self.vine_table.valid_cnt, view_id]
+        vine_col = self.vine_table.vis_column(view_id)
         return np.concatenate([root_col, vine_col], axis=0)
 
     def get_visibility_rows(self, row_mask: np.ndarray) -> np.ndarray:
@@ -171,13 +178,13 @@ class GrapeTrellis:
         root_mask = row_mask[:n_root]
         vine_mask = row_mask[n_root:]
         root_rows = self.root_table.vis_rows(root_mask)
-        vine_rows = self.vine_table.points_visibility[:self.vine_table.valid_cnt][vine_mask]
+        vine_rows = self.vine_table.vis_rows(vine_mask)
         return np.concatenate([root_rows, vine_rows], axis=0)
 
     def get_view_has_voxels(self) -> np.ndarray:
         """Return bool array [N_views] indicating which views have any visible voxels."""
         root_any = self.root_table.vis_any_per_view()
-        vine_any = self.vine_table.points_visibility[:self.vine_table.valid_cnt].any(axis=0) if self.vine_table.valid_cnt > 0 else np.zeros(self.N_views, dtype=bool)
+        vine_any = self.vine_table.vis_any_per_view()
         return root_any | vine_any
 
     def get_normal(self) -> np.ndarray:
@@ -195,7 +202,7 @@ class GrapeTrellis:
         voxel_name = self.vine_table.hashcode_voxel(x, y, z)
         if voxel_name in self.vine_table.hash_voxel_table_id:
             vid = self.vine_table.hash_voxel_table_id[voxel_name]
-            return self.vine_table.points_visibility[vid]
+            return self.vine_table.vis_row(vid)
         
         return np.zeros([self.N_views]).astype(np.bool_)
     
@@ -589,29 +596,73 @@ class GrapeTrellis:
 class VineTable:
     def __init__(self, min_bound: np.ndarray, max_bound: np.ndarray, N_views: int = 597, voxel_size: float = 0.15) -> None:
         self.voxel_size = voxel_size
-        self.N_views = N_views
+        self._n_views = N_views
         self.min_bound = min_bound
         self.max_bound = max_bound
-        # self.hash_voxel_table = defaultdict(list)
         self.hash_voxel_table_id = defaultdict(list)
 
         self.CAPACITY = 2048
         self.points_xyz = np.zeros([self.CAPACITY, 3]).astype(np.float16)
-        self.points_color = np.zeros([self.CAPACITY, 3]).astype(np.float16)   # or np.float?
+        self.points_color = np.zeros([self.CAPACITY, 3]).astype(np.float16)
         self.points_normal = np.zeros([self.CAPACITY, 3]).astype(np.float16)
-        
-        self.points_visibility = np.zeros([self.CAPACITY, N_views]).astype(np.bool_)
+
+        n_packed_cols = (N_views + 7) // 8
+        self._visibility_packed = np.zeros([self.CAPACITY, n_packed_cols], dtype=np.uint8)
         self.points_ray_vector = np.zeros([self.CAPACITY, 3]).astype(np.float16)
         self.view_diversity = np.zeros([self.CAPACITY, 1]).astype(np.float16)
 
-        self.valid_cnt = 0 # xxx[:valid_cnt] for query
-    #     self.last_updated_cnt = 0
-    #     # self.hash_voxel_id = defaultdict(list)
+        self.valid_cnt = 0
 
-    # def update(self):
-    #     new_voxels = 
+    # --- N_views property (kept for external access) --------------------------
+    @property
+    def N_views(self) -> int:
+        return self._n_views
 
-    #     self.last_updated_cnt = self.valid_cnt
+    @N_views.setter
+    def N_views(self, value: int) -> None:
+        self._n_views = value
+
+    # --- Packed visibility accessors ------------------------------------------
+    @property
+    def points_visibility(self) -> np.ndarray:
+        """Unpack full visibility matrix. Use only for save/legacy paths."""
+        return np.unpackbits(self._visibility_packed[:self.valid_cnt], axis=1)[:, :self._n_views].astype(bool)
+
+    @points_visibility.setter
+    def points_visibility(self, value: np.ndarray) -> None:
+        """Accept unpacked bool array (e.g. from legacy load) and pack it."""
+        self._n_views = value.shape[1] if value.ndim == 2 else self._n_views
+        packed = np.packbits(value.astype(bool), axis=1)
+        n_rows = packed.shape[0]
+        if n_rows > self.CAPACITY:
+            self.CAPACITY = n_rows
+        n_packed_cols = (self._n_views + 7) // 8
+        self._visibility_packed = np.zeros([self.CAPACITY, n_packed_cols], dtype=np.uint8)
+        self._visibility_packed[:n_rows] = packed
+
+    def vis_column(self, view_id: int) -> np.ndarray:
+        """Get visibility for a single view. Returns bool array [valid_cnt]."""
+        byte_idx = view_id // 8
+        bit_idx = view_id % 8
+        return ((self._visibility_packed[:self.valid_cnt, byte_idx] >> (7 - bit_idx)) & 1).astype(bool)
+
+    def vis_rows(self, row_mask: np.ndarray) -> np.ndarray:
+        """Get unpacked visibility for selected rows only."""
+        packed_rows = self._visibility_packed[:self.valid_cnt][row_mask]
+        return np.unpackbits(packed_rows, axis=1)[:, :self._n_views].astype(bool)
+
+    def vis_any_per_view(self) -> np.ndarray:
+        """Return bool[N_views]: True if any voxel is visible in that view."""
+        if self.valid_cnt == 0:
+            return np.zeros(self._n_views, dtype=bool)
+        or_all = np.bitwise_or.reduce(self._visibility_packed[:self.valid_cnt], axis=0)
+        return np.unpackbits(or_all)[:self._n_views].astype(bool)
+
+    def vis_row(self, idx: int) -> np.ndarray:
+        """Get unpacked visibility for a single row."""
+        return np.unpackbits(self._visibility_packed[idx])[:self._n_views].astype(bool)
+
+    # --- Original interface ---------------------------------------------------
 
     def add_observation(self, voxel_name: str, ref_visibility: np.ndarray, ref_viewset_diversity_score: float, ray_vector: np.ndarray) -> None:
         idx = -1
@@ -619,12 +670,13 @@ class VineTable:
             idx = self.hash_voxel_table_id[voxel_name]
             if idx < 0 or idx >= self.valid_cnt:
                 return None
-            
-        self.points_visibility[idx] = np.logical_or(self.points_visibility[idx], ref_visibility)
+
+        packed_ref = np.packbits(ref_visibility.astype(bool).ravel())
+        self._visibility_packed[idx] = self._visibility_packed[idx] | packed_ref
         if self.view_diversity[idx] < ref_viewset_diversity_score:
             self.view_diversity[idx] = ref_viewset_diversity_score
             self.points_ray_vector[idx] = ray_vector
-    
+
     def get_xyz(self, voxel_name: str | None = None) -> np.ndarray | None:
         if voxel_name is None:
             return self.points_xyz[:self.valid_cnt]
@@ -635,16 +687,16 @@ class VineTable:
             if idx < 0 or idx >= self.valid_cnt:
                 return None
         return self.points_xyz[idx]
-    
+
     def get_color(self) -> np.ndarray:
         return self.points_color[:self.valid_cnt]
 
     def get_normal(self) -> np.ndarray:
         return self.points_normal[:self.valid_cnt]
-    
+
     def get_visibility(self) -> np.ndarray:
-        return self.points_visibility[:self.valid_cnt]
-    
+        return self.points_visibility
+
     def get_ray_vector(self) -> np.ndarray:
         return self.points_ray_vector[:self.valid_cnt]
 
@@ -652,7 +704,7 @@ class VineTable:
         new_xyz = new_xyz.reshape(-1, 3)
         new_color = new_color.reshape(-1, 3)
         new_normal = new_normal.reshape(-1, 3)
-        new_visibility = new_visibility.reshape(-1, self.N_views)
+        new_visibility = new_visibility.reshape(-1, self._n_views)
         new_view_diversity_arr = np.asarray(new_view_diversity).reshape(-1, 1)
         new_ray_vector = new_ray_vector.reshape(-1, 3)
 
@@ -660,17 +712,19 @@ class VineTable:
         if self.valid_cnt + num_new_points > self.CAPACITY:
             self._double_resize()
 
+        packed_vis = np.packbits(new_visibility.astype(bool), axis=1)
+
         for i in range(num_new_points):
             name = self.hashcode_point(new_xyz[i,0], new_xyz[i,1], new_xyz[i,2])
             if name not in self.hash_voxel_table_id:
                 self.hash_voxel_table_id[name] = self.valid_cnt
 
-                self.points_xyz[self.valid_cnt] = new_xyz
-                self.points_color[self.valid_cnt] = new_color # float? int?
-                self.points_normal[self.valid_cnt] = new_normal
-                self.points_visibility[self.valid_cnt] = new_visibility
-                self.points_ray_vector[self.valid_cnt] = new_ray_vector
-                self.view_diversity[self.valid_cnt] = new_view_diversity_arr
+                self.points_xyz[self.valid_cnt] = new_xyz[i]
+                self.points_color[self.valid_cnt] = new_color[i]
+                self.points_normal[self.valid_cnt] = new_normal[i]
+                self._visibility_packed[self.valid_cnt] = packed_vis[i]
+                self.points_ray_vector[self.valid_cnt] = new_ray_vector[i]
+                self.view_diversity[self.valid_cnt] = new_view_diversity_arr[i]
 
                 self.valid_cnt += 1
 
@@ -680,7 +734,7 @@ class VineTable:
         self.points_xyz = self._enlarge_and_copy(self.points_xyz, self.CAPACITY)
         self.points_color = self._enlarge_and_copy(self.points_color, self.CAPACITY)
         self.points_normal = self._enlarge_and_copy(self.points_normal, self.CAPACITY)
-        self.points_visibility = self._enlarge_and_copy(self.points_visibility, self.CAPACITY)
+        self._visibility_packed = self._enlarge_and_copy(self._visibility_packed, self.CAPACITY)
         self.points_ray_vector = self._enlarge_and_copy(self.points_ray_vector, self.CAPACITY)
         self.view_diversity = self._enlarge_and_copy(self.view_diversity, self.CAPACITY)
 
