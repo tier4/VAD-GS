@@ -9,3 +9,5 @@ build/
 *.so
 *.egg-info
 log_gpu.py
+.venv_export/
+viewer/tiles
