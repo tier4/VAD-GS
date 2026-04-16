@@ -4,8 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VAD-GS 3D Gaussian Splatting Viewer</title>
-    <script src="https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium/Cesium.js"></script>
-    <link href="https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <script>
+        // Toggle between minified and unminified CesiumJS builds via URL param ?debug=1
+        const _useDebug = new URLSearchParams(window.location.search).has('debug');
+        const _cesiumBase = _useDebug
+            ? 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/CesiumUnminified'
+            : 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium';
+        document.write(`<script src="${_cesiumBase}/Cesium.js"><\/script>`);
+        document.write(`<link href="${_cesiumBase}/Widgets/widgets.css" rel="stylesheet">`);
+    </script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { width: 100%; height: 100%; overflow: hidden; font-family: sans-serif; }
@@ -170,6 +177,13 @@
                     selectionIndicator: false,
                 });
                 viewer.scene.globe.depthTestAgainstTerrain = true;
+
+                // Disable atmosphere & IBL to prevent CesiumJS from injecting
+                // CUSTOM_SPHERICAL_HARMONICS / CUSTOM_SPECULAR_IBL defines into
+                // the Gaussian Splatting fragment shader (causes compile errors).
+                viewer.scene.atmosphere.show = false;
+                viewer.scene.globe.showGroundAtmosphere = false;
+                viewer.scene.skyAtmosphere.show = false;
             } catch (e) {
                 setStatus('Error initializing Cesium viewer: ' + (e.message || e));
                 console.error('Viewer init failed:', e);
@@ -230,6 +244,11 @@
                     console.log('Tile loaded:', tile.contentReady, tile.content);
                 });
 
+                // Disable IBL on tileset to avoid shader define conflicts
+                if (tileset.imageBasedLighting) {
+                    tileset.imageBasedLighting.imageBasedLightingFactor = new Cesium.Cartesian2(0.0, 0.0);
+                }
+
                 viewer.scene.primitives.add(tileset);
                 currentTileset = tileset;
 
@@ -243,11 +262,22 @@
                     const root = tileset.root;
                     const info = [];
                     info.push(`Tileset: ${url}`);
-                    info.push(`Root content state: ${root ? root.contentState : 'no root'}`);
+                    info.push(`Root ready: ${root ? root.contentReady : 'no root'}`);
                     if (root && root.content) {
-                        info.push(`Content type: ${root.content.constructor.name}`);
+                        const cls = root.content.constructor.name;
+                        const isGS = cls === 'GaussianSplat3DTileContent'
+                            || (root.content._splats !== undefined)
+                            || (root.content._pointCount !== undefined && root.content._sortWorker !== undefined);
+                        info.push(`Content class: ${cls}${isGS ? ' (3D Gaussian Splatting)' : ''}`);
                     }
-                    info.push(`Total tiles: ${tileset.statistics ? tileset.statistics.numberOfTilesTotal : '?'}`);
+                    const stats = tileset.statistics;
+                    if (stats) {
+                        info.push(`Tiles: ${stats.numberOfTilesTotal}, loaded: ${stats.numberOfLoadedTilesTotal}`);
+                        if (stats.numberOfPointsLoaded > 0) {
+                            info.push(`Points/splats loaded: ${stats.numberOfPointsLoaded.toLocaleString()}`);
+                        }
+                    }
+                    info.push(`\nTip: add ?debug=1 to URL for verbose class names`);
                     setStatus(info.join('\n'));
                 }, 3000);
             } catch (e) {
