@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VAD-GS 3D Gaussian Splatting Viewer</title>
-    <script src="https://cesium.com/downloads/cesiumjs/releases/1.130.1/Build/Cesium/Cesium.js"></script>
-    <link href="https://cesium.com/downloads/cesiumjs/releases/1.130.1/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium/Cesium.js"></script>
+    <link href="https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { width: 100%; height: 100%; overflow: hidden; font-family: sans-serif; }
@@ -93,7 +93,7 @@
         <h2>VAD-GS Viewer</h2>
 
         <label for="tilesetUrl">Tileset URL:</label>
-        <input type="text" id="tilesetUrl" value="tileset.json" placeholder="path/to/tileset.json">
+        <input type="text" id="tilesetUrl" value="tiles/tileset.json" placeholder="path/to/tileset.json">
 
         <div style="margin-top:8px;">
             <button onclick="loadTileset()">Load Tileset</button>
@@ -149,7 +149,7 @@
         }
 
         // ---------- Init ----------
-        function initViewer() {
+        async function initViewer() {
             const params = getUrlParams();
 
             // Apply Cesium Ion token if available
@@ -158,20 +158,23 @@
                 Cesium.Ion.defaultAccessToken = token;
             }
 
-            viewer = new Cesium.Viewer('cesiumContainer', {
-                terrain: Cesium.Terrain.fromWorldTerrain().catch(() => undefined),
-                timeline: false,
-                animation: false,
-                homeButton: true,
-                sceneModePicker: true,
-                baseLayerPicker: true,
-                navigationHelpButton: false,
-                infoBox: false,
-                selectionIndicator: false,
-            });
-
-            // Enable experimental 3DGS support
-            viewer.scene.globe.depthTestAgainstTerrain = true;
+            try {
+                viewer = new Cesium.Viewer('cesiumContainer', {
+                    timeline: false,
+                    animation: false,
+                    homeButton: true,
+                    sceneModePicker: true,
+                    baseLayerPicker: true,
+                    navigationHelpButton: false,
+                    infoBox: false,
+                    selectionIndicator: false,
+                });
+                viewer.scene.globe.depthTestAgainstTerrain = true;
+            } catch (e) {
+                setStatus('Error initializing Cesium viewer: ' + (e.message || e));
+                console.error('Viewer init failed:', e);
+                return;
+            }
 
             // Apply URL params to form
             if (params.tilesetUrl) {

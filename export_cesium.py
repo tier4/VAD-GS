@@ -16,6 +16,11 @@ Example:
         --output tiles_output \
         --lat 35.6812 --lon 139.7671 --height 0 \
         --background-only
+
+    # Auto-detect coordinates from T4 dataset:
+    python export_cesium.py <checkpoint.pth> \
+        --t4-dataset 835afe23-ff50-4883-a0b2-421e101a124b \
+        --background-only
 """
 
 from __future__ import annotations
@@ -23,8 +28,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import struct
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -96,6 +103,118 @@ def build_tileset_transform(
     m[:3, 3] = origin
     # 3D Tiles stores column-major: flatten column by column
     return m.T.flatten().tolist()
+
+
+# ---------------------------------------------------------------------------
+# T4 dataset → geodetic coordinate extraction
+# ---------------------------------------------------------------------------
+
+_ANNOTATION_DATASET_BASE = os.path.expanduser("~/.webauto/data/data/annotation_dataset")
+
+
+def resolve_t4_dataset_path(dataset_id_or_path: str, revision: int = 0) -> Path:
+    """Resolve a T4 dataset UUID or path to a filesystem path."""
+    candidate = os.path.expanduser(dataset_id_or_path)
+    if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "annotation")):
+        return Path(candidate)
+    id_path = os.path.join(_ANNOTATION_DATASET_BASE, dataset_id_or_path)
+    if os.path.isdir(id_path):
+        rev_path = os.path.join(id_path, str(revision))
+        if os.path.isdir(rev_path):
+            return Path(rev_path)
+        return Path(id_path)
+    return Path(candidate)
+
+
+def _read_lanelet2_reference_points(
+    osm_path: Path,
+) -> np.ndarray:
+    """Read (lat, lon, local_x, local_y) reference points from lanelet2_map.osm.
+
+    Returns an (N, 4) array: columns are [lat, lon, local_x, local_y].
+    """
+    tree = ET.parse(osm_path)
+    root = tree.getroot()
+    rows: list[tuple[float, float, float, float]] = []
+    for node in root.iter("node"):
+        lat = node.get("lat")
+        lon = node.get("lon")
+        if lat is None or lon is None:
+            continue
+        tags = {t.get("k"): t.get("v") for t in node.iter("tag")}
+        lx = tags.get("local_x")
+        ly = tags.get("local_y")
+        if lx is None or ly is None:
+            continue
+        rows.append((float(lat), float(lon), float(lx), float(ly)))
+    if not rows:
+        raise RuntimeError(f"No reference points with (lat,lon,local_x,local_y) found in {osm_path}")
+    return np.array(rows, dtype=np.float64)
+
+
+def _fit_local_to_geodetic(
+    ref: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit affine transforms from local (x,y) to (lat, lon).
+
+    Returns (lat_coef, lon_coef) where each is [a, b, c] such that
+        lat = a*local_x + b*local_y + c
+        lon = a*local_x + b*local_y + c
+    """
+    A = np.column_stack([ref[:, 2], ref[:, 3], np.ones(len(ref))])
+    lat_coef, _, _, _ = np.linalg.lstsq(A, ref[:, 0], rcond=None)
+    lon_coef, _, _, _ = np.linalg.lstsq(A, ref[:, 1], rcond=None)
+    return lat_coef, lon_coef
+
+
+def geocoord_from_t4_dataset(
+    dataset_path: Path,
+) -> tuple[float, float, float]:
+    """Extract (lat, lon, height) from a T4 dataset.
+
+    Uses lanelet2_map.osm reference points to build a local→geodetic affine
+    transform, then applies it to the ego trajectory centroid from ego_pose.json.
+    """
+    # Read ego pose centroid
+    ego_pose_path = dataset_path / "annotation" / "ego_pose.json"
+    if not ego_pose_path.exists():
+        raise FileNotFoundError(f"ego_pose.json not found: {ego_pose_path}")
+    with open(ego_pose_path) as f:
+        ego_poses = json.load(f)
+    if not ego_poses:
+        raise RuntimeError("ego_pose.json is empty")
+
+    xs = [e["translation"][0] for e in ego_poses]
+    ys = [e["translation"][1] for e in ego_poses]
+    zs = [e["translation"][2] for e in ego_poses]
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+    cz = sum(zs) / len(zs)
+
+    # Find lanelet2 map
+    osm_path = dataset_path / "map" / "lanelet2_map.osm"
+    if not osm_path.exists():
+        raise FileNotFoundError(
+            f"lanelet2_map.osm not found: {osm_path}\n"
+            "Cannot auto-detect coordinates. Use --lat/--lon/--height instead."
+        )
+
+    ref = _read_lanelet2_reference_points(osm_path)
+    lat_coef, lon_coef = _fit_local_to_geodetic(ref)
+
+    lat = float(lat_coef[0] * cx + lat_coef[1] * cy + lat_coef[2])
+    lon = float(lon_coef[0] * cx + lon_coef[1] * cy + lon_coef[2])
+    height = float(cz)
+
+    # Sanity check: compute residual on reference points
+    pred_lat = ref[:, 2] * lat_coef[0] + ref[:, 3] * lat_coef[1] + lat_coef[2]
+    pred_lon = ref[:, 2] * lon_coef[0] + ref[:, 3] * lon_coef[1] + lon_coef[2]
+    lat_err_m = np.abs(pred_lat - ref[:, 0]).mean() * 111_000
+    lon_err_m = np.abs(pred_lon - ref[:, 1]).mean() * 90_000
+    print(f"  Affine fit residual: lat {lat_err_m:.3f}m, lon {lon_err_m:.3f}m "
+          f"({len(ref):,} reference points)")
+
+    return lat, lon, height
 
 
 # ---------------------------------------------------------------------------
@@ -292,12 +411,13 @@ def create_tileset_json(
     lon: float,
     height: float,
     geometric_error: float = 500.0,
+    spz_compression: bool = True,
 ) -> dict:
     """Create a 3D Tiles 1.1 tileset.json for a single GLB tile."""
     bv = compute_bounding_box(gc)
     transform = build_tileset_transform(lat, lon, height)
 
-    return {
+    tileset: dict = {
         "asset": {"version": "1.1", "generator": "VAD-GS export_cesium.py"},
         "geometricError": geometric_error,
         "root": {
@@ -308,6 +428,23 @@ def create_tileset_json(
             "content": {"uri": glb_filename},
         },
     }
+
+    # CesiumJS requires 3DTILES_content_gltf extension to detect 3DGS content.
+    # Both KHR_gaussian_splatting and the SPZ compression sub-extension must be
+    # declared as extensionsRequired for CesiumJS to route to its GS renderer.
+    gltf_extensions = ["KHR_gaussian_splatting"]
+    if spz_compression:
+        gltf_extensions.append("KHR_gaussian_splatting_compression_spz_2")
+
+    tileset["extensionsUsed"] = ["3DTILES_content_gltf"]
+    tileset["extensions"] = {
+        "3DTILES_content_gltf": {
+            "extensionsUsed": gltf_extensions,
+            "extensionsRequired": gltf_extensions,
+        }
+    }
+
+    return tileset
 
 
 # ---------------------------------------------------------------------------
@@ -348,27 +485,42 @@ def main():
         help="Limit SH degree for export (reduces file size)",
     )
     parser.add_argument(
-        "--spz-compression",
+        "--no-spz-compression",
         action="store_true",
-        help="Use SPZ compression (smaller files, requires compatible viewer)",
+        help="Disable SPZ compression (larger files, wider viewer compatibility)",
     )
-    parser.add_argument(
+    # Coordinate source: either --t4-dataset or manual --lat/--lon/--height
+    coord_group = parser.add_argument_group("coordinate source")
+    coord_group.add_argument(
+        "--t4-dataset",
+        type=str,
+        default=None,
+        help="T4 dataset path or UUID. Auto-detects lat/lon/height from "
+        "lanelet2_map.osm + ego_pose.json. Overrides --lat/--lon/--height.",
+    )
+    coord_group.add_argument(
+        "--t4-revision",
+        type=int,
+        default=0,
+        help="T4 dataset revision subdirectory (default: 0)",
+    )
+    coord_group.add_argument(
         "--lat",
         type=float,
-        default=35.6812,
-        help="Latitude for tileset placement (default: Tokyo 35.6812)",
+        default=None,
+        help="Latitude for tileset placement",
     )
-    parser.add_argument(
+    coord_group.add_argument(
         "--lon",
         type=float,
-        default=139.7671,
-        help="Longitude for tileset placement (default: Tokyo 139.7671)",
+        default=None,
+        help="Longitude for tileset placement",
     )
-    parser.add_argument(
+    coord_group.add_argument(
         "--height",
         type=float,
-        default=0.0,
-        help="Height above WGS84 ellipsoid in meters (default: 0)",
+        default=None,
+        help="Height above WGS84 ellipsoid in meters",
     )
     parser.add_argument(
         "--geometric-error",
@@ -381,6 +533,29 @@ def main():
     if not args.checkpoint.exists():
         print(f"Error: checkpoint not found: {args.checkpoint}", file=sys.stderr)
         sys.exit(1)
+
+    # Resolve coordinates
+    if args.t4_dataset is not None:
+        print(f"Resolving coordinates from T4 dataset: {args.t4_dataset}")
+        ds_path = resolve_t4_dataset_path(args.t4_dataset, args.t4_revision)
+        if not ds_path.is_dir():
+            print(f"Error: T4 dataset not found: {ds_path}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  Dataset path: {ds_path}")
+        lat, lon, height = geocoord_from_t4_dataset(ds_path)
+        # Allow manual overrides for individual components
+        args.lat = args.lat if args.lat is not None else lat
+        args.lon = args.lon if args.lon is not None else lon
+        args.height = args.height if args.height is not None else height
+        print(f"  Coordinates: lat={args.lat:.8f}, lon={args.lon:.8f}, height={args.height:.2f}")
+    else:
+        # Fallback defaults (Tokyo)
+        if args.lat is None:
+            args.lat = 35.6812
+        if args.lon is None:
+            args.lon = 139.7671
+        if args.height is None:
+            args.height = 0.0
 
     # Determine output directory
     if args.output is None:
@@ -437,13 +612,14 @@ def main():
     # Save GLB
     glb_name = "model.glb"
     glb_path = output_dir / glb_name
-    options = GltfSaveOptions(spz_compression=args.spz_compression)
+    options = GltfSaveOptions(spz_compression=not args.no_spz_compression)
     print(f"Saving GLB: {glb_path}")
     save_gltf(merged, glb_path, options)
     glb_size = glb_path.stat().st_size
     print(f"  GLB size: {glb_size / 1024 / 1024:.1f} MB")
 
     # Save tileset.json
+    use_spz = not args.no_spz_compression
     tileset = create_tileset_json(
         glb_name,
         merged,
@@ -451,6 +627,7 @@ def main():
         lon=args.lon,
         height=args.height,
         geometric_error=args.geometric_error,
+        spz_compression=use_spz,
     )
     tileset_path = output_dir / "tileset.json"
     with open(tileset_path, "w", encoding="utf-8") as f:
