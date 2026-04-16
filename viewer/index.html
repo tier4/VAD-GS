@@ -105,7 +105,14 @@
         <div style="margin-top:8px;">
             <button onclick="loadTileset()">Load Tileset</button>
             <button class="secondary" onclick="flyToTileset()">Fly To</button>
+            <button class="secondary" onclick="flyTopDown()">Top View</button>
             <button class="secondary" onclick="hideControls()">Hide</button>
+        </div>
+
+        <div class="control-group">
+            <label for="globeOpacity">Globe Opacity: <span id="globeOpacityValue">100%</span></label>
+            <input type="range" id="globeOpacity" min="0" max="100" value="100"
+                   style="width:100%;" oninput="setGlobeOpacity(this.value)">
         </div>
 
         <div class="control-group">
@@ -176,7 +183,7 @@
                     infoBox: false,
                     selectionIndicator: false,
                 });
-                viewer.scene.globe.depthTestAgainstTerrain = true;
+                viewer.scene.globe.depthTestAgainstTerrain = false;
 
                 // Disable atmosphere & IBL to prevent CesiumJS from injecting
                 // CUSTOM_SPHERICAL_HARMONICS / CUSTOM_SPECULAR_IBL defines into
@@ -313,6 +320,55 @@
                     0  // auto distance
                 ),
             });
+        }
+
+        // ---------- Top-down view ----------
+        function flyTopDown() {
+            if (!currentTileset) {
+                setStatus('No tileset loaded.');
+                return;
+            }
+            // Make globe translucent so map tiles stay visible as reference
+            setGlobeOpacity(30);
+            document.getElementById('globeOpacity').value = 30;
+
+            const boundingSphere = currentTileset.boundingSphere;
+            const center = boundingSphere.center;
+            const radius = boundingSphere.radius;
+
+            // Position camera directly above the tileset
+            const cartographic = Cesium.Cartographic.fromCartesian(center);
+            const height = cartographic.height + radius * 3;
+            viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromRadians(
+                    cartographic.longitude,
+                    cartographic.latitude,
+                    height
+                ),
+                orientation: {
+                    heading: 0,
+                    pitch: Cesium.Math.toRadians(-90),
+                    roll: 0,
+                },
+            });
+        }
+
+        // ---------- Globe opacity ----------
+        function setGlobeOpacity(pct) {
+            pct = Number(pct);
+            document.getElementById('globeOpacityValue').textContent = pct + '%';
+            if (!viewer) return;
+            const globe = viewer.scene.globe;
+            if (pct >= 100) {
+                globe.show = true;
+                globe.translucency.enabled = false;
+            } else if (pct <= 0) {
+                globe.show = false;
+            } else {
+                globe.show = true;
+                globe.translucency.enabled = true;
+                globe.translucency.frontFaceAlpha = pct / 100;
+            }
         }
 
         // ---------- UI ----------
