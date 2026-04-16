@@ -59,13 +59,18 @@ PY="${VENV_DIR}/bin/python"
 
 if ! "${PY}" -c "import torch, numpy; import importlib; importlib.import_module('3dgs_io'); import spz" >/dev/null 2>&1; then
     echo "=== Installing export dependencies into ${VENV_DIR} ==="
-    # Use uv pip with the venv's python. 3dgs-io brings in spz as a git dep.
     VIRTUAL_ENV="${VENV_DIR}" uv pip install \
         --python "${PY}" \
         torch \
-        "numpy>=2.1,<2.5" \
-        "3dgs-io @ git+https://github.com/tier4/3dgs_io.git"
+        "numpy>=2.1,<2.5"
 fi
+
+# Always update 3dgs-io to latest (picks up bug fixes for SPZ encoding etc.)
+echo "=== Updating 3dgs-io to latest ==="
+VIRTUAL_ENV="${VENV_DIR}" uv pip install \
+    --python "${PY}" \
+    --reinstall --no-cache \
+    "3dgs-io @ git+https://github.com/tier4/3dgs_io.git"
 
 # --- Run export -------------------------------------------------------------
 echo "=== Exporting ${CHECKPOINT} to Cesium 3D Tiles ==="

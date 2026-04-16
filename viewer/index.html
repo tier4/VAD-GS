@@ -221,18 +221,35 @@
                     maximumMemoryUsage: 2048,
                 });
 
+                tileset.tileFailed.addEventListener(function(event) {
+                    console.error('Tile failed:', event.url, event.message);
+                    setStatus(`Tile load error: ${event.message}\n${event.url}`);
+                });
+
+                tileset.tileLoad.addEventListener(function(tile) {
+                    console.log('Tile loaded:', tile.contentReady, tile.content);
+                });
+
                 viewer.scene.primitives.add(tileset);
                 currentTileset = tileset;
 
-                // Report stats
-                const stats = [];
-                stats.push(`Tileset loaded: ${url}`);
-                stats.push(`Ready: ${tileset.ready}`);
-
-                setStatus(stats.join('\n'));
+                setStatus(`Tileset loaded: ${url}\nGaussians: loading content...`);
 
                 // Fly to the tileset
                 flyToTileset();
+
+                // Check content status after a delay
+                setTimeout(() => {
+                    const root = tileset.root;
+                    const info = [];
+                    info.push(`Tileset: ${url}`);
+                    info.push(`Root content state: ${root ? root.contentState : 'no root'}`);
+                    if (root && root.content) {
+                        info.push(`Content type: ${root.content.constructor.name}`);
+                    }
+                    info.push(`Total tiles: ${tileset.statistics ? tileset.statistics.numberOfTilesTotal : '?'}`);
+                    setStatus(info.join('\n'));
+                }, 3000);
             } catch (e) {
                 setStatus(`Error loading tileset:\n${e.message || e}`);
                 console.error(e);
