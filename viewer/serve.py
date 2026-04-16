@@ -1,82 +1,98 @@
 #!/usr/bin/env python3
 """Simple HTTP server for the Cesium 3D Tiles viewer.
 
-Serves both the viewer HTML and the tileset files with correct CORS headers.
+Serves viewer/index.html at / and tiles files at /tiles/.
+No symlinks needed — routes requests to the correct directory.
 
 Usage:
-    python viewer/serve.py [--port 8080] [--tiles path/to/tiles]
-
-    Then open http://localhost:8080/?tileset=tiles/tileset.json
+    python viewer/serve.py --tiles output/t4_exp/.../cesium_tiles/iteration_30000 --port 9000
 """
 
 from __future__ import annotations
 
 import argparse
-import functools
-import os
+import mimetypes
 import sys
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
+# Ensure correct MIME types
+mimetypes.add_type("model/gltf-binary", ".glb")
+mimetypes.add_type("model/gltf+json", ".gltf")
+mimetypes.add_type("application/json", ".json")
+mimetypes.add_type("application/wasm", ".wasm")
 
-class CORSHandler(SimpleHTTPRequestHandler):
-    """HTTP handler with CORS headers and correct MIME types for 3D Tiles."""
+VIEWER_DIR = Path(__file__).parent.resolve()
 
-    extensions_map = {
-        **SimpleHTTPRequestHandler.extensions_map,
-        ".glb": "model/gltf-binary",
-        ".gltf": "model/gltf+json",
-        ".json": "application/json",
-        ".js": "application/javascript",
-        ".wasm": "application/wasm",
-    }
 
-    def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        super().end_headers()
+def make_handler(tiles_dir: Path):
+    """Create a handler class bound to the given tiles directory."""
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.end_headers()
+    class Handler(BaseHTTPRequestHandler):
 
-    def log_message(self, format, *args):
-        # Compact logging
-        sys.stderr.write(f"  {args[0]}\n")
+        def do_GET(self):
+            # Strip query string
+            path = self.path.split("?")[0]
+
+            if path == "/" or path == "/index.html":
+                self._serve_file(VIEWER_DIR / "index.html")
+            elif path.startswith("/tiles/"):
+                rel = path[len("/tiles/"):]
+                self._serve_file(tiles_dir / rel)
+            else:
+                # Try viewer dir for other assets (css, js, etc.)
+                self._serve_file(VIEWER_DIR / path.lstrip("/"))
+
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self._cors_headers()
+            self.end_headers()
+
+        def _serve_file(self, filepath: Path):
+            filepath = filepath.resolve()
+            if not filepath.is_file():
+                self.send_response(404)
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(f"404 Not Found: {self.path}\n".encode())
+                return
+            content = filepath.read_bytes()
+            mime, _ = mimetypes.guess_type(str(filepath))
+            self.send_response(200)
+            self.send_header("Content-Type", mime or "application/octet-stream")
+            self.send_header("Content-Length", str(len(content)))
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(content)
+
+        def _cors_headers(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+
+        def log_message(self, format, *args):
+            sys.stderr.write(f"  {args[0]}\n")
+
+    return Handler
 
 
 def main():
     parser = argparse.ArgumentParser(description="Serve Cesium 3D Tiles viewer")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
-    parser.add_argument(
-        "--tiles",
-        type=Path,
-        default=None,
-        help="Path to tiles directory. A symlink 'tiles' will be created in viewer/",
-    )
+    parser.add_argument("--tiles", type=Path, required=True, help="Path to tiles directory")
     args = parser.parse_args()
 
-    viewer_dir = Path(__file__).parent.resolve()
-    os.chdir(viewer_dir)
+    tiles_dir = args.tiles.resolve()
+    if not (tiles_dir / "tileset.json").is_file():
+        print(f"Error: tileset.json not found in {tiles_dir}", file=sys.stderr)
+        sys.exit(1)
 
-    # Create symlink to tiles directory if specified
-    if args.tiles:
-        tiles_path = args.tiles.resolve()
-        link_path = viewer_dir / "tiles"
-        if link_path.is_symlink() or link_path.exists():
-            link_path.unlink()
-        link_path.symlink_to(tiles_path)
-        tileset_url = "tiles/tileset.json"
-        print(f"Tiles linked: {tiles_path} -> {link_path}")
-    else:
-        tileset_url = "tileset.json"
+    print(f"Tiles dir: {tiles_dir}")
+    print(f"  /        -> {VIEWER_DIR / 'index.html'}")
+    print(f"  /tiles/* -> {tiles_dir}/")
 
-    handler = CORSHandler
-    httpd = HTTPServer(("0.0.0.0", args.port), handler)
+    httpd = HTTPServer(("0.0.0.0", args.port), make_handler(tiles_dir))
 
-    url = f"http://localhost:{args.port}/?tileset={tileset_url}"
-    print(f"Serving viewer at: {url}")
+    print(f"\nhttp://localhost:{args.port}/")
     print("Press Ctrl+C to stop.")
 
     try:

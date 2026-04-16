@@ -4,8 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VAD-GS 3D Gaussian Splatting Viewer</title>
-    <script src="https://cesium.com/downloads/cesiumjs/releases/1.130.1/Build/Cesium/Cesium.js"></script>
-    <link href="https://cesium.com/downloads/cesiumjs/releases/1.130.1/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <script>
+        // Toggle between minified and unminified CesiumJS builds via URL param ?debug=1
+        const _useDebug = new URLSearchParams(window.location.search).has('debug');
+        const _cesiumBase = _useDebug
+            ? 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/CesiumUnminified'
+            : 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium';
+        document.write(`<script src="${_cesiumBase}/Cesium.js"><\/script>`);
+        document.write(`<link href="${_cesiumBase}/Widgets/widgets.css" rel="stylesheet">`);
+    </script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { width: 100%; height: 100%; overflow: hidden; font-family: sans-serif; }
@@ -93,12 +100,19 @@
         <h2>VAD-GS Viewer</h2>
 
         <label for="tilesetUrl">Tileset URL:</label>
-        <input type="text" id="tilesetUrl" value="tileset.json" placeholder="path/to/tileset.json">
+        <input type="text" id="tilesetUrl" value="tiles/tileset.json" placeholder="path/to/tileset.json">
 
         <div style="margin-top:8px;">
             <button onclick="loadTileset()">Load Tileset</button>
             <button class="secondary" onclick="flyToTileset()">Fly To</button>
+            <button class="secondary" onclick="flyTopDown()">Top View</button>
             <button class="secondary" onclick="hideControls()">Hide</button>
+        </div>
+
+        <div class="control-group">
+            <label for="globeOpacity">Globe Opacity: <span id="globeOpacityValue">100%</span></label>
+            <input type="range" id="globeOpacity" min="0" max="100" value="100"
+                   style="width:100%;" oninput="setGlobeOpacity(this.value)">
         </div>
 
         <div class="control-group">
@@ -149,7 +163,7 @@
         }
 
         // ---------- Init ----------
-        function initViewer() {
+        async function initViewer() {
             const params = getUrlParams();
 
             // Apply Cesium Ion token if available
@@ -158,20 +172,30 @@
                 Cesium.Ion.defaultAccessToken = token;
             }
 
-            viewer = new Cesium.Viewer('cesiumContainer', {
-                terrain: Cesium.Terrain.fromWorldTerrain().catch(() => undefined),
-                timeline: false,
-                animation: false,
-                homeButton: true,
-                sceneModePicker: true,
-                baseLayerPicker: true,
-                navigationHelpButton: false,
-                infoBox: false,
-                selectionIndicator: false,
-            });
+            try {
+                viewer = new Cesium.Viewer('cesiumContainer', {
+                    timeline: false,
+                    animation: false,
+                    homeButton: true,
+                    sceneModePicker: true,
+                    baseLayerPicker: true,
+                    navigationHelpButton: false,
+                    infoBox: false,
+                    selectionIndicator: false,
+                });
+                viewer.scene.globe.depthTestAgainstTerrain = false;
 
-            // Enable experimental 3DGS support
-            viewer.scene.globe.depthTestAgainstTerrain = true;
+                // Disable atmosphere & IBL to prevent CesiumJS from injecting
+                // CUSTOM_SPHERICAL_HARMONICS / CUSTOM_SPECULAR_IBL defines into
+                // the Gaussian Splatting fragment shader (causes compile errors).
+                viewer.scene.atmosphere.show = false;
+                viewer.scene.globe.showGroundAtmosphere = false;
+                viewer.scene.skyAtmosphere.show = false;
+            } catch (e) {
+                setStatus('Error initializing Cesium viewer: ' + (e.message || e));
+                console.error('Viewer init failed:', e);
+                return;
+            }
 
             // Apply URL params to form
             if (params.tilesetUrl) {
@@ -218,18 +242,51 @@
                     maximumMemoryUsage: 2048,
                 });
 
+                tileset.tileFailed.addEventListener(function(event) {
+                    console.error('Tile failed:', event.url, event.message);
+                    setStatus(`Tile load error: ${event.message}\n${event.url}`);
+                });
+
+                tileset.tileLoad.addEventListener(function(tile) {
+                    console.log('Tile loaded:', tile.contentReady, tile.content);
+                });
+
+                // Disable IBL on tileset to avoid shader define conflicts
+                if (tileset.imageBasedLighting) {
+                    tileset.imageBasedLighting.imageBasedLightingFactor = new Cesium.Cartesian2(0.0, 0.0);
+                }
+
                 viewer.scene.primitives.add(tileset);
                 currentTileset = tileset;
 
-                // Report stats
-                const stats = [];
-                stats.push(`Tileset loaded: ${url}`);
-                stats.push(`Ready: ${tileset.ready}`);
-
-                setStatus(stats.join('\n'));
+                setStatus(`Tileset loaded: ${url}\nGaussians: loading content...`);
 
                 // Fly to the tileset
                 flyToTileset();
+
+                // Check content status after a delay
+                setTimeout(() => {
+                    const root = tileset.root;
+                    const info = [];
+                    info.push(`Tileset: ${url}`);
+                    info.push(`Root ready: ${root ? root.contentReady : 'no root'}`);
+                    if (root && root.content) {
+                        const cls = root.content.constructor.name;
+                        const isGS = cls === 'GaussianSplat3DTileContent'
+                            || (root.content._splats !== undefined)
+                            || (root.content._pointCount !== undefined && root.content._sortWorker !== undefined);
+                        info.push(`Content class: ${cls}${isGS ? ' (3D Gaussian Splatting)' : ''}`);
+                    }
+                    const stats = tileset.statistics;
+                    if (stats) {
+                        info.push(`Tiles: ${stats.numberOfTilesTotal}, loaded: ${stats.numberOfLoadedTilesTotal}`);
+                        if (stats.numberOfPointsLoaded > 0) {
+                            info.push(`Points/splats loaded: ${stats.numberOfPointsLoaded.toLocaleString()}`);
+                        }
+                    }
+                    info.push(`\nTip: add ?debug=1 to URL for verbose class names`);
+                    setStatus(info.join('\n'));
+                }, 3000);
             } catch (e) {
                 setStatus(`Error loading tileset:\n${e.message || e}`);
                 console.error(e);
@@ -263,6 +320,55 @@
                     0  // auto distance
                 ),
             });
+        }
+
+        // ---------- Top-down view ----------
+        function flyTopDown() {
+            if (!currentTileset) {
+                setStatus('No tileset loaded.');
+                return;
+            }
+            // Make globe translucent so map tiles stay visible as reference
+            setGlobeOpacity(30);
+            document.getElementById('globeOpacity').value = 30;
+
+            const boundingSphere = currentTileset.boundingSphere;
+            const center = boundingSphere.center;
+            const radius = boundingSphere.radius;
+
+            // Position camera directly above the tileset
+            const cartographic = Cesium.Cartographic.fromCartesian(center);
+            const height = cartographic.height + radius * 3;
+            viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromRadians(
+                    cartographic.longitude,
+                    cartographic.latitude,
+                    height
+                ),
+                orientation: {
+                    heading: 0,
+                    pitch: Cesium.Math.toRadians(-90),
+                    roll: 0,
+                },
+            });
+        }
+
+        // ---------- Globe opacity ----------
+        function setGlobeOpacity(pct) {
+            pct = Number(pct);
+            document.getElementById('globeOpacityValue').textContent = pct + '%';
+            if (!viewer) return;
+            const globe = viewer.scene.globe;
+            if (pct >= 100) {
+                globe.show = true;
+                globe.translucency.enabled = false;
+            } else if (pct <= 0) {
+                globe.show = false;
+            } else {
+                globe.show = true;
+                globe.translucency.enabled = true;
+                globe.translucency.frontFaceAlpha = pct / 100;
+            }
         }
 
         // ---------- UI ----------
