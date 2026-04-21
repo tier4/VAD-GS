@@ -43,6 +43,12 @@ _3dgs_io = import_module("3dgs_io")
 save_gltf = _3dgs_io.save_gltf
 GltfSaveOptions = _3dgs_io.GltfSaveOptions
 DatasetType = _3dgs_io.DatasetType
+GlbMetadata = _3dgs_io.GlbMetadata
+TrainingData = _3dgs_io.TrainingData
+Checkpoint = _3dgs_io.Checkpoint
+Export = _3dgs_io.Export
+Model = _3dgs_io.Model
+Placement = _3dgs_io.Placement
 
 from spz import GaussianCloud
 
@@ -636,89 +642,57 @@ def merge_gaussian_clouds(clouds: list[GaussianCloud]) -> GaussianCloud:
 
 
 def build_export_metadata(
-    train_cfg: dict | None,
+    train_cfg: dict,
     checkpoint_path: Path,
-    iteration: int | str,
+    iteration: int,
     total_points: int,
     background_only: bool,
     object_keys: list[str],
     spz_compression: bool,
     max_sh_degree: int | None,
-    lat: float | None = None,
-    lon: float | None = None,
-    height: float | None = None,
-    start_timestamp_us: int | None = None,
-    end_timestamp_us: int | None = None,
-) -> dict:
-    """Build metadata dict to embed in glTF asset.extras.
+    lat: float,
+    lon: float,
+    height: float,
+    start_timestamp_us: int,
+    end_timestamp_us: int,
+) -> GlbMetadata:
+    """Build typed metadata to embed in glTF asset.extras.
 
     Records the training data source, export parameters, and model statistics
     so that downstream consumers can trace provenance.
     """
-    metadata: dict = {}
+    training_data = TrainingData(
+        source_path=train_cfg.get("source_path", ""),
+        data_type=train_cfg.get("data_type", ""),
+        revision=str(train_cfg.get("revision", "")),
+        scene_index=train_cfg.get("scene_index", 0),
+        lidar_channel=train_cfg.get("lidar_channel", ""),
+        selected_frames=train_cfg.get("selected_frames") or [],
+        cameras=train_cfg.get("cameras") or [],
+        camera_channels=train_cfg.get("camera_channels") or [],
+        start_timestamp_us=start_timestamp_us,
+        end_timestamp_us=end_timestamp_us,
+        task=train_cfg.get("task") or None,
+        exp_name=train_cfg.get("exp_name") or None,
+    )
 
-    # Training data source
-    if train_cfg is not None:
-        metadata["dataset_type"] = DatasetType.T4_DATASET.value
-        source: dict = {}
-        if train_cfg.get("source_path"):
-            source["source_path"] = train_cfg["source_path"]
-        if train_cfg.get("data_type"):
-            source["data_type"] = train_cfg["data_type"]
-        if train_cfg.get("revision") is not None:
-            source["revision"] = train_cfg["revision"]
-        if train_cfg.get("scene_index") is not None:
-            source["scene_index"] = train_cfg["scene_index"]
-        if train_cfg.get("lidar_channel"):
-            source["lidar_channel"] = train_cfg["lidar_channel"]
-        if train_cfg.get("task"):
-            source["task"] = train_cfg["task"]
-        if train_cfg.get("exp_name"):
-            source["exp_name"] = train_cfg["exp_name"]
-        if train_cfg.get("selected_frames") is not None:
-            source["selected_frames"] = train_cfg["selected_frames"]
-        if train_cfg.get("cameras") is not None:
-            source["cameras"] = train_cfg["cameras"]
-        if train_cfg.get("camera_channels") is not None:
-            source["camera_channels"] = train_cfg["camera_channels"]
-        if start_timestamp_us is not None:
-            source["start_timestamp_us"] = start_timestamp_us
-        if end_timestamp_us is not None:
-            source["end_timestamp_us"] = end_timestamp_us
-        metadata["training_data"] = source
-
-    # Checkpoint info
-    metadata["checkpoint"] = {
-        "path": str(checkpoint_path),
-        "iteration": iteration if isinstance(iteration, int) else str(iteration),
-    }
-
-    # Export parameters
-    export_params: dict = {
-        "background_only": background_only,
-        "spz_compression": spz_compression,
-    }
-    if max_sh_degree is not None:
-        export_params["max_sh_degree"] = max_sh_degree
-    if object_keys:
-        export_params["object_keys"] = object_keys
-    metadata["export"] = export_params
-
-    # Model statistics
-    metadata["model"] = {
-        "total_gaussians": total_points,
-    }
-
-    # Geodetic placement
-    if lat is not None and lon is not None:
-        placement: dict = {"lat": lat, "lon": lon}
-        if height is not None:
-            placement["height"] = height
-        metadata["placement"] = placement
-
-    metadata["generator"] = "VAD-GS export_cesium.py"
-
-    return metadata
+    return GlbMetadata(
+        dataset_type=DatasetType.T4_DATASET,
+        generator="VAD-GS export_cesium.py",
+        training_data=training_data,
+        checkpoint=Checkpoint(
+            path=str(checkpoint_path),
+            iteration=iteration,
+        ),
+        export=Export(
+            background_only=background_only,
+            spz_compression=spz_compression,
+            max_sh_degree=max_sh_degree,
+            object_keys=object_keys or None,
+        ),
+        model=Model(total_gaussians=total_points),
+        placement=Placement(lat=lat, lon=lon, height=height),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1004,7 @@ def main():
         end_timestamp_us=end_timestamp_us,
     )
     options = GltfSaveOptions(spz_compression=use_spz, metadata=metadata)
-    print(f"Metadata: {json.dumps(metadata, indent=2, ensure_ascii=False)}")
+    print(f"Metadata: {json.dumps(metadata.to_dict(), indent=2, ensure_ascii=False)}")
     print(f"Saving GLB: {glb_path}")
     save_gltf(merged, glb_path, options)
     glb_size = glb_path.stat().st_size
