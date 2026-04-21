@@ -12,6 +12,9 @@
 #   ./export_cesium.sh output/t4_exp/t4_scene_000/trained_model/iteration_30000.pth \
 #       --config configs/example/t4_train_example.yaml --background-only
 #
+#   # Export and open the Cesium viewer:
+#   ./export_cesium.sh --config configs/example/t4_train_example.yaml --background-only --view
+#
 #   # Manual coordinates:
 #   ./export_cesium.sh output/t4_exp/t4_scene_000/trained_model/iteration_30000.pth \
 #       --lat 35.6812 --lon 139.7671 --output my_tiles
@@ -29,6 +32,28 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv_export"
 PY_VERSION="3.13"
+
+# --- Parse shell-level options (--view, --port) before passing rest to Python -
+VIEW=false
+VIEW_PORT=8080
+EXPORT_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --view)
+            VIEW=true
+            shift
+            ;;
+        --port)
+            VIEW_PORT="$2"
+            shift 2
+            ;;
+        *)
+            EXPORT_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${EXPORT_ARGS[@]+"${EXPORT_ARGS[@]}"}"
 
 # --- Bootstrap .venv_export if missing -------------------------------------
 if [ ! -x "${VENV_DIR}/bin/python" ]; then
@@ -63,5 +88,31 @@ VIRTUAL_ENV="${VENV_DIR}" uv pip install \
 echo "=== Exporting to Cesium 3D Tiles ==="
 echo "Started at: $(date)"
 cd "${REPO_ROOT}"
-"${PY}" export_cesium.py "$@"
+
+# Capture output to extract the output directory for --view
+EXPORT_OUTPUT=$("${PY}" export_cesium.py "$@" 2>&1 | tee /dev/stderr)
 echo "Completed at: $(date)"
+
+# --- Launch viewer if --view was specified ----------------------------------
+if $VIEW; then
+    OUTPUT_DIR=$(echo "$EXPORT_OUTPUT" | grep -oP '(?<=Output directory: ).*')
+    if [ -z "$OUTPUT_DIR" ]; then
+        echo "Error: could not detect output directory from export output" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "=== Starting Cesium viewer ==="
+    echo "  Tiles: ${OUTPUT_DIR}"
+    echo "  URL:   http://localhost:${VIEW_PORT}/"
+    echo "  Press Ctrl+C to stop."
+
+    # Open browser (best-effort, non-blocking)
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "http://localhost:${VIEW_PORT}/" 2>/dev/null &
+    elif command -v open >/dev/null 2>&1; then
+        open "http://localhost:${VIEW_PORT}/" &
+    fi
+
+    python3 "${REPO_ROOT}/viewer/serve.py" --tiles "${OUTPUT_DIR}" --port "${VIEW_PORT}"
+fi
