@@ -143,6 +143,9 @@ def load_training_config(config_path: Path) -> dict:
         "revision": data.get("revision", 0),
         "scene_index": data.get("scene_index", 0),
         "lidar_channel": data.get("lidar_channel", "LIDAR_CONCAT"),
+        "selected_frames": data.get("selected_frames", None),
+        "cameras": data.get("cameras", None),
+        "camera_channels": data.get("camera_channels", None),
     }
 
 
@@ -426,6 +429,52 @@ def geocoord_from_t4_dataset(
     return lat, lon, height, model_to_enu
 
 
+def get_t4_frame_timestamps(
+    dataset_path: Path,
+    scene_index: int = 0,
+    selected_frames: list[int] | None = None,
+) -> tuple[int, int]:
+    """Get the start and end timestamps (microseconds) for the selected frame range.
+
+    Returns:
+        (start_timestamp_us, end_timestamp_us)
+    """
+    annotation_dir = dataset_path / "annotation"
+
+    def _load_table(name):
+        p = annotation_dir / f"{name}.json"
+        if not p.exists():
+            return []
+        with open(p) as f:
+            return json.load(f)
+
+    scenes = _load_table("scene")
+    samples_list = _load_table("sample")
+    samples_by_token = {s["token"]: s for s in samples_list}
+
+    scene = scenes[min(scene_index, len(scenes) - 1)]
+
+    # Build ordered sample chain
+    ordered: list[dict] = []
+    token = scene["first_sample_token"]
+    while token:
+        sample = samples_by_token[token]
+        ordered.append(sample)
+        token = sample.get("next", "")
+
+    num_frames_all = len(ordered)
+    if selected_frames is not None:
+        start_frame = max(0, selected_frames[0])
+        end_frame = min(num_frames_all - 1, selected_frames[1])
+    else:
+        start_frame = 0
+        end_frame = num_frames_all - 1
+
+    start_ts = ordered[start_frame]["timestamp"]
+    end_ts = ordered[end_frame]["timestamp"]
+    return int(start_ts), int(end_ts)
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint → GaussianCloud conversion
 # ---------------------------------------------------------------------------
@@ -598,6 +647,8 @@ def build_export_metadata(
     lat: float | None = None,
     lon: float | None = None,
     height: float | None = None,
+    start_timestamp_us: int | None = None,
+    end_timestamp_us: int | None = None,
 ) -> dict:
     """Build metadata dict to embed in glTF asset.extras.
 
@@ -624,6 +675,16 @@ def build_export_metadata(
             source["task"] = train_cfg["task"]
         if train_cfg.get("exp_name"):
             source["exp_name"] = train_cfg["exp_name"]
+        if train_cfg.get("selected_frames") is not None:
+            source["selected_frames"] = train_cfg["selected_frames"]
+        if train_cfg.get("cameras") is not None:
+            source["cameras"] = train_cfg["cameras"]
+        if train_cfg.get("camera_channels") is not None:
+            source["camera_channels"] = train_cfg["camera_channels"]
+        if start_timestamp_us is not None:
+            source["start_timestamp_us"] = start_timestamp_us
+        if end_timestamp_us is not None:
+            source["end_timestamp_us"] = end_timestamp_us
         metadata["training_data"] = source
 
     # Checkpoint info
@@ -870,6 +931,8 @@ def main():
 
     # --- Resolve coordinates and orientation ---
     model_to_enu_rotation = None  # None = assume model is already ENU-aligned
+    start_timestamp_us: int | None = None
+    end_timestamp_us: int | None = None
     if args.t4_dataset is not None:
         print(f"Resolving coordinates from T4 dataset: {args.t4_dataset}")
         ds_path = resolve_t4_dataset_path(args.t4_dataset, args.t4_revision)
@@ -881,6 +944,13 @@ def main():
             ds_path, scene_index=scene_index, lidar_channel=lidar_channel,
         )
         print(f"  Coordinates: lat={lat:.8f}, lon={lon:.8f}, height={height:.2f}")
+
+        # Extract frame timestamps from T4 dataset
+        selected_frames = train_cfg["selected_frames"] if train_cfg else None
+        start_timestamp_us, end_timestamp_us = get_t4_frame_timestamps(
+            ds_path, scene_index=scene_index, selected_frames=selected_frames,
+        )
+        print(f"  Frame timestamps: start={start_timestamp_us}, end={end_timestamp_us}")
     else:
         print("Error: no coordinate source specified. Use --config or --t4-dataset.",
               file=sys.stderr)
@@ -956,6 +1026,8 @@ def main():
         lat=lat,
         lon=lon,
         height=height,
+        start_timestamp_us=start_timestamp_us,
+        end_timestamp_us=end_timestamp_us,
     )
     options = GltfSaveOptions(spz_compression=use_spz, metadata=metadata)
     print(f"Saving GLB: {glb_path}")
