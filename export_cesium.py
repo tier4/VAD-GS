@@ -1030,6 +1030,7 @@ def main():
         end_timestamp_us=end_timestamp_us,
     )
     options = GltfSaveOptions(spz_compression=use_spz, metadata=metadata)
+    print(f"Metadata: {json.dumps(metadata, indent=2, ensure_ascii=False)}")
     print(f"Saving GLB: {glb_path}")
     save_gltf(merged, glb_path, options)
     glb_size = glb_path.stat().st_size
