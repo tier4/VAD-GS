@@ -42,6 +42,7 @@ from importlib import import_module
 _3dgs_io = import_module("3dgs_io")
 save_gltf = _3dgs_io.save_gltf
 GltfSaveOptions = _3dgs_io.GltfSaveOptions
+DatasetType = _3dgs_io.DatasetType
 
 from spz import GaussianCloud
 
@@ -142,6 +143,9 @@ def load_training_config(config_path: Path) -> dict:
         "revision": data.get("revision", 0),
         "scene_index": data.get("scene_index", 0),
         "lidar_channel": data.get("lidar_channel", "LIDAR_CONCAT"),
+        "selected_frames": data.get("selected_frames", None),
+        "cameras": data.get("cameras", None),
+        "camera_channels": data.get("camera_channels", None),
     }
 
 
@@ -425,6 +429,52 @@ def geocoord_from_t4_dataset(
     return lat, lon, height, model_to_enu
 
 
+def get_t4_frame_timestamps(
+    dataset_path: Path,
+    scene_index: int = 0,
+    selected_frames: list[int] | None = None,
+) -> tuple[int, int]:
+    """Get the start and end timestamps (microseconds) for the selected frame range.
+
+    Returns:
+        (start_timestamp_us, end_timestamp_us)
+    """
+    annotation_dir = dataset_path / "annotation"
+
+    def _load_table(name):
+        p = annotation_dir / f"{name}.json"
+        if not p.exists():
+            return []
+        with open(p) as f:
+            return json.load(f)
+
+    scenes = _load_table("scene")
+    samples_list = _load_table("sample")
+    samples_by_token = {s["token"]: s for s in samples_list}
+
+    scene = scenes[min(scene_index, len(scenes) - 1)]
+
+    # Build ordered sample chain
+    ordered: list[dict] = []
+    token = scene["first_sample_token"]
+    while token:
+        sample = samples_by_token[token]
+        ordered.append(sample)
+        token = sample.get("next", "")
+
+    num_frames_all = len(ordered)
+    if selected_frames is not None:
+        start_frame = max(0, selected_frames[0])
+        end_frame = min(num_frames_all - 1, selected_frames[1])
+    else:
+        start_frame = 0
+        end_frame = num_frames_all - 1
+
+    start_ts = ordered[start_frame]["timestamp"]
+    end_ts = ordered[end_frame]["timestamp"]
+    return int(start_ts), int(end_ts)
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint → GaussianCloud conversion
 # ---------------------------------------------------------------------------
@@ -578,6 +628,97 @@ def merge_gaussian_clouds(clouds: list[GaussianCloud]) -> GaussianCloud:
         merged.sh = np.zeros(0, dtype=np.float32)
 
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Metadata builder
+# ---------------------------------------------------------------------------
+
+
+def build_export_metadata(
+    train_cfg: dict | None,
+    checkpoint_path: Path,
+    iteration: int | str,
+    total_points: int,
+    background_only: bool,
+    object_keys: list[str],
+    spz_compression: bool,
+    max_sh_degree: int | None,
+    lat: float | None = None,
+    lon: float | None = None,
+    height: float | None = None,
+    start_timestamp_us: int | None = None,
+    end_timestamp_us: int | None = None,
+) -> dict:
+    """Build metadata dict to embed in glTF asset.extras.
+
+    Records the training data source, export parameters, and model statistics
+    so that downstream consumers can trace provenance.
+    """
+    metadata: dict = {}
+
+    # Training data source
+    if train_cfg is not None:
+        metadata["dataset_type"] = DatasetType.T4_DATASET.value
+        source: dict = {}
+        if train_cfg.get("source_path"):
+            source["source_path"] = train_cfg["source_path"]
+        if train_cfg.get("data_type"):
+            source["data_type"] = train_cfg["data_type"]
+        if train_cfg.get("revision") is not None:
+            source["revision"] = train_cfg["revision"]
+        if train_cfg.get("scene_index") is not None:
+            source["scene_index"] = train_cfg["scene_index"]
+        if train_cfg.get("lidar_channel"):
+            source["lidar_channel"] = train_cfg["lidar_channel"]
+        if train_cfg.get("task"):
+            source["task"] = train_cfg["task"]
+        if train_cfg.get("exp_name"):
+            source["exp_name"] = train_cfg["exp_name"]
+        if train_cfg.get("selected_frames") is not None:
+            source["selected_frames"] = train_cfg["selected_frames"]
+        if train_cfg.get("cameras") is not None:
+            source["cameras"] = train_cfg["cameras"]
+        if train_cfg.get("camera_channels") is not None:
+            source["camera_channels"] = train_cfg["camera_channels"]
+        if start_timestamp_us is not None:
+            source["start_timestamp_us"] = start_timestamp_us
+        if end_timestamp_us is not None:
+            source["end_timestamp_us"] = end_timestamp_us
+        metadata["training_data"] = source
+
+    # Checkpoint info
+    metadata["checkpoint"] = {
+        "path": str(checkpoint_path),
+        "iteration": iteration if isinstance(iteration, int) else str(iteration),
+    }
+
+    # Export parameters
+    export_params: dict = {
+        "background_only": background_only,
+        "spz_compression": spz_compression,
+    }
+    if max_sh_degree is not None:
+        export_params["max_sh_degree"] = max_sh_degree
+    if object_keys:
+        export_params["object_keys"] = object_keys
+    metadata["export"] = export_params
+
+    # Model statistics
+    metadata["model"] = {
+        "total_gaussians": total_points,
+    }
+
+    # Geodetic placement
+    if lat is not None and lon is not None:
+        placement: dict = {"lat": lat, "lon": lon}
+        if height is not None:
+            placement["height"] = height
+        metadata["placement"] = placement
+
+    metadata["generator"] = "VAD-GS export_cesium.py"
+
+    return metadata
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +931,8 @@ def main():
 
     # --- Resolve coordinates and orientation ---
     model_to_enu_rotation = None  # None = assume model is already ENU-aligned
+    start_timestamp_us: int | None = None
+    end_timestamp_us: int | None = None
     if args.t4_dataset is not None:
         print(f"Resolving coordinates from T4 dataset: {args.t4_dataset}")
         ds_path = resolve_t4_dataset_path(args.t4_dataset, args.t4_revision)
@@ -801,6 +944,13 @@ def main():
             ds_path, scene_index=scene_index, lidar_channel=lidar_channel,
         )
         print(f"  Coordinates: lat={lat:.8f}, lon={lon:.8f}, height={height:.2f}")
+
+        # Extract frame timestamps from T4 dataset
+        selected_frames = train_cfg["selected_frames"] if train_cfg else None
+        start_timestamp_us, end_timestamp_us = get_t4_frame_timestamps(
+            ds_path, scene_index=scene_index, selected_frames=selected_frames,
+        )
+        print(f"  Frame timestamps: start={start_timestamp_us}, end={end_timestamp_us}")
     else:
         print("Error: no coordinate source specified. Use --config or --t4-dataset.",
               file=sys.stderr)
@@ -835,12 +985,14 @@ def main():
         )
 
     # Objects
+    exported_obj_keys: list[str] = []
     if not args.background_only:
         obj_keys = [k for k in ckpt.keys() if k.startswith("obj_")]
         if args.objects is not None:
             obj_keys = [k for k in obj_keys if k in args.objects]
+        exported_obj_keys = sorted(obj_keys)
 
-        for obj_key in sorted(obj_keys):
+        for obj_key in exported_obj_keys:
             print(f"Converting {obj_key}...")
             clouds.append(
                 state_dict_to_gaussian_cloud(
@@ -861,14 +1013,30 @@ def main():
     # Save GLB
     glb_name = "model.glb"
     glb_path = output_dir / glb_name
-    options = GltfSaveOptions(spz_compression=not args.no_spz_compression)
+    use_spz = not args.no_spz_compression
+    metadata = build_export_metadata(
+        train_cfg=train_cfg,
+        checkpoint_path=args.checkpoint,
+        iteration=iteration,
+        total_points=total_points,
+        background_only=args.background_only,
+        object_keys=exported_obj_keys,
+        spz_compression=use_spz,
+        max_sh_degree=args.max_sh_degree,
+        lat=lat,
+        lon=lon,
+        height=height,
+        start_timestamp_us=start_timestamp_us,
+        end_timestamp_us=end_timestamp_us,
+    )
+    options = GltfSaveOptions(spz_compression=use_spz, metadata=metadata)
+    print(f"Metadata: {json.dumps(metadata, indent=2, ensure_ascii=False)}")
     print(f"Saving GLB: {glb_path}")
     save_gltf(merged, glb_path, options)
     glb_size = glb_path.stat().st_size
     print(f"  GLB size: {glb_size / 1024 / 1024:.1f} MB")
 
     # Save tileset.json
-    use_spz = not args.no_spz_compression
     tileset = create_tileset_json(
         glb_name,
         merged,
