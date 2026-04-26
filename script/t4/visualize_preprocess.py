@@ -159,6 +159,7 @@ def main():
     )
     add_config_arg(parser)
     parser.add_argument("--dataroot", type=str, default=None, help="Dataset UUID or path")
+    parser.add_argument("--version", type=int, default=None)
     parser.add_argument("--revision", type=int, default=None)
     parser.add_argument("--scene-index", type=int, default=None)
     parser.add_argument("--camera-channels", nargs="+", default=None)
@@ -177,6 +178,8 @@ def main():
     apply_config_defaults(args)
     if args.dataroot is None:
         parser.error("--dataroot is required (provide via --config or CLI)")
+    if args.version is None:
+        args.version = 0
     if args.revision is None:
         args.revision = 0
     if args.scene_index is None:
@@ -211,8 +214,8 @@ def main():
         if selected_items and item_name not in selected_items:
             continue
         if subdir is not None and not (prep / subdir).exists():
-            print(f"[SKIP] {item_name}: directory not found at {prep / subdir}")
-            continue
+            (prep / subdir).mkdir(parents=True, exist_ok=True)
+            print(f"[CREATED] {item_name}: created missing directory at {prep / subdir}")
         items_to_process.append((item_name, subdir, ext))
 
     if not items_to_process:

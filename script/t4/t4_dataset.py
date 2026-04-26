@@ -54,8 +54,8 @@ class T4Dataset:
             print(frame.image_path)
     """
 
-    def __init__(self, dataroot: str | Path, revision: int = 0, scene_index: int = 0):
-        self.dataroot = resolve_dataroot(dataroot, revision=revision)
+    def __init__(self, dataroot: str | Path, revision: int = 0, scene_index: int = 0, version: int = 0):
+        self.dataroot = resolve_dataroot(dataroot, revision=revision, version=version)
         rev_str = str(revision) if revision else None
         self._t4 = Tier4(str(self.dataroot), revision=rev_str, verbose=False)
         self._scene = self._t4.scene[scene_index]
@@ -95,6 +95,7 @@ class T4Dataset:
             dataroot=args.dataroot,
             revision=getattr(args, "revision", 0) or 0,
             scene_index=getattr(args, "scene_index", 0) or 0,
+            version=getattr(args, "version", 0) or 0,
         )
 
     # -- frame iteration -------------------------------------------------------

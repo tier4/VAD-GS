@@ -73,12 +73,14 @@ def main():
     )
     add_config_arg(parser)
     parser.add_argument("--dataroot", type=str, default=None, help="Dataset UUID or path")
+    parser.add_argument("--version", type=int, default=None)
     parser.add_argument("--revision", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="Output dir for sam_masks (default: <dataroot>/sam_masks)")
     parser.add_argument("--scene-index", type=int, default=None)
     parser.add_argument("--camera-channels", nargs="+", default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--box-scale", type=float, default=None,
                         help="Scale factor for 3D bounding boxes (default: 1.5)")
     parser.add_argument("--skip-existing", action="store_true", default=True)
@@ -88,6 +90,8 @@ def main():
     apply_config_defaults(args)
     if args.dataroot is None:
         parser.error("--dataroot is required (provide via --config or CLI)")
+    if args.version is None:
+        args.version = 0
     if args.revision is None:
         args.revision = 0
     if args.scene_index is None:

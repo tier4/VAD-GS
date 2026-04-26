@@ -4,13 +4,16 @@ from lib.config import yacs
 
 _ANNOTATION_DATASET_BASE = os.path.expanduser("~/.webauto/data/data/annotation_dataset")
 
-def _resolve_t4_dataset_path(dataset_id_or_path, revision=0):
+def _resolve_t4_dataset_path(dataset_id_or_path, revision=0, version=0):
     """Resolve a T4 dataset UUID to a filesystem path (no heavy imports)."""
     candidate = os.path.expanduser(str(dataset_id_or_path))
     if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "annotation")):
         return candidate
     id_path = os.path.join(_ANNOTATION_DATASET_BASE, str(dataset_id_or_path))
     if os.path.isdir(id_path):
+        ver_path = os.path.join(id_path, str(version))
+        if os.path.isdir(ver_path):
+            return ver_path
         rev_path = os.path.join(id_path, str(revision))
         if os.path.isdir(rev_path):
             return rev_path
@@ -68,7 +71,7 @@ def parse_cfg(cfg, args):
     # data directory
     # For T4 datasets, resolve UUID-based dataset IDs before path validation
     if cfg.data.get('type', '') == 'T4':
-        resolved = _resolve_t4_dataset_path(cfg.source_path, revision=cfg.data.get('revision', 0))
+        resolved = _resolve_t4_dataset_path(cfg.source_path, revision=cfg.data.get('revision', 0), version=cfg.data.get('version', 0))
         if os.path.isdir(resolved):
             cfg.source_path = resolved
 

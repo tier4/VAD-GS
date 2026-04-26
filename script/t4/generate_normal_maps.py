@@ -76,6 +76,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate normal maps for T4 dataset")
     add_config_arg(parser)
     parser.add_argument("--dataroot", type=str, default=None, help="Dataset UUID or path")
+    parser.add_argument("--version", type=int, default=None)
     parser.add_argument("--revision", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--scene-index", type=int, default=None)
@@ -91,6 +92,8 @@ def main():
     apply_config_defaults(args)
     if args.dataroot is None:
         parser.error("--dataroot is required (provide via --config or CLI)")
+    if args.version is None:
+        args.version = 0
     if args.revision is None:
         args.revision = 0
     if args.scene_index is None:

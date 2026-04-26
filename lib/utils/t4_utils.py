@@ -595,8 +595,9 @@ def generate_dataparser_outputs_t4(
         dict with same keys as drivestudio_utils.generate_dataparser_outputs()
     """
     # Resolve dataset ID to path if needed
+    version = cfg.data.get("version", 0)
     revision = cfg.data.get("revision", 0)
-    datadir = resolve_t4_dataset_path(datadir, revision=revision)
+    datadir = resolve_t4_dataset_path(datadir, revision=revision, version=version)
 
     if camera_channels is None:
         camera_channels = cfg.data.get("camera_channels", T4_CAMERA_CHANNELS_DEFAULT)

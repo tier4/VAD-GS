@@ -66,6 +66,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run all T4 preprocessing steps")
     add_config_arg(parser)
     parser.add_argument("--dataroot", type=str, default=None, help="Dataset UUID or path")
+    parser.add_argument("--version", type=int, default=None)
     parser.add_argument("--revision", type=int, default=None)
     parser.add_argument("--scene-index", type=int, default=None)
     parser.add_argument("--camera-channels", nargs="+", default=None)
@@ -82,6 +83,8 @@ def main():
     apply_config_defaults(args)
     if args.dataroot is None:
         parser.error("--dataroot is required (provide via --config or CLI)")
+    if args.version is None:
+        args.version = 0
     if args.revision is None:
         args.revision = 0
     if args.scene_index is None:
@@ -95,8 +98,8 @@ def main():
     print(f"Resolved dataroot: {dataroot}")
 
     # Common args passed to all sub-scripts
-    common = ["--dataroot", str(args.dataroot), "--revision", str(args.revision),
-              "--scene-index", str(args.scene_index)]
+    common = ["--dataroot", str(args.dataroot), "--version", str(args.version),
+              "--revision", str(args.revision), "--scene-index", str(args.scene_index)]
     if args.camera_channels:
         common += ["--camera-channels"] + args.camera_channels
 

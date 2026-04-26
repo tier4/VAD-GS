@@ -1036,6 +1036,12 @@ def training() -> None:
                 del render_pkg_obj
             acc_obj = acc_obj.repeat(3, 1, 1)
             # row1 = torch.cat([acc, image_obj, acc_obj], dim=2)
+            if mono_depth is None:
+                raise RuntimeError(
+                    f"mono_depth is None for image={viewpoint_cam._image_path}. "
+                    f"Check that mono depth maps exist under <dataroot>/preprocessed/depth/. "
+                    f"Run: python script/t4/generate_mono_depth.py --config <your_config.yaml>"
+                )
             row1 = torch.cat([voxel_depth_tensor[None,:,:].repeat(3,1,1) / voxel_depth_tensor.max(), image_obj, mono_depth.repeat(3,1,1)], dim=2)
             # row1 = torch.cat([normal_gt/2+0.5, image_obj, soft_render_pkg['normals']/2+0.5], dim=2)
             image_to_show = torch.cat([row0, row1], dim=1)

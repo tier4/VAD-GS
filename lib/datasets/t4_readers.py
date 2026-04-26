@@ -30,8 +30,9 @@ def readT4Info(path: str, images: str = "images", split_train: int = -1, split_t
     """Read T4 dataset and return SceneInfo for VAD-GS training/evaluation."""
 
     # Resolve dataset ID to filesystem path (supports UUID-based lookup)
+    version = cfg.data.get("version", 0)
     revision = cfg.data.get("revision", 0)
-    path = resolve_t4_dataset_path(path, revision=revision)
+    path = resolve_t4_dataset_path(path, revision=revision, version=version)
     print(f"T4 dataset path: {path}")
 
     selected_frames = cfg.data.get("selected_frames", None)

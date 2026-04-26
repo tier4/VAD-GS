@@ -132,6 +132,8 @@ def run_t4_mode(args):
     apply_config_defaults(args)
     if args.dataroot is None:
         raise ValueError("--dataroot is required (provide via --config or CLI)")
+    if args.version is None:
+        args.version = 0
     if args.revision is None:
         args.revision = 0
     if args.scene_index is None:
@@ -190,6 +192,7 @@ def main():
                         help="Path to training YAML config")
     parser.add_argument("--dataroot", type=str, default=None,
                         help="Dataset UUID or path (T4 mode)")
+    parser.add_argument("--version", type=int, default=None)
     parser.add_argument("--revision", type=int, default=None)
     parser.add_argument("--scene-index", type=int, default=None)
     parser.add_argument("--camera-channels", nargs="+", default=None)

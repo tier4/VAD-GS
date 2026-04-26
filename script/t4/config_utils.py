@@ -13,13 +13,16 @@ import yaml
 _ANNOTATION_DATASET_BASE = os.path.expanduser("~/.webauto/data/data/annotation_dataset")
 
 
-def resolve_dataroot(dataset_id_or_path, revision=0):
+def resolve_dataroot(dataset_id_or_path, revision=0, version=0):
     """Resolve a dataset UUID or path to a concrete directory."""
     candidate = os.path.expanduser(str(dataset_id_or_path))
     if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "annotation")):
         return Path(candidate)
     id_path = os.path.join(_ANNOTATION_DATASET_BASE, str(dataset_id_or_path))
     if os.path.isdir(id_path):
+        ver_path = os.path.join(id_path, str(version))
+        if os.path.isdir(ver_path):
+            return Path(ver_path)
         rev_path = os.path.join(id_path, str(revision))
         if os.path.isdir(rev_path):
             return Path(rev_path)
@@ -31,7 +34,7 @@ def load_train_config(config_path):
     """Load a training YAML config and extract preprocessing-relevant params.
 
     Returns a dict with keys:
-        dataroot, revision, scene_index, camera_channels, lidar_channel, box_scale
+        dataroot, version, revision, scene_index, camera_channels, lidar_channel, box_scale
     """
     with open(config_path, "r") as f:
         raw = yaml.safe_load(f)
@@ -40,6 +43,7 @@ def load_train_config(config_path):
 
     return {
         "dataroot": raw.get("source_path", None),
+        "version": data.get("version", 0),
         "revision": data.get("revision", 0),
         "scene_index": data.get("scene_index", 0),
         "camera_channels": data.get("camera_channels", None),
@@ -74,6 +78,7 @@ def apply_config_defaults(args, config_keys=None):
     # Mapping: config dict key -> argparse attribute name
     key_map = {
         "dataroot": "dataroot",
+        "version": "version",
         "revision": "revision",
         "scene_index": "scene_index",
         "camera_channels": "camera_channels",
