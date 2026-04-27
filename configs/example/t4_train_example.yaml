@@ -11,7 +11,7 @@ data:
   white_background: false
   split_test: 4
   split_train: -1
-  selected_frames: [420, 480]  # 42秒~48秒 (61フレーム × 5カメラ ≒ 305枚, 10Hz)
+  selected_frames: [0, 140]  # 0秒~14秒 (141フレーム × 5カメラ ≒ 705枚, 10Hz)
 
   # T4-specific settings
   scene_index: 0                 # Index of the scene to load from scene.json
@@ -46,10 +46,10 @@ model:
     flatten_loss: true
 
 train:
-  iterations: 30000
-  test_iterations: [8000, 16000, 30000]
-  save_iterations: [30000]
-  checkpoint_iterations: [4000, 8000, 16000, 24000, 30000]
+  iterations: 50000
+  test_iterations: [10000, 25000, 50000]
+  save_iterations: [50000]
+  checkpoint_iterations: [5000, 10000, 20000, 35000, 50000]
 
 optim:
   error_tolerance: 0.01
@@ -62,12 +62,12 @@ optim:
   densify_grad_abs_bkgd: True
   densify_grad_threshold_obj: 0.0002
   densify_grad_abs_obj: False
-  densify_until_iter: 24000
+  densify_until_iter: 40000
 
   hard_depth_start: 0
-  hard_depth_end: 24000
+  hard_depth_end: 40000
   propagated_iteration_begin: 0
-  propagated_iteration_end: 24000
+  propagated_iteration_end: 40000
   propagation_interval: 5
   lambda_shape_pena: 0
   lambda_scale_pena: 0
@@ -76,13 +76,13 @@ optim:
   max_screen_size: 20
   min_opacity: 0.01
   opacity_lr: 0.05
-  opacity_reset_interval: 3000
+  opacity_reset_interval: 5000
   percent_big_ws: 0.1
   percent_dense: 0.01
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 1.6e-05
-  position_lr_max_steps: 50000
+  position_lr_max_steps: 70000
   rotation_lr: 0.001
   scaling_lr: 0.005
   semantic_lr: 0.01
@@ -96,12 +96,12 @@ optim:
   track_position_lr_delay_mult: 0.01
   track_position_lr_init: 0.005
   track_position_lr_final: 5.0e-5
-  track_position_max_steps: 30000
+  track_position_max_steps: 50000
 
   track_rotation_lr_delay_mult: 0.01
   track_rotation_lr_init: 0.001
   track_rotation_lr_final: 1.0e-5
-  track_rotation_max_steps: 30000
+  track_rotation_max_steps: 50000
 
   normal_loss: True
   use_voxel_depth: True
