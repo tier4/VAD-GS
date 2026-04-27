@@ -118,6 +118,11 @@ def build_tileset_transform(
         rot = enu_to_ecef @ model_to_enu_rotation
     else:
         rot = enu_to_ecef
+    # CesiumJS glTF renderer assumes Y-up, but VAD-GS model is Z-up.
+    # Compensate by appending a Z-up→Y-up rotation (Rx(-90°)) to the transform
+    # so that CesiumJS's implicit Y-up→Z-up correction cancels out.
+    z_up_to_y_up = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
+    rot = rot @ z_up_to_y_up
     # 4x4 column-major (as required by 3D Tiles spec)
     m = np.eye(4, dtype=np.float64)
     m[:3, :3] = rot
