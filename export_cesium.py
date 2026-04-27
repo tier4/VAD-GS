@@ -146,6 +146,7 @@ def load_training_config(config_path: Path) -> dict:
         "exp_name": raw.get("exp_name", ""),
         "source_path": raw.get("source_path", ""),
         "data_type": data.get("type", ""),
+        "version": data.get("version", 0),
         "revision": data.get("revision", 0),
         "scene_index": data.get("scene_index", 0),
         "lidar_channel": data.get("lidar_channel", "LIDAR_CONCAT"),
@@ -176,13 +177,16 @@ def _find_latest_checkpoint(trained_model_dir: Path) -> Path | None:
 _ANNOTATION_DATASET_BASE = os.path.expanduser("~/.webauto/data/data/annotation_dataset")
 
 
-def resolve_t4_dataset_path(dataset_id_or_path: str, revision: int = 0) -> Path:
+def resolve_t4_dataset_path(dataset_id_or_path: str, revision: int = 0, version: int = 0) -> Path:
     """Resolve a T4 dataset UUID or path to a filesystem path."""
     candidate = os.path.expanduser(dataset_id_or_path)
     if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "annotation")):
         return Path(candidate)
     id_path = os.path.join(_ANNOTATION_DATASET_BASE, dataset_id_or_path)
     if os.path.isdir(id_path):
+        ver_path = os.path.join(id_path, str(version))
+        if os.path.isdir(ver_path):
+            return Path(ver_path)
         rev_path = os.path.join(id_path, str(revision))
         if os.path.isdir(rev_path):
             return Path(rev_path)
@@ -870,11 +874,13 @@ def main():
             args.t4_dataset = train_cfg["source_path"]
         if args.t4_revision is None:
             args.t4_revision = train_cfg["revision"]
+        if not hasattr(args, 't4_version') or args.t4_version is None:
+            args.t4_version = train_cfg.get("version", 0)
         scene_index = train_cfg["scene_index"]
         lidar_channel = train_cfg["lidar_channel"]
 
         print(f"  source_path: {args.t4_dataset}")
-        print(f"  revision: {args.t4_revision}, scene_index: {scene_index}, "
+        print(f"  version: {args.t4_version}, revision: {args.t4_revision}, scene_index: {scene_index}, "
               f"lidar_channel: {lidar_channel}")
 
     # --- Resolve checkpoint path ---
@@ -902,6 +908,8 @@ def main():
     # Defaults for values not set by config or CLI
     if args.t4_revision is None:
         args.t4_revision = 0
+    if not hasattr(args, 't4_version') or args.t4_version is None:
+        args.t4_version = 0
 
     # --- Resolve coordinates and orientation ---
     model_to_enu_rotation = None  # None = assume model is already ENU-aligned
@@ -909,7 +917,7 @@ def main():
     end_timestamp_us: int | None = None
     if args.t4_dataset is not None:
         print(f"Resolving coordinates from T4 dataset: {args.t4_dataset}")
-        ds_path = resolve_t4_dataset_path(args.t4_dataset, args.t4_revision)
+        ds_path = resolve_t4_dataset_path(args.t4_dataset, args.t4_revision, version=args.t4_version)
         if not ds_path.is_dir():
             print(f"Error: T4 dataset not found: {ds_path}", file=sys.stderr)
             sys.exit(1)
