@@ -658,14 +658,16 @@ def generate_dataparser_outputs_t4(
     cameras = list(range(len(camera_channels)))
     num_cameras = len(cameras)
 
-    # Frame range
+    # Frame range (negative values count from end, e.g. [-60] or [-60, -1])
     num_frames_all = len(samples)
     if selected_frames is None:
         start_frame = 0
         end_frame = num_frames_all - 1
     else:
-        start_frame = max(0, selected_frames[0])
-        end_frame = min(num_frames_all - 1, selected_frames[1])
+        sf = selected_frames[0]
+        ef = selected_frames[1] if len(selected_frames) > 1 else (num_frames_all - 1)
+        start_frame = max(0, sf if sf >= 0 else num_frames_all + sf)
+        end_frame = min(num_frames_all - 1, ef if ef >= 0 else num_frames_all + ef)
     selected_frames = [start_frame, end_frame]
     num_frames = end_frame - start_frame + 1
 
