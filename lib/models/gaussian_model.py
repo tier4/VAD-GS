@@ -86,9 +86,11 @@ class GaussianModel(nn.Module):
 
         mask = axis_norm > 1e-6
         axis[mask] /= axis_norm[mask].reshape(-1,1)
-        axis[~mask][:, 0] = 0
-        axis[~mask][:, 1] = 0
-        axis[~mask][:, 2] = 1
+        # numpy fancy-indexing on LHS rows + column slicing returns a copy;
+        # use the (rows, col) form so writes land in `axis` itself.
+        axis[~mask, 0] = 0
+        axis[~mask, 1] = 0
+        axis[~mask, 2] = 1
 
         half_theta = np.arccos(points_normal[:,2]) / 2
         q_w = np.cos(half_theta).reshape(-1,1)
@@ -263,7 +265,19 @@ class GaussianModel(nn.Module):
     
     @property
     def get_rotation(self):
-        return self.rotation_activation(self._rotation)
+        rotations = self.rotation_activation(self._rotation)
+        # Defensive guard: zero-norm input quaternions become NaN after
+        # normalize (0/0). Cached PLYs from create_from_pcd carry these for
+        # Gaussians whose surface normal pointed along -Z, due to a numpy
+        # fancy-index copy bug in the init code. Replace any non-finite
+        # quaternion with identity so the rasterizer never sees NaN — which
+        # otherwise causes view-dependent illegal memory accesses inside
+        # diff_gaussian_rasterization.
+        if not torch.isfinite(rotations).all():
+            identity = torch.tensor([1.0, 0.0, 0.0, 0.0], device=rotations.device, dtype=rotations.dtype)
+            bad_row = ~torch.isfinite(rotations).all(dim=-1, keepdim=True)
+            rotations = torch.where(bad_row, identity.expand_as(rotations), rotations)
+        return rotations
     
     @property
     def get_xyz(self):

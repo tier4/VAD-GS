@@ -221,26 +221,40 @@ def all_reduce_gradients(gaussians) -> None:
     Iterates over every sub-model (background, obj_*, sky) held by
     *gaussians* (a :class:`StreetGaussianModel`), plus the auxiliary
     modules (actor_pose, sky_cubemap, color_correction, pose_correction).
+
+    Different ranks see different viewpoints, so different obj_* models
+    end up with grad=None on different ranks. NCCL requires every rank
+    to call all_reduce in the same order with the same shapes — skipping
+    None grads would desync the collective and silently hang.
+
+    Fix: materialize a zero grad for any param missing one, so every rank
+    issues the same sequence of all_reduces. After the SUM all_reduce we
+    divide by world_size, giving the same average gradient on every rank
+    (with the ranks that didn't see this param contributing 0 to the sum).
     """
     label = "all_reduce_gradients"
     _next_seq(label)
+
+    # First pass: align grad-mask across ranks by filling zeros.
+    n_filled = 0
+    for p in _iter_all_optimizer_params(gaussians):
+        if p.grad is None:
+            p.grad = torch.zeros_like(p.data)
+            n_filled += 1
+
     _check_grad_mask_consensus(label, gaussians)
 
     world_size = dist.get_world_size()
     n_reduced = 0
-    n_skipped = 0
     for p in _iter_all_optimizer_params(gaussians):
-        if p.grad is not None:
-            # NCCL requires contiguous tensors; Gaussian params can carry
-            # non-contiguous grad views after densify/prune slicing.
-            if not p.grad.is_contiguous():
-                p.grad = p.grad.contiguous()
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-            p.grad.div_(world_size)
-            n_reduced += 1
-        else:
-            n_skipped += 1
-    _dbg(label, f"seq={_call_counter[label]} reduced={n_reduced} skipped={n_skipped}")
+        # NCCL requires contiguous tensors; Gaussian params can carry
+        # non-contiguous grad views after densify/prune slicing.
+        if not p.grad.is_contiguous():
+            p.grad = p.grad.contiguous()
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad.div_(world_size)
+        n_reduced += 1
+    _dbg(label, f"seq={_call_counter[label]} reduced={n_reduced} zero_filled={n_filled}")
 
 
 # ---------------------------------------------------------------------------

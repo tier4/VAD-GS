@@ -198,9 +198,10 @@ class GaussianModelActor(GaussianModel):
 
             mask = axis_norm > 1e-6
             axis[mask] /= axis_norm[mask].reshape(-1,1)
-            axis[~mask][:, 0] = 0
-            axis[~mask][:, 1] = 0
-            axis[~mask][:, 2] = 1
+            # numpy fancy-indexing copy fix — see gaussian_model.create_from_pcd.
+            axis[~mask, 0] = 0
+            axis[~mask, 1] = 0
+            axis[~mask, 2] = 1
 
             half_theta = np.arccos(pointcloud_normal[:,2]) / 2
             q_w = np.cos(half_theta).reshape(-1,1)
@@ -506,9 +507,10 @@ class GaussianModelActor(GaussianModel):
         axis_norm = torch.norm(axis, dim=1)
         mask = axis_norm > 1e-6
         axis[mask] /= axis_norm[mask, None]
-        axis[~mask][:, 0] = 0
-        axis[~mask][:, 1] = 0
-        axis[~mask][:, 2] = 1
+        # Same fancy-indexing copy gotcha applies in torch; index rows+cols together.
+        axis[~mask, 0] = 0
+        axis[~mask, 1] = 0
+        axis[~mask, 2] = 1
         # half_theta = np.arccos(object_normal_downsampled[:,2]) / 2
         half_theta = torch.arccos(object_normal_downsampled[:,2:3]) / 2
         # q_w = np.cos(half_theta).reshape(-1,1)

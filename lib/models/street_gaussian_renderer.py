@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -103,17 +104,44 @@ class StreetGaussianRenderer():
         override_color: torch.Tensor | None = None,
         exclude_list: list[str] = [],
         render_type: str = "rgb"
-    ) -> dict[str, torch.Tensor]:   
+    ) -> dict[str, torch.Tensor]:
         include_list = list(set(pc.model_name_id.keys()) - set(exclude_list))
-                    
+
+        import os as _os
+        _dbg = _os.environ.get("VAD_GS_DEBUG_DIST", "0") == "1"
+        if _dbg:
+            import torch.distributed as _dist
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+            _cam_id = getattr(viewpoint_camera, "id", "?")
+            _cam_ch = viewpoint_camera.meta.get("cam", "?") if hasattr(viewpoint_camera, "meta") else "?"
+            print(f"[DBG_REND rank={_rank} cam.id={_cam_id} cam={_cam_ch} render_type={render_type}] pre parse_camera", flush=True)
+
         # Step1: render foreground
         pc.set_visibility(include_list)
         pc.parse_camera(viewpoint_camera)
-        
+
+        if _dbg:
+            torch.cuda.synchronize()
+            print(f"[DBG_REND rank={_rank} cam.id={_cam_id} cam={_cam_ch}] post parse_camera, pre render_kernel", flush=True)
+
         result = self.render_kernel(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, render_type=render_type)
+
+        if _dbg:
+            torch.cuda.synchronize()
+            _has_nan = bool(torch.isnan(result['acc']).any() or torch.isnan(result['rgb']).any())
+            _has_inf = bool(torch.isinf(result['acc']).any() or torch.isinf(result['rgb']).any())
+            print(
+                f"[DBG_REND rank={_rank} cam.id={_cam_id} cam={_cam_ch}] post render_kernel "
+                f"acc.shape={tuple(result['acc'].shape)} acc.range=[{result['acc'].min().item():.3f},{result['acc'].max().item():.3f}] "
+                f"rgb.shape={tuple(result['rgb'].shape)} nan={_has_nan} inf={_has_inf}",
+                flush=True,
+            )
 
         # Step2: render sky
         if pc.include_sky:
+            if _dbg:
+                torch.cuda.synchronize()
+                print(f"[DBG_REND rank={_rank} cam.id={_cam_id} cam={_cam_ch}] pre sky_cubemap", flush=True)
             sky_color = pc.sky_cubemap(viewpoint_camera, result['acc'].detach())
 
             result['rgb'] = result['rgb'] + sky_color * (1 - result['acc'])
@@ -253,7 +281,37 @@ class StreetGaussianRenderer():
             features = None
         
         
-        # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+        import os as _os_rk
+        _dbg_rk = _os_rk.environ.get("VAD_GS_DEBUG_DIST", "0") == "1"
+        if _dbg_rk:
+            import torch.distributed as _dist_rk
+            _rank_rk = _dist_rk.get_rank() if _dist_rk.is_initialized() else 0
+            _cam_id_rk = getattr(viewpoint_camera, "id", "?")
+            _cam_ch_rk = viewpoint_camera.meta.get("cam", "?") if hasattr(viewpoint_camera, "meta") else "?"
+            torch.cuda.synchronize()
+            # project means3D into camera space to get Z (depth)
+            _wvt = viewpoint_camera.world_view_transform  # row-major: w2c.T
+            _R_w2c = _wvt[:3, :3]   # since wvt = w2c.T, the upper-left 3x3 here is R_w2c.T == R_c2w
+            _T_w2c = _wvt[3, :3]
+            # camera-space Z of each Gaussian: z = means3D @ R_w2c_col + T_w2c, where wvt column 2 is the z-row of R_w2c
+            _cam_z = means3D @ _wvt[:3, 2] + _wvt[3, 2]
+            _z_min = _cam_z.min().item()
+            _z_max = _cam_z.max().item()
+            _z_neg_cnt = int((_cam_z < 0.01).sum().item())
+            _means3D_nan = bool(torch.isnan(means3D).any() or torch.isinf(means3D).any())
+            _opac_nan = bool(torch.isnan(opacity).any() or torch.isinf(opacity).any())
+            _scale_nan = scales is not None and bool(torch.isnan(scales).any() or torch.isinf(scales).any())
+            _rot_nan = rotations is not None and bool(torch.isnan(rotations).any() or torch.isinf(rotations).any())
+            _scale_max = scales.max().item() if scales is not None else None
+            print(
+                f"[DBG_RK rank={_rank_rk} cam.id={_cam_id_rk} cam={_cam_ch_rk}] "
+                f"N={num_gaussians} z_min={_z_min:.4f} z_max={_z_max:.4f} z_lt_01={_z_neg_cnt} "
+                f"means_bad={_means3D_nan} opac_bad={_opac_nan} scale_bad={_scale_nan} rot_bad={_rot_nan} "
+                f"scale_max={_scale_max} tanfovx={math.tan(viewpoint_camera.FoVx*0.5):.4f} tanfovy={math.tan(viewpoint_camera.FoVy*0.5):.4f} "
+                f"campos={viewpoint_camera.camera_center.tolist()}",
+                flush=True,
+            )
+        # Rasterize visible Gaussians to image, obtain their radii (on screen).
         rendered_color, radii, rendered_depth, rendered_acc, rendered_feature = rasterizer(
             means3D = means3D,
             means2D = means2D,
@@ -264,7 +322,7 @@ class StreetGaussianRenderer():
             rotations = rotations,
             cov3D_precomp = cov3D_precomp,
             semantics = features,
-        )  
+        )
         
         if cfg.mode != 'train':
             rendered_color = torch.clamp(rendered_color, 0., 1.)

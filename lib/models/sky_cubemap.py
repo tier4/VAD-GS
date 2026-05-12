@@ -87,6 +87,15 @@ class SkyCubeMap(nn.Module):
     def forward(self, camera: Camera, acc=None):
         # acc: gaussian opacity of foreground model: [1, H, W]
         # mask: [H, W], indicating whether a pixel is covered by forgeground model
+        import os as _os, torch.distributed as _dist
+        _dbg = _os.environ.get("VAD_GS_DEBUG_DIST", "0") == "1"
+        if _dbg:
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+            _cam_id = getattr(camera, "id", "?")
+            _cam_ch = camera.meta.get("cam", "?") if hasattr(camera, "meta") else "?"
+            torch.cuda.synchronize()
+            print(f"[DBG_SKY rank={_rank} cam.id={_cam_id} cam={_cam_ch}] enter forward acc.is_cuda={acc.is_cuda if acc is not None else None}", flush=True)
+
         sky_mask = camera.guidance['sky_mask'] if 'sky_mask' in camera.guidance else None
         if cfg.mode == 'train' and sky_mask is not None:
             mask = sky_mask[0].to('cuda', non_blocking=True)
@@ -96,10 +105,17 @@ class SkyCubeMap(nn.Module):
         else:
             mask = None
 
+        if _dbg:
+            torch.cuda.synchronize()
+            print(f"[DBG_SKY rank={_rank} cam.id={_cam_id} cam={_cam_ch}] post mask path sky_mask_is_none={sky_mask is None}", flush=True)
+
         # R, T should be in w2c format
         # rays_d: [H, W, 3]
         w2c = camera.world_view_transform.transpose(0, 1)
         H, W, K, R, T = camera.image_height, camera.image_width, camera.K, w2c[:3, :3], w2c[:3, 3]
+        if _dbg:
+            torch.cuda.synchronize()
+            print(f"[DBG_SKY rank={_rank} cam.id={_cam_id} cam={_cam_ch}] pre get_rays_torch H={H} W={W} K.dev={K.device} R.dev={R.device}", flush=True)
         if cfg.mode == 'train':
             _, rays_d = get_rays_torch(H, W, K, R, T, perturb=True)
         else:

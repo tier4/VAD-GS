@@ -302,11 +302,21 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             import sys as _sys, time as _time
             _r = dist.get_rank()
             _t = _time.strftime("%H:%M:%S")
+            _K = viewpoint_cam.K
+            _wvt = viewpoint_cam.world_view_transform
+            _K_bad = bool(torch.isnan(_K).any() or torch.isinf(_K).any())
+            _wvt_bad = bool(torch.isnan(_wvt).any() or torch.isinf(_wvt).any())
+            _img_dev = viewpoint_cam._original_image.device if viewpoint_cam._original_image is not None else "?"
             print(
                 f"[DBG_DIST {_t} rank={_r}] iter={iteration} "
                 f"view_stack_iter={view_stack_iter} cam.id={randidx} "
                 f"frame={viewpoint_cam.meta.get('frame', '?')} "
-                f"cam={viewpoint_cam.meta.get('cam', '?')}",
+                f"cam={viewpoint_cam.meta.get('cam', '?')} "
+                f"K.dev={_K.device} wvt.dev={_wvt.device} img.dev={_img_dev} "
+                f"K_bad={_K_bad} wvt_bad={_wvt_bad} "
+                f"K.diag={_K.diag().tolist()} "
+                f"wvt.det={float(torch.det(_wvt[:3,:3]).item()):.4f} "
+                f"H={viewpoint_cam.image_height} W={viewpoint_cam.image_width}",
                 flush=True,
             )
             _sys.stdout.flush()
@@ -980,6 +990,15 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
         if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end and "mono_depth" in viewpoint_cam.guidance:
             loss_hard = 0
+            if _dbg_dist and is_distributed():
+                import sys as _sys, time as _time
+                _r = dist.get_rank()
+                _t = _time.strftime("%H:%M:%S.%f")[:-3]
+                # Force sync so any pending async CUDA error surfaces *here*
+                # with this rank's name attached, instead of further downstream.
+                torch.cuda.synchronize()
+                print(f"[DBG_DIST {_t} rank={_r}] iter={iteration} pre hard_depth render cam.id={randidx}", flush=True)
+                _sys.stdout.flush()
             with autocast('cuda', enabled=use_amp):
                 hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
                 hard_depth = hard_render_pkg["depth"]
