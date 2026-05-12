@@ -52,31 +52,37 @@ model:
     opt_track: true
     flatten_loss: true
 
+# --- Iteration scaling for multi-GPU ------------------------------------
+# Each iter consumes world_size (=8) images via data-parallel averaging,
+# so iter-based schedules below are 1/8 of the single-GPU baseline in
+# configs/example/t4_train_example.yaml. propagation_interval and
+# *_interval values that count *param updates* (not data) are kept the
+# same as single-GPU.
 train:
-  iterations: 50000
-  test_iterations: [10000, 25000, 50000]
-  save_iterations: [50000]
-  checkpoint_iterations: [5000, 10000, 20000, 35000, 50000]
+  iterations: 6250
+  test_iterations: [1250, 3125, 6250]
+  save_iterations: [6250]
+  checkpoint_iterations: [625, 1250, 2500, 4375, 6250]
 
 optim:
   use_amp: true  # H100 has excellent BF16/FP16 performance
   error_tolerance: 0.01
-  prune_box_interval: 100
-  densification_interval: 100
+  prune_box_interval: 100         # param-update cadence; keep as-is
+  densification_interval: 100     # param-update cadence; keep as-is
   prop_voxel_interval: 5
 
-  densify_from_iter: 500
+  densify_from_iter: 64           # ~500/8
   densify_grad_threshold_bkgd: 0.001
   densify_grad_abs_bkgd: True
   densify_grad_threshold_obj: 0.0002
   densify_grad_abs_obj: False
-  densify_until_iter: 40000
+  densify_until_iter: 5000        # 40000/8
 
   hard_depth_start: 0
-  hard_depth_end: 40000
+  hard_depth_end: 5000            # 40000/8
   propagated_iteration_begin: 0
-  propagated_iteration_end: 40000
-  propagation_interval: 5
+  propagated_iteration_end: 5000  # 40000/8
+  propagation_interval: 5         # view-stack-epoch units; rank-local, keep as-is
   lambda_shape_pena: 0
   lambda_scale_pena: 0
 
@@ -84,13 +90,13 @@ optim:
   max_screen_size: 20
   min_opacity: 0.01
   opacity_lr: 0.05
-  opacity_reset_interval: 5000
+  opacity_reset_interval: 625     # 5000/8
   percent_big_ws: 0.1
   percent_dense: 0.01
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 1.6e-05
-  position_lr_max_steps: 70000
+  position_lr_max_steps: 8750     # 70000/8 — match shorter iteration schedule
   rotation_lr: 0.001
   scaling_lr: 0.005
   semantic_lr: 0.01
@@ -104,12 +110,12 @@ optim:
   track_position_lr_delay_mult: 0.01
   track_position_lr_init: 0.005
   track_position_lr_final: 5.0e-5
-  track_position_max_steps: 50000
+  track_position_max_steps: 6250  # 50000/8
 
   track_rotation_lr_delay_mult: 0.01
   track_rotation_lr_init: 0.001
   track_rotation_lr_final: 1.0e-5
-  track_rotation_max_steps: 50000
+  track_rotation_max_steps: 6250  # 50000/8
 
   normal_loss: True
   use_voxel_depth: True
