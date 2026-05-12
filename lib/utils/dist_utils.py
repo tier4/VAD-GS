@@ -23,7 +23,6 @@ Single-GPU (existing behaviour, no config change needed)::
 from __future__ import annotations
 
 import os
-from datetime import timedelta
 from typing import Generator
 
 import torch
@@ -50,11 +49,7 @@ def setup_distributed() -> tuple[int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     torch.cuda.set_device(local_rank)
-    # Rank 0 may take many minutes on first-run preprocessing (COLMAP,
-    # pointcloud build) before non-zero ranks hit their first collective.
-    # The c10d store timeout governs that wait, so bump it generously.
-    timeout = timedelta(seconds=cfg.dist.timeout_seconds)
-    dist.init_process_group(backend=cfg.dist.backend, timeout=timeout)
+    dist.init_process_group(backend=cfg.dist.backend)
 
     return rank, world_size, local_rank
 
@@ -77,12 +72,6 @@ def is_distributed() -> bool:
 def is_main_process() -> bool:
     """Return True on rank 0 (or always True in single-GPU mode)."""
     return not is_distributed() or dist.get_rank() == 0
-
-
-def barrier() -> None:
-    """No-op when single-GPU; otherwise block until every rank arrives."""
-    if is_distributed():
-        dist.barrier()
 
 
 # ---------------------------------------------------------------------------

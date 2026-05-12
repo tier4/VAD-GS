@@ -21,6 +21,13 @@ echo "Config : ${CONFIG}"
 echo "GPUs   : ${NPROC}"
 echo "=========================="
 
+# Step 1: single-process preprocessing (COLMAP + pointcloud).
+# Skipped automatically when the cache already exists.
+echo "--- Preprocess ---"
+python script/t4/preprocess.py --config "${CONFIG}"
+
+# Step 2: distributed training.
+echo "--- Train (torchrun) ---"
 torchrun \
     --nproc_per_node="${NPROC}" \
     --nnodes=1 \

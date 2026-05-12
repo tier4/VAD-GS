@@ -20,8 +20,8 @@ from lib.config import cfg
 import torch.distributed as dist
 from lib.utils.dist_utils import (
     setup_distributed, cleanup_distributed, is_distributed, is_main_process,
-    barrier, all_reduce_gradients, sync_densification_stats,
-    broadcast_model_params, sync_grad_scaler,
+    all_reduce_gradients, sync_densification_stats, broadcast_model_params,
+    sync_grad_scaler,
 )
 from lib.models.mvs import depth_propagation, check_geometric_consistency, read_propagted_depth, depth_propagation_old
 from tqdm import tqdm
@@ -158,14 +158,15 @@ def training(rank: int = 0, world_size: int = 1) -> None:
     tb_writer = prepare_output_and_logger() if is_main_process() else None
 
     marker_queue.put("Loading Dataset")
-    # Rank 0 runs heavy preprocessing (COLMAP, pointcloud build) so the other
-    # ranks don't race on the same SQLite DB / output directory. They wait at
-    # the barrier and then construct Dataset from the on-disk cache.
-    if is_main_process():
-        dataset = Dataset()
-    barrier()
-    if not is_main_process():
-        dataset = Dataset()
+    if is_distributed():
+        bkgd_ply = os.path.join(cfg.model_path, "input_ply", "points3D_bkgd.ply")
+        if not os.path.exists(bkgd_ply):
+            raise RuntimeError(
+                f"Preprocessing cache missing: {bkgd_ply}\n"
+                f"Run `python script/t4/preprocess.py --config <config>.yaml` "
+                f"before launching distributed training."
+            )
+    dataset = Dataset()
     marker_queue.put("Lolding Model")
     gaussians = StreetGaussianModel(dataset.scene_info.metadata)
     marker_queue.put("Lolding Scene")
