@@ -25,7 +25,10 @@ def parse_cfg(cfg, args):
         raise ValueError('task must be specified')
 
     # assign the gpus
-    if -1 not in cfg.gpus:
+    # Under torchrun, LOCAL_RANK is set and each process must see all GPUs so
+    # that torch.cuda.set_device(local_rank) resolves correctly; the launcher
+    # already handles per-process device assignment.
+    if -1 not in cfg.gpus and 'LOCAL_RANK' not in os.environ:
         os.environ['CUDA_VISIBLE_DEVICES'] = ', '.join([str(gpu) for gpu in cfg.gpus])
 
     if cfg.debug:
