@@ -274,6 +274,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
     viewpoint_stack = None
     check_interval = 0
     check_history = 0
+    _dbg_dist = os.environ.get("VAD_GS_DEBUG_DIST", "0") == "1"
     for iteration in range(start_iter, training_args.iterations + 1):
 
         iter_start.record()
@@ -296,6 +297,19 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
         viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         randidx = viewpoint_cam.id
+
+        if _dbg_dist and is_distributed():
+            import sys as _sys, time as _time
+            _r = dist.get_rank()
+            _t = _time.strftime("%H:%M:%S")
+            print(
+                f"[DBG_DIST {_t} rank={_r}] iter={iteration} "
+                f"view_stack_iter={view_stack_iter} cam.id={randidx} "
+                f"frame={viewpoint_cam.meta.get('frame', '?')} "
+                f"cam={viewpoint_cam.meta.get('cam', '?')}",
+                flush=True,
+            )
+            _sys.stdout.flush()
         
         gt_image = viewpoint_cam.original_image
         gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
@@ -982,6 +996,17 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 loss_hard += 1 * loss_global
 
             scaler.scale(loss_hard).backward()
+            if _dbg_dist and is_distributed():
+                import sys as _sys, time as _time
+                _r = dist.get_rank()
+                _t = _time.strftime("%H:%M:%S")
+                _objs = list(getattr(gaussians, 'graph_obj_list', []))
+                print(
+                    f"[DBG_DIST {_t} rank={_r}] iter={iteration} after hard_depth.backward "
+                    f"graph_obj_list({len(_objs)})={_objs[:20]}",
+                    flush=True,
+                )
+                _sys.stdout.flush()
             if is_distributed():
                 all_reduce_gradients(gaussians)
             # Optimizer step
@@ -1082,6 +1107,17 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         scalar_dict['loss'] = loss.item()
 
         scaler.scale(loss).backward()
+        if _dbg_dist and is_distributed():
+            import sys as _sys, time as _time
+            _r = dist.get_rank()
+            _t = _time.strftime("%H:%M:%S")
+            _objs = list(getattr(gaussians, 'graph_obj_list', []))
+            print(
+                f"[DBG_DIST {_t} rank={_r}] iter={iteration} after main.backward "
+                f"graph_obj_list({len(_objs)})={_objs[:20]}",
+                flush=True,
+            )
+            _sys.stdout.flush()
         if is_distributed():
             all_reduce_gradients(gaussians)
 
