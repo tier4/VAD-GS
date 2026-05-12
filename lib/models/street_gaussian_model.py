@@ -256,53 +256,27 @@ class StreetGaussianModel(nn.Module):
                     idx += num_gaussians_obj
 
 
-        import os as _os
-        _dbg_pc = _os.environ.get("VAD_GS_DEBUG_DIST", "0") == "1"
-        if _dbg_pc:
-            import torch.distributed as _dist_pc
-            _r_pc = _dist_pc.get_rank() if _dist_pc.is_initialized() else 0
-            _cam_ch_pc = camera.meta.get("cam", "?")
-            _cam_id_pc = getattr(camera, "id", "?")
         if len(self.graph_obj_list) > 0:
             self.obj_rots = []
             self.obj_trans = []
             for i, obj_name in enumerate(self.graph_obj_list):
                 obj_model: GaussianModelActor = getattr(self, obj_name)
                 track_id = obj_model.track_id
-                if _dbg_pc:
-                    torch.cuda.synchronize()
-                    print(f"[DBG_PC rank={_r_pc} cam.id={_cam_id_pc} cam={_cam_ch_pc}] pre tracking obj={obj_name} track_id={track_id}", flush=True)
                 obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
                 obj_trans = self.actor_pose.get_tracking_translation(track_id, self.viewpoint_camera)
-                if _dbg_pc:
-                    torch.cuda.synchronize()
-                    print(f"[DBG_PC rank={_r_pc} cam.id={_cam_id_pc} cam={_cam_ch_pc}] post tracking obj={obj_name} rot.shape={tuple(obj_rot.shape)} trans.shape={tuple(obj_trans.shape)}", flush=True)
                 ego_pose = self.viewpoint_camera.ego_pose
                 ego_pose_rot = matrix_to_quaternion(ego_pose[:3, :3].unsqueeze(0)).squeeze(0)
                 obj_rot = quaternion_raw_multiply(ego_pose_rot.unsqueeze(0), obj_rot.unsqueeze(0)).squeeze(0)
                 obj_trans = ego_pose[:3, :3] @ obj_trans + ego_pose[:3, 3]
-                if _dbg_pc:
-                    torch.cuda.synchronize()
-                    print(f"[DBG_PC rank={_r_pc} cam.id={_cam_id_pc} cam={_cam_ch_pc}] post ego compose obj={obj_name}", flush=True)
 
-                _xyz_n = obj_model.get_xyz.shape[0]
-                obj_rot = obj_rot.expand(_xyz_n, -1)
-                obj_trans = obj_trans.unsqueeze(0).expand(_xyz_n, -1)
-                if _dbg_pc:
-                    torch.cuda.synchronize()
-                    print(f"[DBG_PC rank={_r_pc} cam.id={_cam_id_pc} cam={_cam_ch_pc}] post expand obj={obj_name} xyz_n={_xyz_n}", flush=True)
+                obj_rot = obj_rot.expand(obj_model.get_xyz.shape[0], -1)
+                obj_trans = obj_trans.unsqueeze(0).expand(obj_model.get_xyz.shape[0], -1)
 
                 self.obj_rots.append(obj_rot)
                 self.obj_trans.append(obj_trans)
 
-            if _dbg_pc:
-                torch.cuda.synchronize()
-                print(f"[DBG_PC rank={_r_pc} cam.id={_cam_id_pc} cam={_cam_ch_pc}] pre cat obj_rots n_items={len(self.obj_rots)}", flush=True)
             self.obj_rots = torch.cat(self.obj_rots, dim=0)
             self.obj_trans = torch.cat(self.obj_trans, dim=0)
-            if _dbg_pc:
-                torch.cuda.synchronize()
-                print(f"[DBG_PC rank={_r_pc} cam.id={_cam_id_pc} cam={_cam_ch_pc}] post cat obj_rots.shape={tuple(self.obj_rots.shape)}", flush=True)
 
             if cfg.mode == 'train':
                 self.flip_mask = []
@@ -314,9 +288,6 @@ class StreetGaussianModel(nn.Module):
                         flip_mask = torch.rand(obj_model.get_xyz.shape[0], device=obj_model.get_xyz.device) < self.flip_prob
                     self.flip_mask.append(flip_mask)
                 self.flip_mask = torch.cat(self.flip_mask, dim=0)
-                if _dbg_pc:
-                    torch.cuda.synchronize()
-                    print(f"[DBG_PC rank={_r_pc} cam.id={_cam_id_pc} cam={_cam_ch_pc}] post flip_mask", flush=True)
             
     @property
     def get_scaling(self) -> torch.Tensor:

@@ -22,123 +22,13 @@ Single-GPU (existing behaviour, no config change needed)::
 
 from __future__ import annotations
 
-import hashlib
 import os
-import sys
-import time
 from typing import Generator
 
 import torch
 import torch.distributed as dist
 
 from lib.config import cfg
-
-
-# ---------------------------------------------------------------------------
-# Debug instrumentation (enabled with VAD_GS_DEBUG_DIST=1)
-# ---------------------------------------------------------------------------
-# Set VAD_GS_DEBUG_DIST=1 to:
-#   - Log each collective entry on every rank with a per-call counter
-#   - Before each grad-touching collective, all_gather a fingerprint of
-#     "which optimizer params will participate" and abort with a clear
-#     message if ranks disagree (which is what silently desyncs NCCL).
-_DEBUG_DIST = os.environ.get("VAD_GS_DEBUG_DIST", "0") == "1"
-_call_counter: dict[str, int] = {}
-
-
-def _dbg(label: str, msg: str) -> None:
-    if not _DEBUG_DIST:
-        return
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    t = time.strftime("%H:%M:%S")
-    print(f"[DBG_DIST {t} rank={rank}] {label}: {msg}", flush=True)
-    sys.stdout.flush()
-
-
-def _next_seq(label: str) -> int:
-    n = _call_counter.get(label, 0) + 1
-    _call_counter[label] = n
-    return n
-
-
-def _iter_all_optimizer_params_named(gaussians) -> Generator[tuple[str, torch.nn.Parameter], None, None]:
-    """Same iteration order as _iter_all_optimizer_params, but with stable names."""
-    for model_name in gaussians.model_name_id.keys():
-        sub_model = getattr(gaussians, model_name)
-        for gi, group in enumerate(sub_model.optimizer.param_groups):
-            gname = group.get("name", f"g{gi}")
-            for pi, p in enumerate(group["params"]):
-                yield (f"{model_name}/{gname}/{pi}", p)
-    for module in _auxiliary_modules(gaussians):
-        mod_name = type(module).__name__
-        for gi, group in enumerate(module.optimizer.param_groups):
-            gname = group.get("name", f"g{gi}")
-            for pi, p in enumerate(group["params"]):
-                yield (f"{mod_name}/{gname}/{pi}", p)
-
-
-def _check_grad_mask_consensus(label: str, gaussians) -> None:
-    """Pre-collective consensus check: every rank reports which params have
-    grad != None and which have grad == None. If ranks disagree, abort with
-    a readable diff instead of letting NCCL hang minutes later.
-
-    This itself enqueues NCCL byte collectives via all_gather_object, so it
-    *also* desyncs if upstream code does, but at least it fails *here* with
-    a clear log instead of at a distant 1-elem broadcast.
-    """
-    if not _DEBUG_DIST or not dist.is_initialized():
-        return
-
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-    seq = _call_counter.get(label, 0)
-
-    names_with_grad: list[str] = []
-    names_without_grad: list[str] = []
-    for name, p in _iter_all_optimizer_params_named(gaussians):
-        (names_with_grad if p.grad is not None else names_without_grad).append(name)
-
-    fp_input = "|".join(names_with_grad)
-    fp = hashlib.sha1(fp_input.encode()).hexdigest()[:10]
-    payload = (rank, len(names_with_grad), len(names_without_grad), fp)
-
-    gathered: list = [None] * world
-    dist.all_gather_object(gathered, payload)
-
-    fps = {entry[3] for entry in gathered}  # type: ignore[index]
-    if len(fps) == 1:
-        if rank == 0:
-            _dbg(label, f"seq={seq} consensus OK n_with_grad={payload[1]} fp={fp}")
-        return
-
-    # Mismatch path: gather full name lists so rank 0 can diff.
-    full: list = [None] * world
-    dist.all_gather_object(full, names_with_grad)
-
-    if rank == 0:
-        print(f"[DBG_DIST] !!! {label} seq={seq} GRAD-MASK MISMATCH ACROSS RANKS !!!", flush=True)
-        for entry in gathered:
-            r, nw, nn, f = entry  # type: ignore[misc]
-            print(f"  rank {r}: {nw} with grad / {nn} without grad / fp={f}", flush=True)
-        ref = set(full[0])  # type: ignore[arg-type]
-        for r in range(1, world):
-            cur = set(full[r])  # type: ignore[arg-type]
-            only_ref = sorted(ref - cur)
-            only_cur = sorted(cur - ref)
-            print(
-                f"  diff rank0 vs rank{r}: only_in_0={only_ref[:15]}"
-                f"{'...' if len(only_ref) > 15 else ''} "
-                f"only_in_{r}={only_cur[:15]}"
-                f"{'...' if len(only_cur) > 15 else ''}",
-                flush=True,
-            )
-        sys.stdout.flush()
-    # Synchronize before aborting so all ranks emit logs.
-    dist.barrier()
-    raise RuntimeError(
-        f"[rank={rank}] grad-mask mismatch detected at {label} seq={seq}; "
-        f"see rank-0 log for diff. This is the root cause of the NCCL hang."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -232,20 +122,13 @@ def all_reduce_gradients(gaussians) -> None:
     divide by world_size, giving the same average gradient on every rank
     (with the ranks that didn't see this param contributing 0 to the sum).
     """
-    label = "all_reduce_gradients"
-    _next_seq(label)
-
-    # First pass: align grad-mask across ranks by filling zeros.
-    n_filled = 0
+    # First pass: align grad-mask across ranks by filling zeros so every
+    # rank issues the same sequence of collectives in the same order.
     for p in _iter_all_optimizer_params(gaussians):
         if p.grad is None:
             p.grad = torch.zeros_like(p.data)
-            n_filled += 1
-
-    _check_grad_mask_consensus(label, gaussians)
 
     world_size = dist.get_world_size()
-    n_reduced = 0
     for p in _iter_all_optimizer_params(gaussians):
         # NCCL requires contiguous tensors; Gaussian params can carry
         # non-contiguous grad views after densify/prune slicing.
@@ -253,8 +136,6 @@ def all_reduce_gradients(gaussians) -> None:
             p.grad = p.grad.contiguous()
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
         p.grad.div_(world_size)
-        n_reduced += 1
-    _dbg(label, f"seq={_call_counter[label]} reduced={n_reduced} zero_filled={n_filled}")
 
 
 # ---------------------------------------------------------------------------
@@ -267,11 +148,6 @@ def sync_densification_stats(gaussians) -> None:
 
     Must be called *before* ``densify_and_prune()``.
     """
-    label = "sync_densification_stats"
-    seq = _next_seq(label)
-    if _DEBUG_DIST:
-        names = list(gaussians.model_name_id.keys())
-        _dbg(label, f"seq={seq} starting; submodels={len(names)}")
     for model_name in gaussians.model_name_id.keys():
         sub_model = getattr(gaussians, model_name)
         for attr in ("xyz_gradient_accum", "denom", "max_radii2D"):
@@ -282,7 +158,6 @@ def sync_densification_stats(gaussians) -> None:
         dist.all_reduce(sub_model.xyz_gradient_accum, op=dist.ReduceOp.SUM)
         dist.all_reduce(sub_model.denom, op=dist.ReduceOp.SUM)
         dist.all_reduce(sub_model.max_radii2D, op=dist.ReduceOp.MAX)
-    _dbg(label, f"seq={seq} done")
 
 
 # ---------------------------------------------------------------------------
@@ -295,23 +170,10 @@ def broadcast_model_params(gaussians, src: int = 0) -> None:
     Called after rank 0 runs depth-propagation-based densification which
     may change parameter tensor shapes.
     """
-    label = "broadcast_model_params"
-    seq = _next_seq(label)
-    if _DEBUG_DIST and dist.is_initialized():
-        rank = dist.get_rank()
-        # Each rank also sees its own tensor shape - a shape mismatch with
-        # src will hang NCCL silently; log shapes so we can spot it.
-        first_few = []
-        for i, (name, p) in enumerate(_iter_all_optimizer_params_named(gaussians)):
-            if i >= 5:
-                break
-            first_few.append((name, tuple(p.data.shape)))
-        _dbg(label, f"seq={seq} src={src} sample_shapes={first_few}")
     for p in _iter_all_optimizer_params(gaussians):
         if not p.data.is_contiguous():
             p.data = p.data.contiguous()
         dist.broadcast(p.data, src=src)
-    _dbg(label, f"seq={seq} done")
 
 
 # ---------------------------------------------------------------------------
@@ -325,10 +187,4 @@ def sync_grad_scaler(scaler) -> None:
     Accesses ``scaler._scale`` (private) because GradScaler exposes no
     public tensor accessor.
     """
-    label = "sync_grad_scaler"
-    seq = _next_seq(label)
-    if _DEBUG_DIST:
-        scale_val = float(scaler._scale.item()) if scaler._scale is not None else None
-        _dbg(label, f"seq={seq} pre scale={scale_val}")
     dist.broadcast(scaler._scale, src=0)
-    _dbg(label, f"seq={seq} done")

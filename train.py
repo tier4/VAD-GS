@@ -274,7 +274,6 @@ def training(rank: int = 0, world_size: int = 1) -> None:
     viewpoint_stack = None
     check_interval = 0
     check_history = 0
-    _dbg_dist = os.environ.get("VAD_GS_DEBUG_DIST", "0") == "1"
     for iteration in range(start_iter, training_args.iterations + 1):
 
         iter_start.record()
@@ -298,29 +297,6 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         randidx = viewpoint_cam.id
 
-        if _dbg_dist and is_distributed():
-            import sys as _sys, time as _time
-            _r = dist.get_rank()
-            _t = _time.strftime("%H:%M:%S")
-            _K = viewpoint_cam.K
-            _wvt = viewpoint_cam.world_view_transform
-            _K_bad = bool(torch.isnan(_K).any() or torch.isinf(_K).any())
-            _wvt_bad = bool(torch.isnan(_wvt).any() or torch.isinf(_wvt).any())
-            _img_dev = viewpoint_cam._original_image.device if viewpoint_cam._original_image is not None else "?"
-            print(
-                f"[DBG_DIST {_t} rank={_r}] iter={iteration} "
-                f"view_stack_iter={view_stack_iter} cam.id={randidx} "
-                f"frame={viewpoint_cam.meta.get('frame', '?')} "
-                f"cam={viewpoint_cam.meta.get('cam', '?')} "
-                f"K.dev={_K.device} wvt.dev={_wvt.device} img.dev={_img_dev} "
-                f"K_bad={_K_bad} wvt_bad={_wvt_bad} "
-                f"K.diag={_K.diag().tolist()} "
-                f"wvt.det={float(torch.det(_wvt[:3,:3]).item()):.4f} "
-                f"H={viewpoint_cam.image_height} W={viewpoint_cam.image_width}",
-                flush=True,
-            )
-            _sys.stdout.flush()
-        
         gt_image = viewpoint_cam.original_image
         gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
         loss_mask = viewpoint_cam.guidance['mask'] if 'mask' in viewpoint_cam.guidance else torch.ones_like(gt_image[0:1]).bool()
@@ -990,15 +966,6 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
         if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end and "mono_depth" in viewpoint_cam.guidance:
             loss_hard = 0
-            if _dbg_dist and is_distributed():
-                import sys as _sys, time as _time
-                _r = dist.get_rank()
-                _t = _time.strftime("%H:%M:%S.%f")[:-3]
-                # Force sync so any pending async CUDA error surfaces *here*
-                # with this rank's name attached, instead of further downstream.
-                torch.cuda.synchronize()
-                print(f"[DBG_DIST {_t} rank={_r}] iter={iteration} pre hard_depth render cam.id={randidx}", flush=True)
-                _sys.stdout.flush()
             with autocast('cuda', enabled=use_amp):
                 hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
                 hard_depth = hard_render_pkg["depth"]
@@ -1015,17 +982,6 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 loss_hard += 1 * loss_global
 
             scaler.scale(loss_hard).backward()
-            if _dbg_dist and is_distributed():
-                import sys as _sys, time as _time
-                _r = dist.get_rank()
-                _t = _time.strftime("%H:%M:%S")
-                _objs = list(getattr(gaussians, 'graph_obj_list', []))
-                print(
-                    f"[DBG_DIST {_t} rank={_r}] iter={iteration} after hard_depth.backward "
-                    f"graph_obj_list({len(_objs)})={_objs[:20]}",
-                    flush=True,
-                )
-                _sys.stdout.flush()
             if is_distributed():
                 all_reduce_gradients(gaussians)
             # Optimizer step
@@ -1126,17 +1082,6 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         scalar_dict['loss'] = loss.item()
 
         scaler.scale(loss).backward()
-        if _dbg_dist and is_distributed():
-            import sys as _sys, time as _time
-            _r = dist.get_rank()
-            _t = _time.strftime("%H:%M:%S")
-            _objs = list(getattr(gaussians, 'graph_obj_list', []))
-            print(
-                f"[DBG_DIST {_t} rank={_r}] iter={iteration} after main.backward "
-                f"graph_obj_list({len(_objs)})={_objs[:20]}",
-                flush=True,
-            )
-            _sys.stdout.flush()
         if is_distributed():
             all_reduce_gradients(gaussians)
 
