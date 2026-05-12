@@ -65,7 +65,7 @@ train:
   checkpoint_iterations: [625, 1250, 2500, 4375, 6250]
 
 optim:
-  use_amp: true  # H100 has excellent BF16/FP16 performance
+  use_amp: false  # disabled: AMP loss-scale collapsed to 0 around iter 100 in multi-GPU; revisit once training is stable.
   error_tolerance: 0.01
   prune_box_interval: 100         # param-update cadence; keep as-is
   densification_interval: 100     # param-update cadence; keep as-is
