@@ -74,6 +74,12 @@ def is_main_process() -> bool:
     return not is_distributed() or dist.get_rank() == 0
 
 
+def barrier() -> None:
+    """No-op when single-GPU; otherwise block until every rank arrives."""
+    if is_distributed():
+        dist.barrier()
+
+
 # ---------------------------------------------------------------------------
 # Internal: iterate all optimizer params
 # ---------------------------------------------------------------------------
