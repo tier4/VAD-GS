@@ -16,6 +16,11 @@ Usage:
 
 from __future__ import annotations
 
+import os
+import sys
+
+sys.path.append(os.getcwd())
+
 from lib.config import cfg
 from lib.datasets.dataset import Dataset
 
