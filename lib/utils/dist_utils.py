@@ -115,6 +115,10 @@ def all_reduce_gradients(gaussians) -> None:
     world_size = dist.get_world_size()
     for p in _iter_all_optimizer_params(gaussians):
         if p.grad is not None:
+            # NCCL requires contiguous tensors; Gaussian params can carry
+            # non-contiguous grad views after densify/prune slicing.
+            if not p.grad.is_contiguous():
+                p.grad = p.grad.contiguous()
             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
             p.grad.div_(world_size)
 
@@ -131,6 +135,11 @@ def sync_densification_stats(gaussians) -> None:
     """
     for model_name in gaussians.model_name_id.keys():
         sub_model = getattr(gaussians, model_name)
+        for attr in ("xyz_gradient_accum", "denom", "max_radii2D"):
+            t = getattr(sub_model, attr)
+            if not t.is_contiguous():
+                t = t.contiguous()
+                setattr(sub_model, attr, t)
         dist.all_reduce(sub_model.xyz_gradient_accum, op=dist.ReduceOp.SUM)
         dist.all_reduce(sub_model.denom, op=dist.ReduceOp.SUM)
         dist.all_reduce(sub_model.max_radii2D, op=dist.ReduceOp.MAX)
@@ -147,6 +156,8 @@ def broadcast_model_params(gaussians, src: int = 0) -> None:
     may change parameter tensor shapes.
     """
     for p in _iter_all_optimizer_params(gaussians):
+        if not p.data.is_contiguous():
+            p.data = p.data.contiguous()
         dist.broadcast(p.data, src=src)
 
 
