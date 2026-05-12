@@ -135,6 +135,10 @@ cfg.data.use_colmap = True
 # data.sphere_scale: Scale the sphere radius by this factor.
 # data.regenerate_pcd: Regenerate the initialization point cloud.
 
+cfg.dist = CN()
+cfg.dist.enabled = False  # Set True + torchrun to enable multi-GPU training
+cfg.dist.backend = 'nccl'
+
 cfg.render = CN()
 cfg.render.convert_SHs_python = False
 cfg.render.compute_cov3D_python = False

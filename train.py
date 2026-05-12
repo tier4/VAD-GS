@@ -5,6 +5,7 @@ import torch
 from torch.amp import autocast, GradScaler
 import patchmatch_cuda
 
+import random
 from random import randint
 from lib.utils.loss_utils import l1_loss, l2_loss, psnr, ssim, patch_norm_mse_loss, patch_norm_mse_loss_global
 from lib.utils.img_utils import save_img_torch, visualize_depth_numpy
@@ -16,6 +17,12 @@ from lib.utils.cfg_utils import save_cfg
 from lib.models.scene import Scene
 from lib.datasets.dataset import Dataset
 from lib.config import cfg
+import torch.distributed as dist
+from lib.utils.dist_utils import (
+    setup_distributed, cleanup_distributed, is_distributed, is_main_process,
+    all_reduce_gradients, sync_densification_stats, broadcast_model_params,
+    sync_grad_scaler,
+)
 from lib.models.mvs import depth_propagation, check_geometric_consistency, read_propagted_depth, depth_propagation_old
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
@@ -142,13 +149,13 @@ def monitor_resources(
 
 
 
-def training() -> None:
+def training(rank: int = 0, world_size: int = 1) -> None:
     training_args = cfg.train
     optim_args = cfg.optim
     data_args = cfg.data
 
     start_iter = 0
-    tb_writer = prepare_output_and_logger()
+    tb_writer = prepare_output_and_logger() if is_main_process() else None
 
     marker_queue.put("Loading Dataset")
     dataset = Dataset()
@@ -189,7 +196,7 @@ def training() -> None:
     ema_loss_for_log = 0.0
     ema_psnr_for_log = 0.0
     psnr_dict = {}
-    progress_bar = tqdm(range(start_iter, training_args.iterations))
+    progress_bar = tqdm(range(start_iter, training_args.iterations), disable=not is_main_process())
     start_iter += 1
 
     # LRU tracker for bkgd_voxel_depth guidance cache (see module-level helper).
@@ -229,11 +236,38 @@ def training() -> None:
             obj_model.grape_trellis.set_param(dataset.scene_info.metadata["c2ws"], dataset.scene_info.metadata["ixts"], selected_frames, cams_per_frame=cams_per_frame)
     N_bkgd_init = gaussians.background.get_xyz.shape[0]
 
+    # --- Multi-GPU: partition views and preload to VRAM -------------------
+    if is_distributed():
+        all_train_cams = scene.getTrainCameras()
+        all_train_cams_sorted = sorted(all_train_cams, key=lambda c: c.id)
+        local_cameras = all_train_cams_sorted[rank::world_size]
+
+        if is_main_process():
+            print(f"Preloading {len(local_cameras)} views per GPU to VRAM "
+                  f"({len(all_train_cams)} total / {world_size} GPUs)")
+
+        for cam in local_cameras:
+            # Trigger lazy loading of image and all guidance data
+            _ = cam.original_image
+            for key in list(cam.guidance.keys()):
+                _ = cam.guidance[key]
+            # Move everything to VRAM
+            cam.set_device('cuda')
+            # Re-assign via __setitem__ to mark entries as persistent
+            # so they survive unload() calls.
+            for key in list(cam.guidance.keys()):
+                cam.guidance[key] = cam.guidance[key]
+
+        if is_main_process():
+            print(f"VRAM preload complete for {len(local_cameras)} views")
+    else:
+        local_cameras = None  # not used in single-GPU mode
+
     viewpoint_stack = None
     check_interval = 0
     check_history = 0
     for iteration in range(start_iter, training_args.iterations + 1):
-    
+
         iter_start.record()
         gaussians.update_learning_rate(iteration)
 
@@ -242,11 +276,16 @@ def training() -> None:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            view_stack_iter += 1
-        
-        # viewpoint_cam = viewpoint_full_stack[18]
+        if is_distributed():
+            if not viewpoint_stack:
+                viewpoint_stack = list(local_cameras)
+                random.shuffle(viewpoint_stack)
+                view_stack_iter += 1
+        else:
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+                view_stack_iter += 1
+
         viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         randidx = viewpoint_cam.id
         
@@ -292,7 +331,9 @@ def training() -> None:
             viewpoint_cam.guidance["bkgd_voxel_depth"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32))
             del mask_visible, uvs
         # Bound the per-camera cache via LRU eviction across all previously-visited cameras.
-        _lru_touch_bkgd_voxel_cache(bkgd_voxel_cache_tracker, viewpoint_cam)
+        # In multi-GPU mode, each rank holds few views — no eviction needed.
+        if not is_distributed():
+            _lru_touch_bkgd_voxel_cache(bkgd_voxel_cache_tracker, viewpoint_cam)
         
 
         flag_global_reconstruct = False
@@ -301,9 +342,12 @@ def training() -> None:
         _propagation_ran = False
 
         ###################### hard depth #######################
+        # In multi-GPU mode, only rank 0 runs depth propagation.  Other ranks
+        # skip this block entirely; model params are broadcast afterwards.
+        _skip_propagation = is_distributed() and rank != 0
         # check_views = [5, 10, 20, 40, 60, 80, 100]
         # if view_stack_iter in check_views : # and iteration % optim_args.propagation_interval == 0:
-        if view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end:
+        if not _skip_propagation and view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end:
             _propagation_ran = True
             soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
             image = soft_render_pkg["rgb"]
@@ -898,6 +942,16 @@ def training() -> None:
                 del soft_render_pkg, image
             torch.cuda.empty_cache()
 
+        # In multi-GPU mode, broadcast updated model params after rank 0
+        # runs depth-propagation-based densification.  The flag must be
+        # shared so all ranks enter the collective broadcast together.
+        if is_distributed():
+            _flag = torch.tensor([1 if _propagation_ran else 0], device='cuda')
+            dist.broadcast(_flag, src=0)
+            if _flag.item():
+                broadcast_model_params(gaussians, src=0)
+            del _flag
+
 
         voxel_depth_value, voxel_depth_source = viewpoint_cam.guidance["bkgd_voxel_depth"]
         voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
@@ -920,6 +974,8 @@ def training() -> None:
                 loss_hard += 1 * loss_global
 
             scaler.scale(loss_hard).backward()
+            if is_distributed():
+                all_reduce_gradients(gaussians)
             # Optimizer step
             if iteration < training_args.iterations:
                 gaussians.update_optimizer(scaler=scaler if use_amp else None)
@@ -1018,11 +1074,13 @@ def training() -> None:
         scalar_dict['loss'] = loss.item()
 
         scaler.scale(loss).backward()
+        if is_distributed():
+            all_reduce_gradients(gaussians)
 
         iter_end.record()
 
         is_save_images = True
-        if is_save_images and (iteration % 100 == 0):
+        if is_save_images and (iteration % 100 == 0) and is_main_process():
             # row0: gt_image, image, depth
             # row1: acc, image_obj, acc_obj
             depth_colored, _ = visualize_depth_numpy(soft_render_pkg['depth'].detach().cpu().numpy().squeeze(0))
@@ -1077,7 +1135,7 @@ def training() -> None:
             #     progress_bar.close()
 
             # Save ply
-            if (iteration in training_args.save_iterations):
+            if (iteration in training_args.save_iterations) and is_main_process():
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
@@ -1091,6 +1149,11 @@ def training() -> None:
 
                 if iteration > optim_args.densify_from_iter:
                     if iteration % optim_args.densification_interval == 0:
+                        if is_distributed():
+                            sync_densification_stats(gaussians)
+                            # Deterministic RNG so all ranks make identical decisions
+                            torch.manual_seed(iteration)
+                            torch.cuda.manual_seed(iteration)
                         scalars, tensors = gaussians.densify_and_prune(
                             max_grad=optim_args.densify_grad_threshold,
                             min_opacity=optim_args.min_opacity,
@@ -1107,7 +1170,8 @@ def training() -> None:
                 if data_args.white_background and iteration == optim_args.densify_from_iter:
                     gaussians.reset_opacity()
 
-            training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer)
+            if is_main_process():
+                training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer)
             del scalar_dict, tensor_dict, soft_render_pkg, image, acc, viewspace_point_tensor, visibility_filter, radii, loss
 
             # Optimizer step
@@ -1115,8 +1179,10 @@ def training() -> None:
                 gaussians.update_optimizer(scaler=scaler if use_amp else None)
                 if use_amp:
                     scaler.update()
+                    if is_distributed():
+                        sync_grad_scaler(scaler)
 
-            if (iteration in training_args.checkpoint_iterations):
+            if (iteration in training_args.checkpoint_iterations) and is_main_process():
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 state_dict = gaussians.save_state_dict(is_final=(iteration == training_args.iterations))
                 state_dict['iter'] = iteration
@@ -1128,7 +1194,7 @@ def training() -> None:
             # Viewer PLY export is memory-heavy (several GB of CPU RAM spike for
             # multi-million Gaussians). Only run on save_iterations to avoid OOM
             # during routine checkpoints.
-            if (iteration in training_args.save_iterations):
+            if (iteration in training_args.save_iterations) and is_main_process():
                 gaussians.set_visibility(list(set(gaussians.model_name_id.keys())))
                 gaussians.parse_camera(camera=viewpoint_cam)
 
@@ -1203,10 +1269,12 @@ def training() -> None:
                 del elements, ply_element
                 gc.collect()
 
-            # End-of-iteration cleanup: free lazily-loaded data to prevent RAM accumulation
-            if hasattr(viewpoint_cam.guidance, 'unload'):
-                viewpoint_cam.guidance.unload()
-            viewpoint_cam.unload_image()
+            # End-of-iteration cleanup: free lazily-loaded data to prevent RAM accumulation.
+            # In multi-GPU mode, data is preloaded to VRAM — skip unloading.
+            if not is_distributed():
+                if hasattr(viewpoint_cam.guidance, 'unload'):
+                    viewpoint_cam.guidance.unload()
+                viewpoint_cam.unload_image()
 
 
 def prepare_output_and_logger() -> SummaryWriter | None:
@@ -1293,7 +1361,16 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    print("Optimizing " + cfg.model_path)
+    # --- distributed setup (no-op when cfg.dist.enabled is False) ---------
+    rank, world_size, local_rank = setup_distributed()
+
+    if not is_main_process():
+        cfg.train.quiet = True
+
+    if is_main_process():
+        print("Optimizing " + cfg.model_path)
+        if is_distributed():
+            print(f"Distributed training: {world_size} GPUs")
 
     # Initialize system state (RNG)
     safe_state(cfg.train.quiet)
@@ -1301,29 +1378,30 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     torch.autograd.set_detect_anomaly(cfg.train.detect_anomaly)
 
-
     stop_event = threading.Event()
-    monitor_thread = threading.Thread(
-        target=monitor_resources,
-        kwargs={
-            "interval": 1.0,
-            "log_file": os.path.join(cfg.record_dir, "resource.log"),
-            "gpu_id": 0,
-            "stop_event": stop_event,
-            "marker_queue": marker_queue,
-        },
-        daemon=True,
-    )
-    monitor_thread.start()
+    if is_main_process():
+        monitor_thread = threading.Thread(
+            target=monitor_resources,
+            kwargs={
+                "interval": 1.0,
+                "log_file": os.path.join(cfg.record_dir, "resource.log"),
+                "gpu_id": local_rank,
+                "stop_event": stop_event,
+                "marker_queue": marker_queue,
+            },
+            daemon=True,
+        )
+        monitor_thread.start()
     time_start=time.time()
 
-    training()
+    training(rank, world_size)
 
     time_end=time.time()
-    stop_event.set()
-    monitor_thread.join()
-    print('time cost', time_end-time_start,'s')
-    print('scene id:', cfg.workspace)
+    if is_main_process():
+        stop_event.set()
+        monitor_thread.join()
+        print('time cost', time_end-time_start,'s')
+        print('scene id:', cfg.workspace)
+        print("\nTraining complete.")
 
-    # All done
-    print("\nTraining complete.")
+    cleanup_distributed()
