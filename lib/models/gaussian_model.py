@@ -351,8 +351,16 @@ class GaussianModel(nn.Module):
         
     def update_optimizer(self, scaler=None):
         if scaler is not None:
-            scaler.unscale_(self.optimizer)
-            scaler.step(self.optimizer)
+            # GradScaler asserts on empty found_inf when no params got grads
+            # this iter (e.g. obj sub-models not in the current frame).
+            has_grads = any(
+                p.grad is not None
+                for group in self.optimizer.param_groups
+                for p in group["params"]
+            )
+            if has_grads:
+                scaler.unscale_(self.optimizer)
+                scaler.step(self.optimizer)
         else:
             self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
