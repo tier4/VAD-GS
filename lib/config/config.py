@@ -138,6 +138,7 @@ cfg.data.use_colmap = True
 cfg.dist = CN()
 cfg.dist.enabled = False  # Set True + torchrun to enable multi-GPU training
 cfg.dist.backend = 'nccl'
+cfg.dist.timeout_seconds = 7200  # 2h: covers rank-0 COLMAP/pointcloud preprocessing
 
 cfg.render = CN()
 cfg.render.convert_SHs_python = False
