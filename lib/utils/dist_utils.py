@@ -229,16 +229,24 @@ def _broadcast_attr_tensor(obj, attr: str, src: int) -> None:
 
 
 def _broadcast_opt_state(opt: torch.optim.Optimizer, p: torch.nn.Parameter, src: int) -> None:
-    """Broadcast Adam state (step, exp_avg, exp_avg_sq) for parameter *p*."""
+    """Broadcast Adam's exp_avg / exp_avg_sq for parameter *p*.
+
+    'step' is intentionally not broadcast: every rank invokes
+    optimizer.step() once per training iter so the step counter increments
+    identically on all ranks, and densify/prune carries the same
+    ``stored_state`` (step included) onto the rebuilt parameter without
+    resetting it. Broadcasting step would also force us to round-trip
+    Adam's CPU 0-d step tensor through CUDA — NCCL can't operate on CPU
+    tensors.
+    """
     rank = dist.get_rank()
     state = opt.state.setdefault(p, {})
 
-    # Flags: bit 0 = step, bit 1 = exp_avg, bit 2 = exp_avg_sq
+    # Flags: bit 0 = exp_avg, bit 1 = exp_avg_sq
     if rank == src:
         flags = (
-            (1 if "step" in state else 0)
-            | (2 if "exp_avg" in state else 0)
-            | (4 if "exp_avg_sq" in state else 0)
+            (1 if "exp_avg" in state else 0)
+            | (2 if "exp_avg_sq" in state else 0)
         )
     else:
         flags = 0
@@ -246,18 +254,7 @@ def _broadcast_opt_state(opt: torch.optim.Optimizer, p: torch.nn.Parameter, src:
     dist.broadcast(flags_t, src=src)
     flags = int(flags_t.item())
 
-    if flags & 1:
-        if rank == src:
-            step = state["step"]
-            t = step if isinstance(step, torch.Tensor) else torch.tensor(
-                float(step), dtype=torch.float32, device="cuda"
-            )
-        else:
-            t = torch.zeros((), dtype=torch.float32, device="cuda")
-        dist.broadcast(t, src=src)
-        state["step"] = t
-
-    for key, bit in (("exp_avg", 2), ("exp_avg_sq", 4)):
+    for key, bit in (("exp_avg", 1), ("exp_avg_sq", 2)):
         if not (flags & bit):
             continue
         if rank == src:
