@@ -42,6 +42,9 @@ command:
   - ${args}
 
 # Early stop weak runs once we have signal.
+# With min_iter=3000 and eta=3, the rung iterations land roughly at
+# {3000, 9000, 27000, 50000} — matching the test_iterations in base.yaml
+# so the early-stop decision is taken at a real test eval.
 early_terminate:
   type: hyperband
   min_iter: 3000
@@ -113,9 +116,9 @@ parameters:
   # When to stop densifying. Later end means more foreground refinement
   # but risks oscillation against opacity-reset.
   optim.densify_until_iter:
-    values: [7500, 10000, 11500]
+    values: [25000, 35000, 40000, 45000]
 
   # Opacity reset cadence: aggressive reset prunes too hard, but never
   # resetting leaves stale Gaussians.
   optim.opacity_reset_interval:
-    values: [2000, 3000, 5000, 8000]
+    values: [3000, 5000, 8000, 12000]

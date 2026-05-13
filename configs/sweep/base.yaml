@@ -53,14 +53,17 @@ model:
     opt_track: true
     flatten_loss: true
 
-# --- Shortened schedule tuned for sweep efficiency ----------------------
-# Full single-GPU schedule is 50k iter; for hyperparameter search we use
-# ~25% of that. Re-rank top candidates at full length separately if needed.
+# --- Full single-GPU schedule -------------------------------------------
+# Sweep at the production length (50000 iter) so the tuning we find can
+# be used as-is. Hyperband (configured in t4_sweep.yaml) culls weak runs
+# at the early test rungs so we do not pay full cost for every config.
+# test_iterations are placed near the hyperband rungs (~min_iter,
+# ~min_iter*eta, ...) so the early-stop signal lands on real evals.
 train:
-  iterations: 12500
-  test_iterations: [3000, 7000, 12500]
-  save_iterations: [12500]
-  checkpoint_iterations: [12500]
+  iterations: 50000
+  test_iterations: [3000, 10000, 25000, 50000]
+  save_iterations: [50000]
+  checkpoint_iterations: [50000]
 
 optim:
   use_amp: false
@@ -74,12 +77,12 @@ optim:
   densify_grad_abs_bkgd: True
   densify_grad_threshold_obj: 0.0002
   densify_grad_abs_obj: False
-  densify_until_iter: 10000
+  densify_until_iter: 40000
 
   hard_depth_start: 0
-  hard_depth_end: 10000
+  hard_depth_end: 40000
   propagated_iteration_begin: 0
-  propagated_iteration_end: 10000
+  propagated_iteration_end: 40000
   propagation_interval: 5
   lambda_shape_pena: 0
   lambda_scale_pena: 0
@@ -94,7 +97,7 @@ optim:
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 1.6e-05
-  position_lr_max_steps: 17500
+  position_lr_max_steps: 70000
   rotation_lr: 0.001
   scaling_lr: 0.005
   semantic_lr: 0.01
@@ -108,12 +111,12 @@ optim:
   track_position_lr_delay_mult: 0.01
   track_position_lr_init: 0.005
   track_position_lr_final: 5.0e-5
-  track_position_max_steps: 12500
+  track_position_max_steps: 50000
 
   track_rotation_lr_delay_mult: 0.01
   track_rotation_lr_init: 0.001
   track_rotation_lr_final: 1.0e-5
-  track_rotation_max_steps: 12500
+  track_rotation_max_steps: 50000
 
   normal_loss: True
   use_voxel_depth: True
