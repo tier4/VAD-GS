@@ -161,19 +161,148 @@ def sync_densification_stats(gaussians) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Model-state broadcast (after depth-propagation densification)
+# Full-state broadcast (after rank-0-only densify / prune / propagation)
 # ---------------------------------------------------------------------------
+#
+# Densify / prune mutate parameter shapes and the optimizer state attached
+# to each parameter (Adam's exp_avg / exp_avg_sq are param-shaped). When we
+# do them on rank 0 only, every rank then has to receive all of:
+#   - the new .data on each nn.Parameter
+#   - the matching Adam state (exp_avg, exp_avg_sq, step)
+#   - the resized densification accumulators (xyz_gradient_accum, denom,
+#     max_radii2D)
+#
+# NCCL broadcast requires sender/receiver tensors of matching shape, so we
+# first send a fixed-size metadata tensor describing (ndim, shape, dtype)
+# and let receivers reallocate before the data broadcast.
 
-def broadcast_model_params(gaussians, src: int = 0) -> None:
-    """Broadcast all trainable parameters from *src* to every other rank.
+_MAX_NDIM = 8
+_DTYPE_TO_CODE = {
+    torch.float32: 0, torch.float16: 1, torch.bfloat16: 2, torch.float64: 3,
+    torch.int8: 4, torch.int16: 5, torch.int32: 6, torch.int64: 7,
+    torch.uint8: 8, torch.bool: 9,
+}
+_CODE_TO_DTYPE = {v: k for k, v in _DTYPE_TO_CODE.items()}
 
-    Called after rank 0 runs depth-propagation-based densification which
-    may change parameter tensor shapes.
+
+def _broadcast_meta(t: torch.Tensor | None, src: int) -> tuple[tuple[int, ...], torch.dtype]:
+    """Broadcast (ndim, shape..., dtype) from *src*. Returns the receiver's view."""
+    rank = dist.get_rank()
+    meta = torch.zeros(_MAX_NDIM + 2, dtype=torch.long, device="cuda")
+    if rank == src:
+        assert t is not None, "sender must provide tensor"
+        assert t.ndim <= _MAX_NDIM, f"tensor ndim {t.ndim} exceeds _MAX_NDIM={_MAX_NDIM}"
+        meta[0] = t.ndim
+        for i, dim in enumerate(t.shape):
+            meta[1 + i] = dim
+        meta[-1] = _DTYPE_TO_CODE[t.dtype]
+    dist.broadcast(meta, src=src)
+    ndim = int(meta[0].item())
+    shape = tuple(int(meta[1 + i].item()) for i in range(ndim))
+    dtype = _CODE_TO_DTYPE[int(meta[-1].item())]
+    return shape, dtype
+
+
+def _broadcast_param_data(p: torch.nn.Parameter, src: int) -> None:
+    """Broadcast p.data from src; replace it on receivers if shape/dtype changed."""
+    rank = dist.get_rank()
+    shape, dtype = _broadcast_meta(p.data if rank == src else None, src)
+    if rank != src and (p.data.shape != shape or p.data.dtype != dtype):
+        p.data = torch.empty(shape, dtype=dtype, device=p.data.device)
+    if not p.data.is_contiguous():
+        p.data = p.data.contiguous()
+    dist.broadcast(p.data, src=src)
+
+
+def _broadcast_attr_tensor(obj, attr: str, src: int) -> None:
+    """Broadcast obj.<attr> from src; reassign on receivers if shape/dtype changed."""
+    rank = dist.get_rank()
+    cur = getattr(obj, attr)
+    shape, dtype = _broadcast_meta(cur if rank == src else None, src)
+    if rank != src and (cur.shape != shape or cur.dtype != dtype):
+        cur = torch.empty(shape, dtype=dtype, device=cur.device)
+        setattr(obj, attr, cur)
+    if not cur.is_contiguous():
+        cur = cur.contiguous()
+        setattr(obj, attr, cur)
+    dist.broadcast(cur, src=src)
+
+
+def _broadcast_opt_state(opt: torch.optim.Optimizer, p: torch.nn.Parameter, src: int) -> None:
+    """Broadcast Adam state (step, exp_avg, exp_avg_sq) for parameter *p*."""
+    rank = dist.get_rank()
+    state = opt.state.setdefault(p, {})
+
+    # Flags: bit 0 = step, bit 1 = exp_avg, bit 2 = exp_avg_sq
+    if rank == src:
+        flags = (
+            (1 if "step" in state else 0)
+            | (2 if "exp_avg" in state else 0)
+            | (4 if "exp_avg_sq" in state else 0)
+        )
+    else:
+        flags = 0
+    flags_t = torch.tensor([flags], dtype=torch.long, device="cuda")
+    dist.broadcast(flags_t, src=src)
+    flags = int(flags_t.item())
+
+    if flags & 1:
+        if rank == src:
+            step = state["step"]
+            t = step if isinstance(step, torch.Tensor) else torch.tensor(
+                float(step), dtype=torch.float32, device="cuda"
+            )
+        else:
+            t = torch.zeros((), dtype=torch.float32, device="cuda")
+        dist.broadcast(t, src=src)
+        state["step"] = t
+
+    for key, bit in (("exp_avg", 2), ("exp_avg_sq", 4)):
+        if not (flags & bit):
+            continue
+        if rank == src:
+            shape, dtype = _broadcast_meta(state[key], src)
+        else:
+            shape, dtype = _broadcast_meta(None, src)
+            cur = state.get(key)
+            if not isinstance(cur, torch.Tensor) or cur.shape != shape or cur.dtype != dtype:
+                state[key] = torch.empty(shape, dtype=dtype, device=p.data.device)
+        if not state[key].is_contiguous():
+            state[key] = state[key].contiguous()
+        dist.broadcast(state[key], src=src)
+
+
+def broadcast_model_state(gaussians, src: int = 0) -> None:
+    """Broadcast every piece of state that densify / prune can mutate.
+
+    Includes for every sub-model and auxiliary module:
+      * Each nn.Parameter's .data (resizing receivers if shape changed)
+      * Each parameter's Adam state (step, exp_avg, exp_avg_sq)
+      * Densification accumulators (xyz_gradient_accum, denom, max_radii2D)
+        on the Gaussian sub-models.
     """
-    for p in _iter_all_optimizer_params(gaussians):
-        if not p.data.is_contiguous():
-            p.data = p.data.contiguous()
-        dist.broadcast(p.data, src=src)
+    if not dist.is_initialized():
+        return
+
+    for model_name in gaussians.model_name_id.keys():
+        sub_model = getattr(gaussians, model_name)
+        for group in sub_model.optimizer.param_groups:
+            for p in group["params"]:
+                _broadcast_param_data(p, src)
+                _broadcast_opt_state(sub_model.optimizer, p, src)
+        for attr in ("xyz_gradient_accum", "denom", "max_radii2D"):
+            if hasattr(sub_model, attr):
+                _broadcast_attr_tensor(sub_model, attr, src)
+
+    for module in _auxiliary_modules(gaussians):
+        for group in module.optimizer.param_groups:
+            for p in group["params"]:
+                _broadcast_param_data(p, src)
+                _broadcast_opt_state(module.optimizer, p, src)
+
+
+# Back-compat alias: train.py used to call broadcast_model_params.
+broadcast_model_params = broadcast_model_state
 
 
 # ---------------------------------------------------------------------------

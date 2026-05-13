@@ -20,7 +20,7 @@ from lib.config import cfg
 import torch.distributed as dist
 from lib.utils.dist_utils import (
     setup_distributed, cleanup_distributed, is_distributed, is_main_process,
-    all_reduce_gradients, sync_densification_stats, broadcast_model_params,
+    all_reduce_gradients, sync_densification_stats, broadcast_model_state,
     sync_grad_scaler,
 )
 from lib.models.mvs import depth_propagation, check_geometric_consistency, read_propagted_depth, depth_propagation_old
@@ -957,7 +957,10 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             _flag = torch.tensor([1 if _propagation_ran else 0], device='cuda')
             dist.broadcast(_flag, src=0)
             if _flag.item():
-                broadcast_model_params(gaussians, src=0)
+                # rank 0 ran depth-propagation densify; sync the full state
+                # (param data + Adam state + densify accumulators) so other
+                # ranks pick up the new tensor shapes.
+                broadcast_model_state(gaussians, src=0)
             del _flag
 
 
@@ -1158,15 +1161,26 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 if iteration > optim_args.densify_from_iter:
                     if iteration % optim_args.densification_interval == 0:
                         if is_distributed():
+                            # Aggregate densification accumulators so rank 0
+                            # makes the decision using the full data.
                             sync_densification_stats(gaussians)
-                            # Deterministic RNG so all ranks make identical decisions
-                            torch.manual_seed(iteration)
-                            torch.cuda.manual_seed(iteration)
-                        scalars, tensors = gaussians.densify_and_prune(
-                            max_grad=optim_args.densify_grad_threshold,
-                            min_opacity=optim_args.min_opacity,
-                            prune_big_points=prune_big_points,
-                        )
+                            if is_main_process():
+                                scalars, tensors = gaussians.densify_and_prune(
+                                    max_grad=optim_args.densify_grad_threshold,
+                                    min_opacity=optim_args.min_opacity,
+                                    prune_big_points=prune_big_points,
+                                )
+                            else:
+                                scalars, tensors = {}, {}
+                            # Broadcast the new param shapes / data / optimizer
+                            # state / accumulators so every rank matches rank 0.
+                            broadcast_model_state(gaussians, src=0)
+                        else:
+                            scalars, tensors = gaussians.densify_and_prune(
+                                max_grad=optim_args.densify_grad_threshold,
+                                min_opacity=optim_args.min_opacity,
+                                prune_big_points=prune_big_points,
+                            )
 
                         scalar_dict.update(scalars)
                         tensor_dict.update(tensors)
