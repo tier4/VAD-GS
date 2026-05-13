@@ -203,26 +203,6 @@ def _broadcast_meta(t: torch.Tensor | None, src: int) -> tuple[tuple[int, ...], 
     return shape, dtype
 
 
-def _broadcast_param_data(p: torch.nn.Parameter, src: int) -> None:
-    """Broadcast p.data from src; replace it on receivers if shape/dtype changed.
-
-    When the shape changes we also drop p.grad: the gradient was computed
-    against the old param shape and would mismatch exp_avg / exp_avg_sq in
-    the next optimizer.step(). Setting it to None makes Adam skip this
-    param for the current iter (rank 0 also has grad=None on the freshly-
-    constructed nn.Parameter after densify_and_prune), which lines up
-    behaviour across ranks.
-    """
-    rank = dist.get_rank()
-    shape, dtype = _broadcast_meta(p.data if rank == src else None, src)
-    if rank != src and (p.data.shape != shape or p.data.dtype != dtype):
-        p.data = torch.empty(shape, dtype=dtype, device=p.data.device)
-        p.grad = None
-    if not p.data.is_contiguous():
-        p.data = p.data.contiguous()
-    dist.broadcast(p.data, src=src)
-
-
 def _broadcast_attr_tensor(obj, attr: str, src: int) -> None:
     """Broadcast obj.<attr> from src; reassign on receivers if shape/dtype changed."""
     rank = dist.get_rank()
@@ -278,12 +258,74 @@ def _broadcast_opt_state(opt: torch.optim.Optimizer, p: torch.nn.Parameter, src:
         dist.broadcast(state[key], src=src)
 
 
+# Gaussian sub-model attributes that may hold one of the optimizer params.
+# When we rebuild a Parameter on a receiver we walk this list to find which
+# attribute pointed at the old object so we can redirect it to the new one.
+_GAUSSIAN_PARAM_ATTRS = (
+    "_xyz", "_features_dc", "_features_rest",
+    "_opacity", "_scaling", "_rotation", "_semantic",
+)
+
+
+def _broadcast_gaussian_sub_model(sub_model, src: int) -> None:
+    """Sync a Gaussian sub-model whose params may change shape after densify.
+
+    Rebuilding the Parameter object on the receiver (instead of just
+    reassigning .data) is important: PyTorch attaches an AccumulateGrad
+    node to a leaf tensor with the leaf's shape baked in; reusing the same
+    Parameter with a swapped-out .data leaves stale shape metadata behind
+    and the next backward dies in validate_outputs with a CatBackward
+    shape mismatch. densify_and_prune on rank 0 already constructs fresh
+    Parameters (see densification_postfix / _prune_optimizer), so we mirror
+    that on the receivers.
+    """
+    rank = dist.get_rank()
+    opt = sub_model.optimizer
+
+    for group in opt.param_groups:
+        for i in range(len(group["params"])):
+            p = group["params"][i]
+            shape, dtype = _broadcast_meta(p.data if rank == src else None, src)
+            if rank != src and (p.data.shape != shape or p.data.dtype != dtype):
+                new_param = torch.nn.Parameter(
+                    torch.empty(shape, dtype=dtype, device=p.data.device)
+                )
+                if p in opt.state:
+                    opt.state[new_param] = opt.state.pop(p)
+                group["params"][i] = new_param
+                for attr_name in _GAUSSIAN_PARAM_ATTRS:
+                    if getattr(sub_model, attr_name, None) is p:
+                        setattr(sub_model, attr_name, new_param)
+                        break
+                p = new_param
+            if not p.data.is_contiguous():
+                p.data = p.data.contiguous()
+            dist.broadcast(p.data, src=src)
+            _broadcast_opt_state(opt, p, src)
+
+    for attr in ("xyz_gradient_accum", "denom", "max_radii2D"):
+        if hasattr(sub_model, attr):
+            _broadcast_attr_tensor(sub_model, attr, src)
+
+
+def _broadcast_fixed_shape_module(module, src: int) -> None:
+    """Aux modules (actor_pose, sky_cubemap, color_correction, pose_correction)
+    have fixed-shape parameters that densify does not touch; broadcast their
+    .data and Adam state directly without the shape-change dance."""
+    for group in module.optimizer.param_groups:
+        for p in group["params"]:
+            if not p.data.is_contiguous():
+                p.data = p.data.contiguous()
+            dist.broadcast(p.data, src=src)
+            _broadcast_opt_state(module.optimizer, p, src)
+
+
 def broadcast_model_state(gaussians, src: int = 0) -> None:
     """Broadcast every piece of state that densify / prune can mutate.
 
     Includes for every sub-model and auxiliary module:
-      * Each nn.Parameter's .data (resizing receivers if shape changed)
-      * Each parameter's Adam state (step, exp_avg, exp_avg_sq)
+      * Each nn.Parameter (rebuilt on receivers if shape changed)
+      * Each parameter's Adam state (exp_avg, exp_avg_sq)
       * Densification accumulators (xyz_gradient_accum, denom, max_radii2D)
         on the Gaussian sub-models.
     """
@@ -291,20 +333,10 @@ def broadcast_model_state(gaussians, src: int = 0) -> None:
         return
 
     for model_name in gaussians.model_name_id.keys():
-        sub_model = getattr(gaussians, model_name)
-        for group in sub_model.optimizer.param_groups:
-            for p in group["params"]:
-                _broadcast_param_data(p, src)
-                _broadcast_opt_state(sub_model.optimizer, p, src)
-        for attr in ("xyz_gradient_accum", "denom", "max_radii2D"):
-            if hasattr(sub_model, attr):
-                _broadcast_attr_tensor(sub_model, attr, src)
+        _broadcast_gaussian_sub_model(getattr(gaussians, model_name), src)
 
     for module in _auxiliary_modules(gaussians):
-        for group in module.optimizer.param_groups:
-            for p in group["params"]:
-                _broadcast_param_data(p, src)
-                _broadcast_opt_state(module.optimizer, p, src)
+        _broadcast_fixed_shape_module(module, src)
 
 
 # Back-compat alias: train.py used to call broadcast_model_params.
