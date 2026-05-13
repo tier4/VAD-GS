@@ -1,0 +1,85 @@
+# wandb sweep config for VAD-GS T4 training.
+#
+# Usage:
+#   1. Create the sweep:
+#        SWEEP_ID=$(python script/sweep/sweep_init.py configs/sweep/t4_sweep.yaml)
+#   2. Launch N parallel agents (one per GPU):
+#        NUM_AGENTS=8 SWEEP_ID=$SWEEP_ID bash script/sweep/sweep_launch.sh
+#
+# The agent invokes script/sweep/sweep_run.py, which loads
+# configs/sweep/base.yaml as the baseline and overrides the keys
+# listed under `parameters` below using yacs `key value` format.
+
+# entity / project are normally pulled from .env (WANDB_ENTITY / WANDB_PROJECT)
+# by script/sweep/sweep_init.py, so they are intentionally NOT hardcoded here.
+program: script/sweep/sweep_run.py
+method: bayes
+
+metric:
+  # Run-level summary written by training_report() after each test eval.
+  # Reflects the best test-view PSNR observed during the run.
+  name: test/test_view/best_psnr
+  goal: maximize
+
+# wandb agent will pass each sampled config as `--key=value` CLI args.
+# sweep_run.py reads them back via wandb.config and converts to yacs opts.
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --base-config
+  - configs/sweep/base.yaml
+  - ${args}
+
+# Early stop weak runs once we have signal.
+early_terminate:
+  type: hyperband
+  min_iter: 3000
+  eta: 3
+
+parameters:
+  # Densification thresholds. Lower threshold => more clones/splits.
+  optim.densify_grad_threshold_bkgd:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.002
+  optim.densify_grad_threshold_obj:
+    distribution: log_uniform_values
+    min: 0.00002
+    max: 0.0005
+
+  # Opacity reset cadence: aggressive reset prunes too hard, but never
+  # resetting leaves stale Gaussians. Search this carefully.
+  optim.opacity_reset_interval:
+    values: [2000, 3000, 5000, 8000]
+
+  # Densify horizon as a fraction of total iters is controlled by
+  # densify_until_iter; sweep both endpoints for the prune window.
+  optim.densify_until_iter:
+    values: [7500, 10000, 11500]
+
+  # Learning rates: small ranges around defaults.
+  optim.position_lr_init:
+    distribution: log_uniform_values
+    min: 8.0e-06
+    max: 3.2e-05
+  optim.feature_lr:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.005
+  optim.opacity_lr:
+    distribution: log_uniform_values
+    min: 0.02
+    max: 0.1
+  optim.scaling_lr:
+    distribution: log_uniform_values
+    min: 0.002
+    max: 0.01
+
+  # Loss weights.
+  optim.lambda_dssim:
+    values: [0.1, 0.2, 0.3]
+  optim.lambda_depth_lidar:
+    values: [0.0, 0.05, 0.1, 0.2]
+  optim.lambda_sky:
+    values: [0.025, 0.05, 0.1]

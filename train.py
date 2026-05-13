@@ -92,6 +92,30 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+try:
+    import wandb as _wandb
+    WANDB_FOUND = True
+except ImportError:
+    _wandb = None
+    WANDB_FOUND = False
+
+
+def _wandb_active() -> bool:
+    """True when a wandb run has been initialised (by the sweep wrapper)."""
+    return WANDB_FOUND and getattr(_wandb, "run", None) is not None
+
+
+def _wandb_log(payload: dict, step: int | None = None) -> None:
+    if not _wandb_active():
+        return
+    try:
+        if step is not None:
+            _wandb.log(payload, step=step)
+        else:
+            _wandb.log(payload)
+    except Exception as exc:
+        print(f"[wandb] log failed: {exc}")
+
 
 def monitor_resources(
     interval: float = 1.0,
@@ -1332,6 +1356,14 @@ def prepare_output_and_logger() -> SummaryWriter | None:
         tb_writer = SummaryWriter(cfg.record_dir)
     else:
         print("Tensorboard not available: not logging progress")
+
+    if _wandb_active():
+        try:
+            _wandb.run.summary["model_path"] = cfg.model_path
+            _wandb.run.summary["record_dir"] = cfg.record_dir
+            _wandb.run.summary["exp_name"] = cfg.exp_name
+        except Exception as exc:
+            print(f"[wandb] summary init failed: {exc}")
     return tb_writer
 
 def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stats: dict[str, float], tensor_stats: dict[str, torch.Tensor], testing_iterations: list[int], scene: Scene, renderer: StreetGaussianRenderer) -> None:
@@ -1343,6 +1375,9 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                 tb_writer.add_histogram('train/' + key, value, iteration)
         except:
             print('Failed to write to tensorboard')
+
+    if _wandb_active() and scalar_stats:
+        _wandb_log({f"train/{k}": float(v) for k, v in scalar_stats.items()}, step=iteration)
             
             
     # Report test and samples of training set
@@ -1377,9 +1412,25 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
+                if _wandb_active():
+                    metric_prefix = config['name']  # e.g. "test/test_view" or "test/train_view"
+                    _wandb_log({
+                        f"{metric_prefix}/psnr": float(psnr_test),
+                        f"{metric_prefix}/l1_loss": float(l1_test),
+                    }, step=iteration)
+                    if _wandb.run is not None:
+                        # Track best PSNR per split as a run-level summary for sweep ranking.
+                        summary_key = f"{metric_prefix}/best_psnr"
+                        prev = _wandb.run.summary.get(summary_key)
+                        if prev is None or float(psnr_test) > float(prev):
+                            _wandb.run.summary[summary_key] = float(psnr_test)
+                            _wandb.run.summary[f"{metric_prefix}/best_psnr_iter"] = iteration
+
         if tb_writer:
             tb_writer.add_histogram("test/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('test/points_total', scene.gaussians.get_xyz.shape[0], iteration)
+        if _wandb_active():
+            _wandb_log({"test/points_total": int(scene.gaussians.get_xyz.shape[0])}, step=iteration)
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
