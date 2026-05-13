@@ -204,11 +204,20 @@ def _broadcast_meta(t: torch.Tensor | None, src: int) -> tuple[tuple[int, ...], 
 
 
 def _broadcast_param_data(p: torch.nn.Parameter, src: int) -> None:
-    """Broadcast p.data from src; replace it on receivers if shape/dtype changed."""
+    """Broadcast p.data from src; replace it on receivers if shape/dtype changed.
+
+    When the shape changes we also drop p.grad: the gradient was computed
+    against the old param shape and would mismatch exp_avg / exp_avg_sq in
+    the next optimizer.step(). Setting it to None makes Adam skip this
+    param for the current iter (rank 0 also has grad=None on the freshly-
+    constructed nn.Parameter after densify_and_prune), which lines up
+    behaviour across ranks.
+    """
     rank = dist.get_rank()
     shape, dtype = _broadcast_meta(p.data if rank == src else None, src)
     if rank != src and (p.data.shape != shape or p.data.dtype != dtype):
         p.data = torch.empty(shape, dtype=dtype, device=p.data.device)
+        p.grad = None
     if not p.data.is_contiguous():
         p.data = p.data.contiguous()
     dist.broadcast(p.data, src=src)
