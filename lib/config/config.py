@@ -43,6 +43,7 @@ cfg.train.quiet = False
 cfg.train.checkpoint_iterations = [30000]
 cfg.train.start_checkpoint = None
 cfg.train.importance_sampling = False
+cfg.train.preload_vram = False  # if True, preload all train views to VRAM at startup (single-GPU). Distributed always preloads.
 
 cfg.optim = CN()
 cfg.optim.use_amp = False # If set to True, use Automatic Mixed Precision (AMP) for training.

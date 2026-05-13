@@ -268,15 +268,24 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             obj_model.grape_trellis.set_param(dataset.scene_info.metadata["c2ws"], dataset.scene_info.metadata["ixts"], selected_frames, cams_per_frame=cams_per_frame)
     N_bkgd_init = gaussians.background.get_xyz.shape[0]
 
-    # --- Multi-GPU: partition views and preload to VRAM -------------------
-    if is_distributed():
+    # --- View preload to VRAM ---------------------------------------------
+    # Distributed always preloads (it is the only way data-parallel ranks
+    # stay aligned). Single-GPU preloads when cfg.train.preload_vram is set,
+    # which is the default for sweep runs to avoid 8 parallel agents each
+    # re-decoding jpegs and reading guidance off disk every iteration.
+    preload_vram = is_distributed() or training_args.get("preload_vram", False)
+    if preload_vram:
         all_train_cams = scene.getTrainCameras()
         all_train_cams_sorted = sorted(all_train_cams, key=lambda c: c.id)
-        local_cameras = all_train_cams_sorted[rank::world_size]
+        if is_distributed():
+            local_cameras = all_train_cams_sorted[rank::world_size]
+            preload_label = f"{len(local_cameras)} views per GPU ({len(all_train_cams)} total / {world_size} GPUs)"
+        else:
+            local_cameras = all_train_cams_sorted
+            preload_label = f"{len(local_cameras)} views (single-GPU)"
 
         if is_main_process():
-            print(f"Preloading {len(local_cameras)} views per GPU to VRAM "
-                  f"({len(all_train_cams)} total / {world_size} GPUs)")
+            print(f"Preloading {preload_label} to VRAM")
 
         for cam in local_cameras:
             # Trigger lazy loading of image and all guidance data
@@ -293,7 +302,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         if is_main_process():
             print(f"VRAM preload complete for {len(local_cameras)} views")
     else:
-        local_cameras = None  # not used in single-GPU mode
+        local_cameras = None  # lazy-load every iter
 
     viewpoint_stack = None
     check_interval = 0
@@ -308,7 +317,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if is_distributed():
+        if preload_vram:
             if not viewpoint_stack:
                 viewpoint_stack = list(local_cameras)
                 random.shuffle(viewpoint_stack)
@@ -1316,8 +1325,9 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 gc.collect()
 
             # End-of-iteration cleanup: free lazily-loaded data to prevent RAM accumulation.
-            # In multi-GPU mode, data is preloaded to VRAM — skip unloading.
-            if not is_distributed():
+            # Skip unloading when views are preloaded — otherwise we'd defeat
+            # the whole point of the preload by re-reading from disk next iter.
+            if not preload_vram:
                 if hasattr(viewpoint_cam.guidance, 'unload'):
                     viewpoint_cam.guidance.unload()
                 viewpoint_cam.unload_image()

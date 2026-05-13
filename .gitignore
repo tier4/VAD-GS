@@ -13,3 +13,5 @@ log_gpu.py
 viewer/tiles
 .env
 .env.local
+
+wandb

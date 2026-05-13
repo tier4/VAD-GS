@@ -64,6 +64,10 @@ train:
   test_iterations: [3000, 10000, 25000, 50000]
   save_iterations: [50000]
   checkpoint_iterations: [50000]
+  # Sweep agents are CPU/disk-bound when 8 of them lazy-load jpegs from the
+  # same dataset every iter. Preloading all train views to VRAM removes the
+  # contention at the cost of ~7GB per GPU (well within H100's 80GB).
+  preload_vram: true
 
 optim:
   use_amp: false
