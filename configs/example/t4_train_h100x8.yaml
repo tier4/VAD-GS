@@ -72,9 +72,14 @@ optim:
   prop_voxel_interval: 5
 
   densify_from_iter: 64           # ~500/8
-  densify_grad_threshold_bkgd: 0.001
+  # Multi-GPU averages gradients across world_size=8, so single-GPU
+  # densify thresholds end up ~8x too strict in absolute terms — fewer
+  # Gaussians get cloned/split, which combined with the same prune cadence
+  # left training in a net-prune regime and dragged PSNR down. Scale the
+  # thresholds by 1/world_size so densify and prune balance again.
+  densify_grad_threshold_bkgd: 0.000125  # was 0.001 (single-GPU)
   densify_grad_abs_bkgd: True
-  densify_grad_threshold_obj: 0.0002
+  densify_grad_threshold_obj: 0.000025   # was 0.0002 (single-GPU)
   densify_grad_abs_obj: False
   densify_until_iter: 5000        # 40000/8
 
@@ -90,7 +95,12 @@ optim:
   max_screen_size: 20
   min_opacity: 0.01
   opacity_lr: 0.05
-  opacity_reset_interval: 625     # 5000/8
+  # opacity_reset is shock therapy, not data-proportional: scaling it by
+  # 1/8 fired the "reset → recover → prune" cycle far too often (every
+  # 625 iter ≒ once per ~9 view-stack epochs) and chewed Gaussians
+  # before they could rebuild opacity. Keep it closer to the single-GPU
+  # 5000-iter cadence.
+  opacity_reset_interval: 3000     # was 625 (overly aggressive)
   percent_big_ws: 0.1
   percent_dense: 0.01
   position_lr_delay_mult: 0.01
