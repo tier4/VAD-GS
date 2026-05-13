@@ -28,7 +28,14 @@ def parse_cfg(cfg, args):
     # Under torchrun, LOCAL_RANK is set and each process must see all GPUs so
     # that torch.cuda.set_device(local_rank) resolves correctly; the launcher
     # already handles per-process device assignment.
-    if -1 not in cfg.gpus and 'LOCAL_RANK' not in os.environ:
+    # Likewise, if the caller already pinned CUDA_VISIBLE_DEVICES (e.g. the
+    # wandb sweep launcher sets it per-agent so 8 jobs land on 8 GPUs), do
+    # not clobber it with cfg.gpus (which defaults to [0]).
+    if (
+        -1 not in cfg.gpus
+        and 'LOCAL_RANK' not in os.environ
+        and 'CUDA_VISIBLE_DEVICES' not in os.environ
+    ):
         os.environ['CUDA_VISIBLE_DEVICES'] = ', '.join([str(gpu) for gpu in cfg.gpus])
 
     if cfg.debug:
