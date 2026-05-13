@@ -20,6 +20,11 @@
 #                           symlinked into each run's model_path. Exported
 #                           to every agent so they share preprocessing.
 #                           Default: output/t4_exp/tokyo_teleport_h100x8
+#   THREADS_PER_AGENT       OpenMP/MKL/OpenBLAS thread cap per agent.
+#                           Default: nproc / NUM_AGENTS. Without this each
+#                           PyTorch process tries to grab every CPU core,
+#                           and 8 of them oversubscribe the machine into
+#                           uselessness (load avg > 300, GPU util ~0%).
 
 set -euo pipefail
 
@@ -32,6 +37,15 @@ LOG_DIR="${LOG_DIR:-output/sweep_logs}"
 COUNT="${COUNT:-}"
 VAD_GS_SWEEP_CACHE_FROM="${VAD_GS_SWEEP_CACHE_FROM:-output/t4_exp/tokyo_teleport_h100x8}"
 export VAD_GS_SWEEP_CACHE_FROM
+
+# Cap per-agent thread count so 8 PyTorch processes do not oversubscribe
+# the box. nproc returns logical cores; default to floor(nproc / NUM_AGENTS).
+TOTAL_CPUS="$(nproc 2>/dev/null || echo 8)"
+THREADS_PER_AGENT="${THREADS_PER_AGENT:-$((TOTAL_CPUS / NUM_AGENTS))}"
+if [[ "$THREADS_PER_AGENT" -lt 1 ]]; then
+    THREADS_PER_AGENT=1
+fi
+echo "[launch] $TOTAL_CPUS logical CPUs / $NUM_AGENTS agents = $THREADS_PER_AGENT threads/agent"
 
 mkdir -p "$LOG_DIR"
 
@@ -79,10 +93,20 @@ for i in $(seq 0 $((NUM_AGENTS - 1))); do
 
     if [[ -n "$COUNT" ]]; then
         CUDA_VISIBLE_DEVICES="$gpu" \
+        OMP_NUM_THREADS="$THREADS_PER_AGENT" \
+        MKL_NUM_THREADS="$THREADS_PER_AGENT" \
+        OPENBLAS_NUM_THREADS="$THREADS_PER_AGENT" \
+        NUMEXPR_NUM_THREADS="$THREADS_PER_AGENT" \
+        VAD_GS_NUM_THREADS="$THREADS_PER_AGENT" \
             wandb agent --count "$COUNT" "$SWEEP_ID" \
             > "$log_file" 2>&1 &
     else
         CUDA_VISIBLE_DEVICES="$gpu" \
+        OMP_NUM_THREADS="$THREADS_PER_AGENT" \
+        MKL_NUM_THREADS="$THREADS_PER_AGENT" \
+        OPENBLAS_NUM_THREADS="$THREADS_PER_AGENT" \
+        NUMEXPR_NUM_THREADS="$THREADS_PER_AGENT" \
+        VAD_GS_NUM_THREADS="$THREADS_PER_AGENT" \
             wandb agent "$SWEEP_ID" \
             > "$log_file" 2>&1 &
     fi

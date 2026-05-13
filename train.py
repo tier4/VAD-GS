@@ -5,6 +5,21 @@ import torch
 from torch.amp import autocast, GradScaler
 import patchmatch_cuda
 
+# Cap PyTorch's intra-op thread pool when running as a sweep agent.
+# Multiple PyTorch processes default to grabbing every CPU core each, which
+# oversubscribes the machine into a load-avg-300 thread-contention spiral
+# (GPU goes ~idle while CPUs thrash). The launcher sets VAD_GS_NUM_THREADS
+# to floor(nproc / NUM_AGENTS); honour it here as a safety net even when
+# users invoke train.py outside the launcher.
+_vad_gs_threads = os.environ.get("VAD_GS_NUM_THREADS")
+if _vad_gs_threads:
+    try:
+        _n = max(1, int(_vad_gs_threads))
+        torch.set_num_threads(_n)
+        torch.set_num_interop_threads(min(_n, 4))
+    except (RuntimeError, ValueError):
+        pass
+
 import random
 from random import randint
 from lib.utils.loss_utils import l1_loss, l2_loss, psnr, ssim, patch_norm_mse_loss, patch_norm_mse_loss_global
