@@ -160,7 +160,12 @@ class ActorPose(nn.Module):
         if len(track_ids) == 0:
             return torch.empty(0, 4, device=self._dense_ts.device)
         if self.opt_track and camera.meta['is_val']:
-            outs = [self.get_tracking_rotation(int(t), camera) for t in track_ids]
+            # Per-id get_tracking_rotation_ returns (1, 4) when opt_track is on,
+            # because opt_rots has a trailing length-1 dim that broadcasts up
+            # through quaternion_raw_multiply_theta. Reshape to (4,) before
+            # stacking so this branch matches the (B, 4) contract of the
+            # non-val path.
+            outs = [self.get_tracking_rotation(int(t), camera).reshape(4) for t in track_ids]
             return torch.stack(outs, dim=0)
         return self._get_tracking_rotation_batched(track_ids, camera.meta['timestamp'])
 
