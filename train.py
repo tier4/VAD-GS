@@ -345,6 +345,29 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
     gaussians_renderer = StreetGaussianRenderer()
 
+    # Optional: torch.compile the renderer's .render method to capture the
+    # forward as a CUDA graph and skip the per-iter Python orchestration
+    # overhead. Gated by VAD_GS_TORCH_COMPILE because (a) 3DGS densification
+    # changes Gaussian counts mid-training, which forces compile invalidation,
+    # and (b) some object/dataset combinations cause graph breaks. Modes:
+    #   VAD_GS_TORCH_COMPILE=reduce-overhead  ← attempts CUDA graphs
+    #   VAD_GS_TORCH_COMPILE=default          ← plain compile, fuses ops
+    #   VAD_GS_TORCH_COMPILE=max-autotune     ← also tunes kernel choices
+    _compile_mode = os.environ.get("VAD_GS_TORCH_COMPILE", "")
+    if _compile_mode:
+        if is_main_process():
+            print(f"[torch.compile] wrapping renderer.render with mode={_compile_mode}")
+        try:
+            gaussians_renderer.render = torch.compile(
+                gaussians_renderer.render,
+                mode=_compile_mode,
+                dynamic=True,
+                fullgraph=False,
+            )
+        except Exception as exc:
+            if is_main_process():
+                print(f"[torch.compile] failed to wrap, falling back to eager: {exc}")
+
     use_amp = optim_args.use_amp
     scaler = GradScaler('cuda', enabled=use_amp)
     print(f'AMP (Automatic Mixed Precision): {"ON" if use_amp else "OFF"}')
