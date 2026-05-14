@@ -1065,30 +1065,35 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             with perf_section("hard_depth_step"):
                 loss_hard = 0
                 with autocast('cuda', enabled=use_amp):
-                    hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
-                    hard_depth = hard_render_pkg["depth"]
+                    with perf_section("hard_depth.render"):
+                        hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
+                        hard_depth = hard_render_pkg["depth"]
 
-                    patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
-                    if sky_mask is not None:
-                        mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
-                        hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
+                    with perf_section("hard_depth.loss"):
+                        patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
+                        if sky_mask is not None:
+                            mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
+                            hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
 
-                    loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
-                    loss_hard += 1 * loss_l2_dpt
+                        loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
+                        loss_hard += 1 * loss_l2_dpt
 
-                    loss_global = patch_norm_mse_loss_global(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
-                    loss_hard += 1 * loss_global
+                        loss_global = patch_norm_mse_loss_global(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
+                        loss_hard += 1 * loss_global
 
-                scaler.scale(loss_hard).backward()
-                if is_distributed():
-                    all_reduce_gradients(gaussians)
+                with perf_section("hard_depth.backward"):
+                    scaler.scale(loss_hard).backward()
+                    if is_distributed():
+                        all_reduce_gradients(gaussians)
                 # Optimizer step
-                if iteration < training_args.iterations:
-                    gaussians.update_optimizer(scaler=scaler if use_amp else None)
-                    if use_amp:
-                        scaler.update()
+                with perf_section("hard_depth.opt_step"):
+                    if iteration < training_args.iterations:
+                        gaussians.update_optimizer(scaler=scaler if use_amp else None)
+                        if use_amp:
+                            scaler.update()
                 del hard_render_pkg, hard_depth, loss_hard, loss_l2_dpt, loss_global
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache() removed — defensive call, ~20-50ms sync
+                # cost per iter on this dataset, and we have plenty of headroom on H100.
 
         with autocast('cuda', enabled=use_amp):
             with perf_section("main_render"):
