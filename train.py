@@ -393,7 +393,15 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             # Bound the per-camera cache via LRU eviction across all previously-visited cameras.
             # In multi-GPU mode, each rank holds few views — no eviction needed.
             if not is_distributed():
-                _lru_touch_bkgd_voxel_cache(bkgd_voxel_cache_tracker, viewpoint_cam)
+                # When we have already paid the RAM cost of preloading every
+                # train view into VRAM, holding their (much smaller) voxel
+                # depth caches is free — bump the cap so we get a 100% hit
+                # rate instead of 1/4 (which was costing ~1.6 s/iter).
+                _bkgd_cache_cap = (
+                    len(local_cameras) if (preload_vram and local_cameras is not None)
+                    else BKGD_VOXEL_CACHE_MAX
+                )
+                _lru_touch_bkgd_voxel_cache(bkgd_voxel_cache_tracker, viewpoint_cam, max_size=_bkgd_cache_cap)
         
 
         flag_global_reconstruct = False
