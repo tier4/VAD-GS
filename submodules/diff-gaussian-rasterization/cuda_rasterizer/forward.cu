@@ -337,7 +337,7 @@ __global__ void filter_preprocessCUDA(int P, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, uint32_t S_MAX>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -384,6 +384,13 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	// Accumulate semantic channels in registers (mirrors the backward kernel's
+	// accum_semantic_rec[S_MAX] pattern). Previously the per-Gaussian inner
+	// loop did `+=` directly into global memory (out_semantic[ch*H*W+pix_id])
+	// for every contributing Gaussian — that turned every pixel's per-Gaussian
+	// step into S_MAX global RMW ops, which dominated bandwidth in the render
+	// kernel. Now we accumulate locally and write to global once per pixel.
+	float Sem_acc[S_MAX] = { 0 };
 	float weight = 0;
 	float D = 0;
 
@@ -439,8 +446,10 @@ renderCUDA(
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
-			for (int ch = 0; ch < S; ch++){
-				out_semantic[ch * H * W + pix_id] += semantics[collected_id[j] * S + ch] * alpha * T;
+			// Semantic accumulation into registers (was global RMW before).
+			// S is dynamic (≤ S_MAX) so unused slots stay zero — same math.
+			for (int ch = 0; ch < S; ch++) {
+				Sem_acc[ch] += semantics[collected_id[j] * S + ch] * alpha * T;
 			}
 
 			weight += alpha * T;
@@ -463,6 +472,11 @@ renderCUDA(
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 		out_alpha[pix_id] = weight; //1 - T;
 		out_depth[pix_id] = D;
+		// Drain register semantic accumulator to global memory once.
+		// out_semantic was zero-initialised by the caller, so plain assignment
+		// matches the previous += semantics from a zero baseline.
+		for (int ch = 0; ch < S; ch++)
+			out_semantic[ch * H * W + pix_id] = Sem_acc[ch];
 	}
 }
 
@@ -483,7 +497,7 @@ void FORWARD::render(
 	float* out_depth,
 	float* out_semantic)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS, NUM_CLASSES> << <grid, block >> > (
 		ranges,
 		point_list,
 		W, H, S,
