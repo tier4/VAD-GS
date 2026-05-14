@@ -350,15 +350,23 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         # The per-camera bkgd_voxel_depth is the dominant per-iter cost
         # (~1.6s on this dataset). It is deterministic for a given
         # (camera, image_shape) under the current trellis state, so
-        # precompute it for every preloaded view here. render_voxel_depth
-        # is numpy-heavy and only reads from the trellis state, so it
-        # parallelises safely across threads (different cams write to
-        # different LazyGuidanceDicts).
+        # precompute it for every preloaded view here.
+        #
+        # NOTE: do not wrap this in a ThreadPoolExecutor. render_voxel_depth
+        # calls lib.models.trellis.parallel_rasterize, which is decorated
+        # with @njit(parallel=True) and already saturates every core via
+        # numba prange. Stacking 16 Python threads on top would oversubscribe
+        # the box (~3500 threads fighting for 224 cores) and actually slow
+        # the precompute down compared to sequential. Keep it sequential.
         _trellis = gaussians.background.grape_trellis
-
-        def _precompute_voxel_depth(cam):
+        for cam in tqdm(
+            local_cameras,
+            desc="Preload (bkgd_voxel_depth, numba-parallel)",
+            unit="view",
+            disable=not is_main_process(),
+        ):
             if "bkgd_voxel_depth" in cam.guidance:
-                return
+                continue
             img = cam.original_image
             img_H, img_W = img.shape[1], img.shape[2]
             scaled_K = cam.K.detach().cpu().numpy() if hasattr(cam.K, "detach") else cam.K.cpu().numpy()
@@ -369,17 +377,6 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 v_val.astype(np.float16),
                 v_src.astype(np.int32),
             )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_preload_workers) as pool:
-            futures = [pool.submit(_precompute_voxel_depth, cam) for cam in local_cameras]
-            for fut in tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(futures),
-                desc=f"Preload (bkgd_voxel_depth, {_preload_workers}t)",
-                unit="view",
-                disable=not is_main_process(),
-            ):
-                fut.result()
 
         if is_main_process():
             print(f"VRAM preload complete for {len(local_cameras)} views")
