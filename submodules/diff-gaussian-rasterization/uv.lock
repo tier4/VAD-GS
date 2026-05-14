@@ -1,0 +1,22 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[manifest]
+
+[[manifest.dependency-metadata]]
+name = "diff-gaussian-rasterization"
+version = "0.0.0"
+
+[[manifest.dependency-metadata]]
+name = "patchmatch-cuda"
+version = "0.0.0"
+
+[[manifest.dependency-metadata]]
+name = "simple-knn"
+version = "0.0.0"
+
+[[manifest.dependency-metadata]]
+name = "simple-waymo-open-dataset-reader"
+version = "0.0.0"
+requires-dist = ["protobuf"]
