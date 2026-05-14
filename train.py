@@ -317,6 +317,32 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
         if is_main_process():
             print(f"VRAM preload complete for {len(local_cameras)} views")
+
+        # The per-camera bkgd_voxel_depth is the dominant per-iter cost
+        # (~1.6s on this dataset). It is deterministic for a given
+        # (camera, image_shape) under the current trellis state, so
+        # precompute it for every preloaded view here. The cache cap is
+        # bumped to len(local_cameras) below, so the LRU never evicts.
+        if is_main_process():
+            print(f"Precomputing bkgd_voxel_depth for {len(local_cameras)} views")
+        _trellis = gaussians.background.grape_trellis
+        _vox_t0 = time.time()
+        for cam in local_cameras:
+            if "bkgd_voxel_depth" in cam.guidance:
+                continue
+            img = cam.original_image
+            img_H, img_W = img.shape[1], img.shape[2]
+            scaled_K = cam.K.detach().cpu().numpy() if hasattr(cam.K, "detach") else cam.K.cpu().numpy()
+            v_val, v_src, _mask, _uvs = _trellis.render_voxel_depth(
+                cam.id, img_H, img_W, scaled_K=scaled_K,
+            )
+            cam.guidance["bkgd_voxel_depth"] = (
+                v_val.astype(np.float16),
+                v_src.astype(np.int32),
+            )
+            del _mask, _uvs
+        if is_main_process():
+            print(f"bkgd_voxel_depth precompute done in {time.time() - _vox_t0:.1f}s")
     else:
         local_cameras = None  # lazy-load every iter
 
