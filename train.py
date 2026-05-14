@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import torch
 from torch.amp import autocast, GradScaler
@@ -303,18 +304,43 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         if is_main_process():
             print(f"Preloading {preload_label} to VRAM")
 
-        _preload_bar = tqdm(
-            local_cameras,
-            desc="Preload (img + guidance)",
-            unit="view",
-            disable=not is_main_process(),
-        )
-        for cam in _preload_bar:
-            # Trigger lazy loading of image and all guidance data
+        # Parallel disk read + jpeg/png/npz decode. PIL.Image.open,
+        # cv2.imread and np.load all release the GIL during their heavy
+        # work, so ThreadPoolExecutor scales near-linearly with worker
+        # count up to the disk bandwidth limit. Workers are capped at
+        # VAD_GS_PRELOAD_WORKERS (default: 16, but no more than the
+        # OMP/MKL thread cap so we do not fight the running sweep agents).
+        _preload_workers = int(os.environ.get(
+            "VAD_GS_PRELOAD_WORKERS",
+            min(16, int(os.environ.get("VAD_GS_NUM_THREADS", "16"))),
+        ))
+        _preload_workers = max(1, _preload_workers)
+
+        def _load_to_cpu(cam):
             _ = cam.original_image
             for key in list(cam.guidance.keys()):
                 _ = cam.guidance[key]
-            # Move everything to VRAM
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_preload_workers) as pool:
+            futures = [pool.submit(_load_to_cpu, cam) for cam in local_cameras]
+            for fut in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc=f"Preload (img + guidance, {_preload_workers}t)",
+                unit="view",
+                disable=not is_main_process(),
+            ):
+                fut.result()  # surface exceptions
+
+        # GPU transfer + persistent re-mark. CUDA ops serialise on the
+        # default stream anyway, so threading buys nothing here — keep
+        # sequential so failures are easy to attribute.
+        for cam in tqdm(
+            local_cameras,
+            desc="Preload (to VRAM)",
+            unit="view",
+            disable=not is_main_process(),
+        ):
             cam.set_device('cuda')
             # Re-assign via __setitem__ to mark entries as persistent
             # so they survive unload() calls.
@@ -324,18 +350,15 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         # The per-camera bkgd_voxel_depth is the dominant per-iter cost
         # (~1.6s on this dataset). It is deterministic for a given
         # (camera, image_shape) under the current trellis state, so
-        # precompute it for every preloaded view here. The cache cap is
-        # bumped to len(local_cameras) below, so the LRU never evicts.
+        # precompute it for every preloaded view here. render_voxel_depth
+        # is numpy-heavy and only reads from the trellis state, so it
+        # parallelises safely across threads (different cams write to
+        # different LazyGuidanceDicts).
         _trellis = gaussians.background.grape_trellis
-        _vox_bar = tqdm(
-            local_cameras,
-            desc="Preload (bkgd_voxel_depth)",
-            unit="view",
-            disable=not is_main_process(),
-        )
-        for cam in _vox_bar:
+
+        def _precompute_voxel_depth(cam):
             if "bkgd_voxel_depth" in cam.guidance:
-                continue
+                return
             img = cam.original_image
             img_H, img_W = img.shape[1], img.shape[2]
             scaled_K = cam.K.detach().cpu().numpy() if hasattr(cam.K, "detach") else cam.K.cpu().numpy()
@@ -346,7 +369,17 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 v_val.astype(np.float16),
                 v_src.astype(np.int32),
             )
-            del _mask, _uvs
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_preload_workers) as pool:
+            futures = [pool.submit(_precompute_voxel_depth, cam) for cam in local_cameras]
+            for fut in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc=f"Preload (bkgd_voxel_depth, {_preload_workers}t)",
+                unit="view",
+                disable=not is_main_process(),
+            ):
+                fut.result()
 
         if is_main_process():
             print(f"VRAM preload complete for {len(local_cameras)} views")
