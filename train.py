@@ -356,6 +356,46 @@ def training(rank: int = 0, world_size: int = 1) -> None:
     viewpoint_stack = None
     check_interval = 0
     check_history = 0
+
+    # Optional torch.profiler integration for operator-level breakdown.
+    # Enable with VAD_GS_TORCH_PROFILE_ITERS=N (and optionally _WARMUP=M, _OUT=dir).
+    # Writes a Chrome/Perfetto trace to <out>/<host>.<pid>.<count>.json.gz that can be
+    # loaded into chrome://tracing or https://ui.perfetto.dev, and prints a top-N
+    # operator summary to stdout when the active phase ends. After the trace fires,
+    # train.py exits — this is purely a profiling mode.
+    _torch_profile_iters = int(os.environ.get("VAD_GS_TORCH_PROFILE_ITERS", "0"))
+    _torch_profile_warmup = int(os.environ.get("VAD_GS_TORCH_PROFILE_WARMUP", "5"))
+    _torch_prof = None
+    _torch_profile_dir = None
+    if _torch_profile_iters > 0:
+        _torch_profile_dir = os.environ.get(
+            "VAD_GS_TORCH_PROFILE_OUT",
+            os.path.join("output", "perf", "torch_profile_" + time.strftime("%Y%m%d_%H%M%S")),
+        )
+        os.makedirs(_torch_profile_dir, exist_ok=True)
+        _torch_prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=0,
+                warmup=_torch_profile_warmup,
+                active=_torch_profile_iters,
+                repeat=1,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(_torch_profile_dir),
+            record_shapes=False,
+            with_stack=False,
+            profile_memory=False,
+        )
+        _torch_prof.start()
+        if is_main_process():
+            print(
+                f"[torch.profiler] warmup={_torch_profile_warmup}, active={_torch_profile_iters}, "
+                f"out={_torch_profile_dir} — train.py will exit after trace is written."
+            )
+
     for iteration in range(start_iter, training_args.iterations + 1):
 
         iter_start.record()
@@ -1412,6 +1452,25 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 viewpoint_cam.unload_image()
 
         perf_iter_end()
+
+        # torch.profiler step + early exit once the active phase has finished.
+        if _torch_prof is not None:
+            _torch_prof.step()
+            # warmup + active + 1 step required for on_trace_ready to fire.
+            _done = (iteration - start_iter + 1) >= (_torch_profile_warmup + _torch_profile_iters + 1)
+            if _done:
+                _torch_prof.stop()
+                if is_main_process():
+                    print("\n[torch.profiler] active phase complete; top ops by CUDA time:")
+                    print(_torch_prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+                    print("\n[torch.profiler] top ops by CPU time:")
+                    print(_torch_prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
+                    print(f"\n[torch.profiler] trace written under {_torch_profile_dir}")
+                    print("[torch.profiler] view in https://ui.perfetto.dev or chrome://tracing")
+                # Profile mode is a one-shot; everything past this point is
+                # checkpoint / final-state machinery we do not need for a trace.
+                import sys as _sys
+                _sys.exit(0)
 
 
 def prepare_output_and_logger() -> SummaryWriter | None:
