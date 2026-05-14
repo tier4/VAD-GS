@@ -1174,11 +1174,16 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
 
             scalar_dict = dict()
+            # Defer .item() syncs — each one drains the CUDA stream. Stash
+            # scalar tensors here and resolve them all with a single
+            # torch.stack(...).cpu() after backward(). Cuts per-iter D2H
+            # syncs from ~6 to 1.
+            _pending_scalars: list[tuple[str, torch.Tensor]] = []
 
             # rgb loss
             with perf_section("loss_rgb"):
                 Ll1 = l1_loss(image, gt_image, mask=loss_mask)
-                scalar_dict['l1_loss'] = Ll1.item()
+                _pending_scalars.append(('l1_loss', Ll1.detach()))
                 loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
 
             # shape_pena = (gaussians.get_scaling.max(dim=1).values / gaussians.get_scaling.min(dim=1).values).mean()
@@ -1194,7 +1199,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                     sky_loss = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc)).mean()
                     if len(optim_args.lambda_sky_scale) > 0:
                         sky_loss *= optim_args.lambda_sky_scale[viewpoint_cam.meta['cam']]
-                    scalar_dict['sky_loss'] = sky_loss.item()
+                    _pending_scalars.append(('sky_loss', sky_loss.detach()))
                     loss += optim_args.lambda_sky * sky_loss
 
             with perf_section("loss_obj_acc"):
@@ -1206,7 +1211,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                     obj_acc_loss = torch.where(torch.any(dynamic_mask != 255, axis=0), # obj_bound,
                         -(acc_obj * torch.log(acc_obj) +  (1. - acc_obj) * torch.log(1. - acc_obj)),
                         -torch.log(1. - acc_obj)).mean()
-                    scalar_dict['obj_acc_loss'] = obj_acc_loss.item()
+                    _pending_scalars.append(('obj_acc_loss', obj_acc_loss.detach()))
                     loss += optim_args.lambda_reg * obj_acc_loss
                     del image_obj, acc_obj
 
@@ -1221,7 +1226,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                         depth_error = torch.abs((expected_depth[depth_mask] - lidar_depth[depth_mask]))
                         depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
                         lidar_depth_loss = depth_error.mean()
-                        scalar_dict['lidar_depth_loss'] = lidar_depth_loss.item()
+                        _pending_scalars.append(('lidar_depth_loss', lidar_depth_loss.detach()))
                         loss += optim_args.lambda_depth_lidar * lidar_depth_loss
                         del expected_depth, depth_error, lidar_depth_loss
 
@@ -1231,7 +1236,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                         depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
                         depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
                         voxel_depth_loss = depth_error.mean()
-                        scalar_dict['lidar_depth_loss'] = voxel_depth_loss.item()
+                        _pending_scalars.append(('lidar_depth_loss', voxel_depth_loss.detach()))
                         loss += optim_args.lambda_depth_lidar * voxel_depth_loss
                         del expected_depth, depth_error, voxel_depth_loss
 
@@ -1240,7 +1245,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             with perf_section("loss_color_correction"):
                 if optim_args.lambda_color_correction > 0 and gaussians.use_color_correction:
                     color_correction_reg_loss = gaussians.color_correction.regularization_loss(viewpoint_cam)
-                    scalar_dict['color_correction_reg_loss'] = color_correction_reg_loss.item()
+                    _pending_scalars.append(('color_correction_reg_loss', color_correction_reg_loss.detach()))
                     loss += optim_args.lambda_color_correction * color_correction_reg_loss
 
             with perf_section("loss_normal"):
@@ -1260,14 +1265,29 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                         lambda_cos_normal = 0.02
                         loss += lambda_l1_normal * l1_normal + lambda_cos_normal * cos_normal
 
-                        viewpoint_cam.guidance['mono_normal'] = mono_normal.cpu()
+                        # NOTE: mono_normal[sky_mask] = -10 mutates the cached
+                        # guidance tensor in place — that mutation already
+                        # persists across iters when preload_vram is on, so
+                        # the old `guidance['mono_normal'] = mono_normal.cpu()`
+                        # line was a redundant per-iter D2H copy. Dropped.
 
-        scalar_dict['loss'] = loss.item()
+        _pending_scalars.append(('loss', loss.detach()))
 
         with perf_section("backward"):
             scaler.scale(loss).backward()
             if is_distributed():
                 all_reduce_gradients(gaussians)
+
+        # Batch-resolve all loss scalars stashed during the autocast block in
+        # a single D2H copy. Done after backward so the forward graph is
+        # already consumed and we are not blocking gradient computation.
+        with perf_section("resolve_scalars"):
+            if _pending_scalars:
+                _keys = [k for k, _ in _pending_scalars]
+                _vals = torch.stack([v for _, v in _pending_scalars]).float().cpu().tolist()
+                for _k, _v in zip(_keys, _vals):
+                    scalar_dict[_k] = float(_v)
+                _pending_scalars.clear()
 
         iter_end.record()
 
@@ -1306,18 +1326,24 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             # Log
             tensor_dict = dict()
 
-            if iteration % 10 == 0:                    
-                # Progress bar
-                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            # Progress bar update: psnr() + ssim() add several kernels and a
+            # .item() sync each iter at the old % 10 cadence. Bump to % 100 so
+            # the bar still gives a live signal but its cost amortises 10x.
+            # Re-use scalar_dict['loss'] (already on CPU from the batch resolve)
+            # so we do not introduce another loss.item() sync here.
+            if iteration % 100 == 0:
+                cur_loss = scalar_dict.get('loss', float('nan'))
+                if not np.isnan(cur_loss):
+                    ema_loss_for_log = 0.4 * cur_loss + 0.6 * ema_loss_for_log
                 if np.isnan(ema_loss_for_log):
-                    ema_loss_for_log = loss.item()
+                    ema_loss_for_log = cur_loss
 
                 ema_psnr_for_log = 0.4 * psnr(image, gt_image, loss_mask).mean().float().item() + 0.6 * ema_psnr_for_log
                 if np.isnan(ema_psnr_for_log):
                     ema_psnr_for_log = psnr(image, gt_image, loss_mask).mean().float().item()
-                
-                progress_bar.set_postfix({"Exp": f"{cfg.task}-{cfg.exp_name}", 
-                                          "Loss": f"{ema_loss_for_log:.{7}f},", 
+
+                progress_bar.set_postfix({"Exp": f"{cfg.task}-{cfg.exp_name}",
+                                          "Loss": f"{ema_loss_for_log:.{7}f},",
                                           "PSNR": f"{ema_psnr_for_log:.{4}f}",
                                           "SSIM": f"{ssim(image, gt_image):.{4}f}",
                                           "GS":  str(gaussians.background.get_xyz.shape[0])
