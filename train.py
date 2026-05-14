@@ -120,18 +120,22 @@ def _bkgd_voxel_cache_load(cache_dir: str, cam_id: int, H: int, W: int):
 def _bkgd_voxel_cache_save(cache_dir: str, cam_id: int, H: int, W: int,
                            v_val: np.ndarray, v_src: np.ndarray) -> None:
     path = _bkgd_voxel_cache_file(cache_dir, cam_id, H, W)
-    tmp = path + f".tmp.{os.getpid()}"
+    # numpy.savez_compressed silently appends ".npz" if the filename does not
+    # already end in ".npz" — so include the suffix explicitly to keep the
+    # path numpy actually writes in sync with what we rename below.
+    tmp = path + f".tmp.{os.getpid()}.npz"
     try:
         np.savez_compressed(tmp, value=v_val.astype(np.float16),
                             source=v_src.astype(np.int32))
         os.replace(tmp, path)  # atomic on POSIX
     except OSError:
         # Best-effort: cleanup the tmp file if rename failed.
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+        for candidate in (tmp, tmp + ".npz"):
+            if os.path.exists(candidate):
+                try:
+                    os.remove(candidate)
+                except OSError:
+                    pass
 
 
 def _bkgd_voxel_cache_init(trellis) -> tuple[str, bool]:
