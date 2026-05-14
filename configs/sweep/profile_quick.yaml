@@ -1,0 +1,13 @@
+parent_cfg: configs/sweep/base.yaml
+
+# Profile-only run: short schedule so the perf timer prints a few
+# representative buckets and exits. Same model / dataset / preload as
+# the real sweep, but no checkpoints / test evals.
+exp_name: profile_quick
+
+train:
+  iterations: 500
+  test_iterations: [9999999]   # effectively disabled
+  save_iterations: [9999999]
+  checkpoint_iterations: [9999999]
+  preload_vram: true

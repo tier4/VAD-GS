@@ -27,6 +27,7 @@ from lib.utils.img_utils import save_img_torch, visualize_depth_numpy
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer
 from lib.models.street_gaussian_model import StreetGaussianModel
 from lib.utils.general_utils import safe_state
+from lib.utils.perf_timer import perf_section, perf_iter_end
 from lib.utils.camera_utils import Camera
 from lib.utils.cfg_utils import save_cfg
 from lib.models.scene import Scene
@@ -332,64 +333,67 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if preload_vram:
-            if not viewpoint_stack:
-                viewpoint_stack = list(local_cameras)
-                random.shuffle(viewpoint_stack)
-                view_stack_iter += 1
-        else:
-            if not viewpoint_stack:
-                viewpoint_stack = scene.getTrainCameras().copy()
-                view_stack_iter += 1
+        with perf_section("camera_pick"):
+            if preload_vram:
+                if not viewpoint_stack:
+                    viewpoint_stack = list(local_cameras)
+                    random.shuffle(viewpoint_stack)
+                    view_stack_iter += 1
+            else:
+                if not viewpoint_stack:
+                    viewpoint_stack = scene.getTrainCameras().copy()
+                    view_stack_iter += 1
 
-        viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-        randidx = viewpoint_cam.id
+            viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+            randidx = viewpoint_cam.id
 
-        gt_image = viewpoint_cam.original_image
-        gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
-        loss_mask = viewpoint_cam.guidance['mask'] if 'mask' in viewpoint_cam.guidance else torch.ones_like(gt_image[0:1]).bool()
-        loss_mask = loss_mask.cuda(non_blocking=True) if not loss_mask.is_cuda else loss_mask
-        lidar_depth = None
-        sky_mask = None
-        dynamic_mask = None
-        seg_bkgd_mask = None
-        mono_depth = None
-        mono_normal = None
-        if 'lidar_depth' in viewpoint_cam.guidance:
-            lidar_depth = viewpoint_cam.guidance['lidar_depth']
-            lidar_depth = lidar_depth.cuda(non_blocking=True) if not lidar_depth.is_cuda else lidar_depth
-        if 'sky_mask' in viewpoint_cam.guidance:
-            sky_mask = viewpoint_cam.guidance['sky_mask']
-            sky_mask = sky_mask.cuda(non_blocking=True) if not sky_mask.is_cuda else sky_mask
-        # if 'obj_bound' in viewpoint_cam.guidance:
-        #     obj_bound = viewpoint_cam.guidance['obj_bound']
-        #     obj_bound = obj_bound.cuda(non_blocking=True) if not obj_bound.is_cuda else obj_bound
-        if 'dynamic_mask' in viewpoint_cam.guidance:
-            dynamic_mask = viewpoint_cam.guidance['dynamic_mask']
-            dynamic_mask = dynamic_mask.cuda(non_blocking=True) if not dynamic_mask.is_cuda else dynamic_mask
-        if "seg_bkgd" in viewpoint_cam.guidance:
-            seg_bkgd_mask = viewpoint_cam.guidance['seg_bkgd']
+        with perf_section("guidance_load"):
+            gt_image = viewpoint_cam.original_image
+            gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
+            loss_mask = viewpoint_cam.guidance['mask'] if 'mask' in viewpoint_cam.guidance else torch.ones_like(gt_image[0:1]).bool()
+            loss_mask = loss_mask.cuda(non_blocking=True) if not loss_mask.is_cuda else loss_mask
+            lidar_depth = None
+            sky_mask = None
+            dynamic_mask = None
+            seg_bkgd_mask = None
+            mono_depth = None
+            mono_normal = None
+            if 'lidar_depth' in viewpoint_cam.guidance:
+                lidar_depth = viewpoint_cam.guidance['lidar_depth']
+                lidar_depth = lidar_depth.cuda(non_blocking=True) if not lidar_depth.is_cuda else lidar_depth
+            if 'sky_mask' in viewpoint_cam.guidance:
+                sky_mask = viewpoint_cam.guidance['sky_mask']
+                sky_mask = sky_mask.cuda(non_blocking=True) if not sky_mask.is_cuda else sky_mask
+            # if 'obj_bound' in viewpoint_cam.guidance:
+            #     obj_bound = viewpoint_cam.guidance['obj_bound']
+            #     obj_bound = obj_bound.cuda(non_blocking=True) if not obj_bound.is_cuda else obj_bound
+            if 'dynamic_mask' in viewpoint_cam.guidance:
+                dynamic_mask = viewpoint_cam.guidance['dynamic_mask']
+                dynamic_mask = dynamic_mask.cuda(non_blocking=True) if not dynamic_mask.is_cuda else dynamic_mask
+            if "seg_bkgd" in viewpoint_cam.guidance:
+                seg_bkgd_mask = viewpoint_cam.guidance['seg_bkgd']
 
-        if "mono_depth" in viewpoint_cam.guidance:
-            mono_depth = viewpoint_cam.guidance['mono_depth']
-            mono_depth = mono_depth.cuda(non_blocking=True) if not mono_depth.is_cuda else mono_depth
-        if "mono_normal" in viewpoint_cam.guidance:
-            mono_normal = viewpoint_cam.guidance['mono_normal']
-            mono_normal = mono_normal.cuda(non_blocking=True) if not mono_normal.is_cuda else mono_normal
-            # if not viewpoint_cam.guidance['mono_normal'].is_cuda:
-            #     viewpoint_cam.guidance['mono_normal'] = viewpoint_cam.guidance['mono_normal'].cuda(non_blocking=True)
+            if "mono_depth" in viewpoint_cam.guidance:
+                mono_depth = viewpoint_cam.guidance['mono_depth']
+                mono_depth = mono_depth.cuda(non_blocking=True) if not mono_depth.is_cuda else mono_depth
+            if "mono_normal" in viewpoint_cam.guidance:
+                mono_normal = viewpoint_cam.guidance['mono_normal']
+                mono_normal = mono_normal.cuda(non_blocking=True) if not mono_normal.is_cuda else mono_normal
+                # if not viewpoint_cam.guidance['mono_normal'].is_cuda:
+                #     viewpoint_cam.guidance['mono_normal'] = viewpoint_cam.guidance['mono_normal'].cuda(non_blocking=True)
 
-        current_view, img_H, img_W = randidx, gt_image.shape[1], gt_image.shape[2]
-        if "bkgd_voxel_depth" not in viewpoint_cam.guidance:
-            voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W, scaled_K=viewpoint_cam.K.cpu().numpy())
-            # Cache only pixel-level data (~3 MB); voxel-level data (mask_visible, uvs)
-            # is ~37 MB per camera and only needed for propagation — recomputed on demand.
-            viewpoint_cam.guidance["bkgd_voxel_depth"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32))
-            del mask_visible, uvs
-        # Bound the per-camera cache via LRU eviction across all previously-visited cameras.
-        # In multi-GPU mode, each rank holds few views — no eviction needed.
-        if not is_distributed():
-            _lru_touch_bkgd_voxel_cache(bkgd_voxel_cache_tracker, viewpoint_cam)
+        with perf_section("voxel_depth_cache"):
+            current_view, img_H, img_W = randidx, gt_image.shape[1], gt_image.shape[2]
+            if "bkgd_voxel_depth" not in viewpoint_cam.guidance:
+                voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W, scaled_K=viewpoint_cam.K.cpu().numpy())
+                # Cache only pixel-level data (~3 MB); voxel-level data (mask_visible, uvs)
+                # is ~37 MB per camera and only needed for propagation — recomputed on demand.
+                viewpoint_cam.guidance["bkgd_voxel_depth"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32))
+                del mask_visible, uvs
+            # Bound the per-camera cache via LRU eviction across all previously-visited cameras.
+            # In multi-GPU mode, each rank holds few views — no eviction needed.
+            if not is_distributed():
+                _lru_touch_bkgd_voxel_cache(bkgd_voxel_cache_tracker, viewpoint_cam)
         
 
         flag_global_reconstruct = False
@@ -405,9 +409,10 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         # if view_stack_iter in check_views : # and iteration % optim_args.propagation_interval == 0:
         if not _skip_propagation and view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end:
             _propagation_ran = True
-            soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
-            image = soft_render_pkg["rgb"]
-            _similarity = ssim(image, gt_image, mask=loss_mask)
+            with perf_section("propagation_probe"):
+                soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
+                image = soft_render_pkg["rgb"]
+                _similarity = ssim(image, gt_image, mask=loss_mask)
             if _similarity < 0.8:
             # if _similarity > 0.8:
             #     continue
@@ -1016,43 +1021,46 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
 
         if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end and "mono_depth" in viewpoint_cam.guidance:
-            loss_hard = 0
-            with autocast('cuda', enabled=use_amp):
-                hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
-                hard_depth = hard_render_pkg["depth"]
+            with perf_section("hard_depth_step"):
+                loss_hard = 0
+                with autocast('cuda', enabled=use_amp):
+                    hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
+                    hard_depth = hard_render_pkg["depth"]
 
-                patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
-                if sky_mask is not None:
-                    mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
-                    hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
+                    patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
+                    if sky_mask is not None:
+                        mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
+                        hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
 
-                loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
-                loss_hard += 1 * loss_l2_dpt
+                    loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
+                    loss_hard += 1 * loss_l2_dpt
 
-                loss_global = patch_norm_mse_loss_global(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
-                loss_hard += 1 * loss_global
+                    loss_global = patch_norm_mse_loss_global(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), 0.01)
+                    loss_hard += 1 * loss_global
 
-            scaler.scale(loss_hard).backward()
-            if is_distributed():
-                all_reduce_gradients(gaussians)
-            # Optimizer step
-            if iteration < training_args.iterations:
-                gaussians.update_optimizer(scaler=scaler if use_amp else None)
-                if use_amp:
-                    scaler.update()
-            del hard_render_pkg, hard_depth, loss_hard, loss_l2_dpt, loss_global
-            torch.cuda.empty_cache()
+                scaler.scale(loss_hard).backward()
+                if is_distributed():
+                    all_reduce_gradients(gaussians)
+                # Optimizer step
+                if iteration < training_args.iterations:
+                    gaussians.update_optimizer(scaler=scaler if use_amp else None)
+                    if use_amp:
+                        scaler.update()
+                del hard_render_pkg, hard_depth, loss_hard, loss_l2_dpt, loss_global
+                torch.cuda.empty_cache()
 
         with autocast('cuda', enabled=use_amp):
-            soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
-            image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
+            with perf_section("main_render"):
+                soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
+                image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
 
             scalar_dict = dict()
 
             # rgb loss
-            Ll1 = l1_loss(image, gt_image, mask=loss_mask)
-            scalar_dict['l1_loss'] = Ll1.item()
-            loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
+            with perf_section("loss_rgb"):
+                Ll1 = l1_loss(image, gt_image, mask=loss_mask)
+                scalar_dict['l1_loss'] = Ll1.item()
+                loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
 
             # shape_pena = (gaussians.get_scaling.max(dim=1).values / gaussians.get_scaling.min(dim=1).values).mean()
             # scale_pena = ((gaussians.get_scaling.max(dim=1, keepdim=True).values)**2).mean()
@@ -1061,80 +1069,86 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
 
             # sky loss
-            if optim_args.lambda_sky > 0 and gaussians.include_sky and sky_mask is not None:
-                acc = torch.clamp(acc, min=1e-6, max=1.-1e-6)
-                sky_loss = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc)).mean()
-                if len(optim_args.lambda_sky_scale) > 0:
-                    sky_loss *= optim_args.lambda_sky_scale[viewpoint_cam.meta['cam']]
-                scalar_dict['sky_loss'] = sky_loss.item()
-                loss += optim_args.lambda_sky * sky_loss
+            with perf_section("loss_sky"):
+                if optim_args.lambda_sky > 0 and gaussians.include_sky and sky_mask is not None:
+                    acc = torch.clamp(acc, min=1e-6, max=1.-1e-6)
+                    sky_loss = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc)).mean()
+                    if len(optim_args.lambda_sky_scale) > 0:
+                        sky_loss *= optim_args.lambda_sky_scale[viewpoint_cam.meta['cam']]
+                    scalar_dict['sky_loss'] = sky_loss.item()
+                    loss += optim_args.lambda_sky * sky_loss
 
-            if optim_args.lambda_reg > 0 and gaussians.include_obj and iteration >= optim_args.densify_until_iter:
-                render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=False)
-                image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
-                del render_pkg_obj
-                acc_obj = torch.clamp(acc_obj, min=1e-6, max=1.-1e-6)
-                obj_acc_loss = torch.where(torch.any(dynamic_mask != 255, axis=0), # obj_bound,
-                    -(acc_obj * torch.log(acc_obj) +  (1. - acc_obj) * torch.log(1. - acc_obj)),
-                    -torch.log(1. - acc_obj)).mean()
-                scalar_dict['obj_acc_loss'] = obj_acc_loss.item()
-                loss += optim_args.lambda_reg * obj_acc_loss
-                del image_obj, acc_obj
+            with perf_section("loss_obj_acc"):
+                if optim_args.lambda_reg > 0 and gaussians.include_obj and iteration >= optim_args.densify_until_iter:
+                    render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=False)
+                    image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
+                    del render_pkg_obj
+                    acc_obj = torch.clamp(acc_obj, min=1e-6, max=1.-1e-6)
+                    obj_acc_loss = torch.where(torch.any(dynamic_mask != 255, axis=0), # obj_bound,
+                        -(acc_obj * torch.log(acc_obj) +  (1. - acc_obj) * torch.log(1. - acc_obj)),
+                        -torch.log(1. - acc_obj)).mean()
+                    scalar_dict['obj_acc_loss'] = obj_acc_loss.item()
+                    loss += optim_args.lambda_reg * obj_acc_loss
+                    del image_obj, acc_obj
 
 
 
             # lidar depth loss
-            if optim_args.lambda_depth_lidar > 0:
-                if optim_args.use_lidar_depth and lidar_depth is not None:
-                    depth_mask = torch.logical_and((lidar_depth > 0.), loss_mask)
-                    expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)
-                    depth_error = torch.abs((expected_depth[depth_mask] - lidar_depth[depth_mask]))
-                    depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
-                    lidar_depth_loss = depth_error.mean()
-                    scalar_dict['lidar_depth_loss'] = lidar_depth_loss.item()
-                    loss += optim_args.lambda_depth_lidar * lidar_depth_loss
-                    del expected_depth, depth_error, lidar_depth_loss
+            with perf_section("loss_depth"):
+                if optim_args.lambda_depth_lidar > 0:
+                    if optim_args.use_lidar_depth and lidar_depth is not None:
+                        depth_mask = torch.logical_and((lidar_depth > 0.), loss_mask)
+                        expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)
+                        depth_error = torch.abs((expected_depth[depth_mask] - lidar_depth[depth_mask]))
+                        depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
+                        lidar_depth_loss = depth_error.mean()
+                        scalar_dict['lidar_depth_loss'] = lidar_depth_loss.item()
+                        loss += optim_args.lambda_depth_lidar * lidar_depth_loss
+                        del expected_depth, depth_error, lidar_depth_loss
 
-                if optim_args.use_voxel_depth:
-                    depth_mask = torch.logical_and((voxel_depth_tensor > 0.), loss_mask)
-                    expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)
-                    depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
-                    depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
-                    voxel_depth_loss = depth_error.mean()
-                    scalar_dict['lidar_depth_loss'] = voxel_depth_loss.item()
-                    loss += optim_args.lambda_depth_lidar * voxel_depth_loss
-                    del expected_depth, depth_error, voxel_depth_loss
+                    if optim_args.use_voxel_depth:
+                        depth_mask = torch.logical_and((voxel_depth_tensor > 0.), loss_mask)
+                        expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)
+                        depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
+                        depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
+                        voxel_depth_loss = depth_error.mean()
+                        scalar_dict['lidar_depth_loss'] = voxel_depth_loss.item()
+                        loss += optim_args.lambda_depth_lidar * voxel_depth_loss
+                        del expected_depth, depth_error, voxel_depth_loss
 
 
             # color correction loss
-            if optim_args.lambda_color_correction > 0 and gaussians.use_color_correction:
-                color_correction_reg_loss = gaussians.color_correction.regularization_loss(viewpoint_cam)
-                scalar_dict['color_correction_reg_loss'] = color_correction_reg_loss.item()
-                loss += optim_args.lambda_color_correction * color_correction_reg_loss
+            with perf_section("loss_color_correction"):
+                if optim_args.lambda_color_correction > 0 and gaussians.use_color_correction:
+                    color_correction_reg_loss = gaussians.color_correction.regularization_loss(viewpoint_cam)
+                    scalar_dict['color_correction_reg_loss'] = color_correction_reg_loss.item()
+                    loss += optim_args.lambda_color_correction * color_correction_reg_loss
 
-            if optim_args.normal_loss:
-                if mono_normal is not None and 'normals' in soft_render_pkg:
-                    rendered_normal = soft_render_pkg['normals']
-                    normal_gt = mono_normal #
-                    if sky_mask is not None: # if viewpoint_cam.sky_mask is not None:
-                        filter_mask = sky_mask.to(normal_gt.device).to(torch.bool)
-                        normal_gt[(filter_mask.repeat(3, 1, 1))] = -10
+            with perf_section("loss_normal"):
+                if optim_args.normal_loss:
+                    if mono_normal is not None and 'normals' in soft_render_pkg:
+                        rendered_normal = soft_render_pkg['normals']
+                        normal_gt = mono_normal #
+                        if sky_mask is not None: # if viewpoint_cam.sky_mask is not None:
+                            filter_mask = sky_mask.to(normal_gt.device).to(torch.bool)
+                            normal_gt[(filter_mask.repeat(3, 1, 1))] = -10
 
-                    filter_mask = (normal_gt != -10)[0, :, :].to(torch.bool)
-                    l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
-                    cos_normal = (1. - torch.sum(rendered_normal * normal_gt, dim = 0))[filter_mask].mean()
+                        filter_mask = (normal_gt != -10)[0, :, :].to(torch.bool)
+                        l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
+                        cos_normal = (1. - torch.sum(rendered_normal * normal_gt, dim = 0))[filter_mask].mean()
 
-                    lambda_l1_normal = 0.02
-                    lambda_cos_normal = 0.02
-                    loss += lambda_l1_normal * l1_normal + lambda_cos_normal * cos_normal
+                        lambda_l1_normal = 0.02
+                        lambda_cos_normal = 0.02
+                        loss += lambda_l1_normal * l1_normal + lambda_cos_normal * cos_normal
 
-                    viewpoint_cam.guidance['mono_normal'] = mono_normal.cpu()
+                        viewpoint_cam.guidance['mono_normal'] = mono_normal.cpu()
 
         scalar_dict['loss'] = loss.item()
 
-        scaler.scale(loss).backward()
-        if is_distributed():
-            all_reduce_gradients(gaussians)
+        with perf_section("backward"):
+            scaler.scale(loss).backward()
+            if is_distributed():
+                all_reduce_gradients(gaussians)
 
         iter_end.record()
 
@@ -1200,39 +1214,41 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
             # Densification
             if iteration < optim_args.densify_until_iter:
-                gaussians.set_visibility(include_list=list(set(gaussians.model_name_id.keys()) - set(['sky'])))
-                gaussians.set_max_radii2D(radii, visibility_filter)
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                with perf_section("densify_stats"):
+                    gaussians.set_visibility(include_list=list(set(gaussians.model_name_id.keys()) - set(['sky'])))
+                    gaussians.set_max_radii2D(radii, visibility_filter)
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
                 
                 prune_big_points = iteration > optim_args.opacity_reset_interval
 
                 if iteration > optim_args.densify_from_iter:
                     if iteration % optim_args.densification_interval == 0:
-                        if is_distributed():
-                            # Aggregate densification accumulators so rank 0
-                            # makes the decision using the full data.
-                            sync_densification_stats(gaussians)
-                            if is_main_process():
+                        with perf_section("densify_and_prune"):
+                            if is_distributed():
+                                # Aggregate densification accumulators so rank 0
+                                # makes the decision using the full data.
+                                sync_densification_stats(gaussians)
+                                if is_main_process():
+                                    scalars, tensors = gaussians.densify_and_prune(
+                                        max_grad=optim_args.densify_grad_threshold,
+                                        min_opacity=optim_args.min_opacity,
+                                        prune_big_points=prune_big_points,
+                                    )
+                                else:
+                                    scalars, tensors = {}, {}
+                                # Broadcast the new param shapes / data / optimizer
+                                # state / accumulators so every rank matches rank 0.
+                                broadcast_model_state(gaussians, src=0)
+                            else:
                                 scalars, tensors = gaussians.densify_and_prune(
                                     max_grad=optim_args.densify_grad_threshold,
                                     min_opacity=optim_args.min_opacity,
                                     prune_big_points=prune_big_points,
                                 )
-                            else:
-                                scalars, tensors = {}, {}
-                            # Broadcast the new param shapes / data / optimizer
-                            # state / accumulators so every rank matches rank 0.
-                            broadcast_model_state(gaussians, src=0)
-                        else:
-                            scalars, tensors = gaussians.densify_and_prune(
-                                max_grad=optim_args.densify_grad_threshold,
-                                min_opacity=optim_args.min_opacity,
-                                prune_big_points=prune_big_points,
-                            )
 
-                        scalar_dict.update(scalars)
-                        tensor_dict.update(tensors)
-                        
+                            scalar_dict.update(scalars)
+                            tensor_dict.update(tensors)
+
             # Reset opacity
             if iteration < optim_args.densify_until_iter:
                 if iteration % optim_args.opacity_reset_interval == 0:
@@ -1241,12 +1257,14 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                     gaussians.reset_opacity()
 
             if is_main_process():
-                training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer)
+                with perf_section("training_report"):
+                    training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer)
             del scalar_dict, tensor_dict, soft_render_pkg, image, acc, viewspace_point_tensor, visibility_filter, radii, loss
 
             # Optimizer step
             if iteration < training_args.iterations:
-                gaussians.update_optimizer(scaler=scaler if use_amp else None)
+                with perf_section("optimizer_step"):
+                    gaussians.update_optimizer(scaler=scaler if use_amp else None)
                 if use_amp:
                     scaler.update()
                     if is_distributed():
@@ -1346,6 +1364,8 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 if hasattr(viewpoint_cam.guidance, 'unload'):
                     viewpoint_cam.guidance.unload()
                 viewpoint_cam.unload_image()
+
+        perf_iter_end()
 
 
 def prepare_output_and_logger() -> SummaryWriter | None:
