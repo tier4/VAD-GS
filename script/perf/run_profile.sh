@@ -41,14 +41,7 @@ LOG_FILE="$PERF_DIR/perf_$(date +%Y%m%d_%H%M%S).log"
 
 # Symlink preprocess cache (input_ply, colmap) into the run's model_path so
 # we do not rebuild COLMAP every time we kick off a profile run.
-EXP_NAME="$(python - <<'PY'
-import sys, yaml
-with open(sys.argv[1]) as f:
-    cfg = yaml.safe_load(f)
-print(cfg.get('exp_name', 'profile_quick'))
-PY
-"$CONFIG")"
-TASK="$(python - <<'PY'
+read -r EXP_NAME TASK < <(uv run python - "$CONFIG" <<'PY'
 import sys, yaml
 def load(path):
     with open(path) as f:
@@ -56,12 +49,14 @@ def load(path):
 cfg = load(sys.argv[1])
 parent = cfg.get('parent_cfg')
 if parent:
+    # parent_cfg in yaml is interpreted relative to cwd by yacs make_cfg,
+    # and run_profile.sh cd's to the repo root before this call.
     base = load(parent)
     base.update(cfg)
     cfg = base
-print(cfg.get('task', 't4_exp'))
+print(cfg.get('exp_name', 'profile_quick'), cfg.get('task', 't4_exp'))
 PY
-"$CONFIG")"
+)
 MODEL_DIR="output/$TASK/$EXP_NAME"
 mkdir -p "$MODEL_DIR"
 for d in input_ply colmap; do
