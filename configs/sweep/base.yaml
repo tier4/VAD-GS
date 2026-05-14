@@ -61,7 +61,10 @@ model:
 # ~min_iter*eta, ...) so the early-stop signal lands on real evals.
 train:
   iterations: 50000
-  test_iterations: [3000, 10000, 25000, 50000]
+  # Aligned with the hyperband rungs in t4_sweep.yaml
+  # (min_iter=10000, eta=2 => {10000, 20000, 40000, 50000}) so the
+  # early-stop decision lands on a real test evaluation.
+  test_iterations: [10000, 20000, 40000, 50000]
   save_iterations: [50000]
   checkpoint_iterations: [50000]
   # Sweep agents are CPU/disk-bound when 8 of them lazy-load jpegs from the

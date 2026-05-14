@@ -6,6 +6,18 @@
 # parameters (percent_dense, percent_big_ws, min_opacity, ...) that affect
 # how aggressively foreground Gaussians clone, split, and survive pruning.
 #
+# Bias correction (2026-05-14): the previous version had three problems
+# that systematically pushed runs toward "fewer Gaussians":
+#   1. hyperband min_iter=3000 cut runs before densification even started.
+#   2. metric was best_psnr (max across rungs), so early-killed sparse
+#      runs registered their peak and competed with full-length runs.
+#   3. parameter ranges allowed an effectively "do not densify / prune
+#      everything" regime (e.g. densify_grad_threshold_obj up to 1e-3,
+#      min_opacity up to 0.05).
+# This revision pushes the first hyperband cut out to iter 10000 (after
+# meaningful densification), switches the metric to the final-rung psnr,
+# and tightens the param ranges to the densify-friendly half.
+#
 # Loss weights and LRs are intentionally *not* swept here — those affect
 # everything globally; once a good densification operating point is found
 # we can sweep them in a second pass.
@@ -26,9 +38,11 @@ program: script/sweep/sweep_run.py
 method: bayes
 
 metric:
-  # Run-level summary written by training_report() after each test eval.
-  # Reflects the best test-view PSNR observed during the run.
-  name: test/test_view/best_psnr
+  # Latest test-view PSNR (the value logged at the most recent
+  # test_iteration). Pairing this with hyperband below means only the
+  # surviving runs' iter-50000 PSNR competes — runs killed at an early
+  # rung cannot win with their iter-10000 reading.
+  name: test/test_view/psnr
   goal: maximize
 
 # wandb agent will pass each sampled config as `--key=value` CLI args.
@@ -42,13 +56,15 @@ command:
   - ${args}
 
 # Early stop weak runs once we have signal.
-# With min_iter=3000 and eta=3, the rung iterations land roughly at
-# {3000, 9000, 27000, 50000} — matching the test_iterations in base.yaml
-# so the early-stop decision is taken at a real test eval.
+# With min_iter=10000 and eta=2, the rung iterations land at
+# {10000, 20000, 40000, 50000} — matching the test_iterations in base.yaml.
+# The first cut now happens *after* densification has had time to play out
+# (densify_from_iter <= 500 + 10000 iters of clones/splits), so growth-
+# oriented runs are no longer killed before their density matters.
 early_terminate:
   type: hyperband
-  min_iter: 3000
-  eta: 3
+  min_iter: 10000
+  eta: 2
 
 parameters:
   # ----- Foreground-only knobs -----------------------------------------
@@ -56,11 +72,12 @@ parameters:
   # Object-side gradient threshold for clone/split. Lower => more
   # foreground Gaussians get cloned/split. This is the single biggest
   # knob for foreground geometry quality.
-  # Default 2.0e-4; sweep over ~1 decade either side.
+  # Default 2.0e-4; sweep on the *densify-friendly* half — upper bound
+  # capped at 3e-4 (was 1e-3, which effectively disabled obj densify).
   optim.densify_grad_threshold_obj:
     distribution: log_uniform_values
-    min: 2.0e-05
-    max: 1.0e-03
+    min: 5.0e-05
+    max: 3.0e-04
 
   # AbsGS-style absolute-gradient densification on objects: ranks
   # candidates by |∂L/∂μ| instead of ∂L/∂μ. Sometimes catches
@@ -79,28 +96,31 @@ parameters:
     values: [0.005, 0.01, 0.02, 0.03]
 
   # Big-point pruning aggressiveness (world-space). Lower => prune more
-  # aggressively; foreground often needs this looser so vehicles /
-  # pedestrians don't get cleared mid-training.
+  # aggressively. Foreground often needs this looser so vehicles /
+  # pedestrians don't get cleared mid-training, so the aggressive end
+  # (0.05, 0.1) is removed.
   optim.percent_big_ws:
-    values: [0.05, 0.1, 0.2, 0.4]
+    values: [0.2, 0.4]
 
   # Opacity prune threshold. Lower keeps more low-opacity points alive
-  # long enough to recover; higher prunes faster.
+  # long enough to recover; higher prunes faster. Upper bound capped
+  # at 0.02 (was 0.05 — 10× default, aggressive).
   optim.min_opacity:
     distribution: log_uniform_values
-    min: 0.005
-    max: 0.05
+    min: 0.003
+    max: 0.02
 
   # Screen-space big-point pruning. 0 disables, otherwise larger keeps
-  # bigger projected Gaussians (helps foreground at close range).
+  # bigger projected Gaussians. The aggressive end (20) is removed —
+  # foreground at close range loses too much detail there.
   optim.max_screen_size:
-    values: [0, 20, 40, 80]
+    values: [0, 40, 80]
 
-  # Tiny-radii pruning. 0 disables. 1 prunes 1-pixel splats. Larger
-  # values prune more aggressively — foreground sometimes loses
-  # detail when this is non-zero.
+  # Tiny-radii pruning. 0 disables. 1 prunes 1-pixel splats. The
+  # aggressive value (2) is removed since it noticeably eats foreground
+  # detail.
   optim.prune_small_radii:
-    values: [0, 1, 2]
+    values: [0, 1]
 
   # ----- Densification schedule ----------------------------------------
 
@@ -109,14 +129,17 @@ parameters:
   optim.densification_interval:
     values: [50, 100, 200]
 
-  # When to start densifying. Later start lets initial bkgd PLY warm up.
+  # When to start densifying. Late starts (1000) are removed — with the
+  # hyperband cut at 10000, runs that only get ~8000 iters of growth
+  # before the rung lose to runs that got 9500-9750.
   optim.densify_from_iter:
-    values: [250, 500, 1000]
+    values: [250, 500]
 
-  # When to stop densifying. Later end means more foreground refinement
-  # but risks oscillation against opacity-reset.
+  # When to stop densifying. Late end means more foreground refinement
+  # but risks oscillation against opacity-reset. 25000 removed — too
+  # short relative to the 50k total budget.
   optim.densify_until_iter:
-    values: [25000, 35000, 40000, 45000]
+    values: [35000, 40000, 45000]
 
   # Opacity reset cadence: aggressive reset prunes too hard, but never
   # resetting leaves stale Gaussians.
