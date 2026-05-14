@@ -61,11 +61,117 @@ marker_queue: queue.Queue[str] = queue.Queue()
 
 ############################
 import gc
+import json
 import shutil
 from collections import OrderedDict
 from plyfile import PlyData, PlyElement
 inverse_opacity = lambda x: np.log(x/(1-x))
 inverse_scale = lambda x: np.log(x)
+
+
+# --- Persistent disk cache for bkgd_voxel_depth ---------------------------
+# Recomputing render_voxel_depth costs ~1.6s per camera on this dataset.
+# The output is deterministic for a given (camera_id, image_shape,
+# trellis state), so persist it under the *dataset*'s preprocessed/ tree
+# (shared across runs of the same dataset, including all sweep agents).
+def _bkgd_voxel_cache_dir() -> str:
+    return os.path.join(cfg.source_path, "preprocessed", "bkgd_voxel_depth")
+
+
+def _bkgd_voxel_cache_signature(trellis) -> dict:
+    """Fingerprint that determines whether cached files are still valid.
+
+    Built from (a) the bkgd PLY file's mtime + size (cheap and stable) and
+    (b) the trellis voxel-grid summary. If any of these change the cache
+    is invalidated and rebuilt.
+    """
+    ply_path = os.path.join(cfg.model_path, "input_ply", "points3D_bkgd.ply")
+    try:
+        st = os.stat(ply_path)
+        ply_id = f"{st.st_mtime_ns}-{st.st_size}"
+    except OSError:
+        ply_id = "missing"
+    return {
+        "ply": ply_id,
+        "voxel_size": float(getattr(trellis, "voxel_size", 0.0)),
+        "n_voxels": int(trellis.get_voxel_size()),
+    }
+
+
+def _bkgd_voxel_cache_file(cache_dir: str, cam_id: int, H: int, W: int) -> str:
+    return os.path.join(cache_dir, f"cam_{cam_id}_{H}x{W}.npz")
+
+
+def _bkgd_voxel_cache_load(cache_dir: str, cam_id: int, H: int, W: int):
+    path = _bkgd_voxel_cache_file(cache_dir, cam_id, H, W)
+    if not os.path.exists(path):
+        return None
+    try:
+        with np.load(path) as z:
+            return (
+                z["value"].astype(np.float16),
+                z["source"].astype(np.int32),
+            )
+    except Exception:
+        # Corrupt file (partial write, etc.) — fall through to recompute.
+        return None
+
+
+def _bkgd_voxel_cache_save(cache_dir: str, cam_id: int, H: int, W: int,
+                           v_val: np.ndarray, v_src: np.ndarray) -> None:
+    path = _bkgd_voxel_cache_file(cache_dir, cam_id, H, W)
+    tmp = path + f".tmp.{os.getpid()}"
+    try:
+        np.savez_compressed(tmp, value=v_val.astype(np.float16),
+                            source=v_src.astype(np.int32))
+        os.replace(tmp, path)  # atomic on POSIX
+    except OSError:
+        # Best-effort: cleanup the tmp file if rename failed.
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _bkgd_voxel_cache_init(trellis) -> tuple[str, bool]:
+    """Ensure the cache dir exists and matches the current trellis state.
+
+    Returns (cache_dir, signature_matched). When the signature did not
+    match we wipe stale ``cam_*.npz`` files and write the new signature.
+    """
+    cache_dir = _bkgd_voxel_cache_dir()
+    sig_path = os.path.join(cache_dir, "_signature.json")
+    sig = _bkgd_voxel_cache_signature(trellis)
+
+    cached_sig = None
+    if os.path.exists(sig_path):
+        try:
+            with open(sig_path, "r") as f:
+                cached_sig = json.load(f)
+        except Exception:
+            cached_sig = None
+
+    matched = (cached_sig == sig)
+    if not matched:
+        if os.path.exists(cache_dir):
+            for name in os.listdir(cache_dir):
+                if name.startswith("cam_") and name.endswith(".npz"):
+                    try:
+                        os.remove(os.path.join(cache_dir, name))
+                    except OSError:
+                        pass
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            tmp_sig = sig_path + f".tmp.{os.getpid()}"
+            with open(tmp_sig, "w") as f:
+                json.dump(sig, f, indent=2)
+            os.replace(tmp_sig, sig_path)
+        except OSError as exc:
+            print(f"[bkgd_voxel_cache] WARNING: could not write signature: {exc}")
+    else:
+        os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir, matched
 
 # LRU cap for the bkgd_voxel_depth guidance cache. Each entry is ~3-15 MB
 # (float16 depth + int32 source arrays scaled with image resolution). Keeping
@@ -349,19 +455,28 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
         # The per-camera bkgd_voxel_depth is the dominant per-iter cost
         # (~1.6s on this dataset). It is deterministic for a given
-        # (camera, image_shape) under the current trellis state, so
-        # precompute it for every preloaded view here.
+        # (camera, image_shape) under the current trellis state, so we:
         #
-        # NOTE: do not wrap this in a ThreadPoolExecutor. render_voxel_depth
-        # calls lib.models.trellis.parallel_rasterize, which is decorated
-        # with @njit(parallel=True) and already saturates every core via
-        # numba prange. Stacking 16 Python threads on top would oversubscribe
-        # the box (~3500 threads fighting for 224 cores) and actually slow
-        # the precompute down compared to sequential. Keep it sequential.
+        #   1. Try to load the npz from a persistent disk cache under
+        #      <source_path>/preprocessed/bkgd_voxel_depth/. That cache is
+        #      shared across every run of the same dataset (all sweep
+        #      agents, all reruns) so the ~14 min precompute is paid
+        #      once, not once per run.
+        #   2. On miss, call render_voxel_depth (numba-parallel internally
+        #      — do not wrap in a ThreadPoolExecutor; it oversubscribes)
+        #      and write the result back to disk for the next run.
         _trellis = gaussians.background.grape_trellis
+        _vox_cache_dir, _vox_cache_matched = _bkgd_voxel_cache_init(_trellis)
+        if is_main_process():
+            print(
+                f"[bkgd_voxel_cache] dir={_vox_cache_dir} "
+                f"(signature_match={_vox_cache_matched})"
+            )
+        _vox_hits = 0
+        _vox_misses = 0
         for cam in tqdm(
             local_cameras,
-            desc="Preload (bkgd_voxel_depth, numba-parallel)",
+            desc="Preload (bkgd_voxel_depth, disk-cached)",
             unit="view",
             disable=not is_main_process(),
         ):
@@ -369,14 +484,24 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 continue
             img = cam.original_image
             img_H, img_W = img.shape[1], img.shape[2]
+            cached = None
+            if _vox_cache_matched:
+                cached = _bkgd_voxel_cache_load(_vox_cache_dir, cam.id, img_H, img_W)
+            if cached is not None:
+                cam.guidance["bkgd_voxel_depth"] = cached
+                _vox_hits += 1
+                continue
             scaled_K = cam.K.detach().cpu().numpy() if hasattr(cam.K, "detach") else cam.K.cpu().numpy()
             v_val, v_src, _mask, _uvs = _trellis.render_voxel_depth(
                 cam.id, img_H, img_W, scaled_K=scaled_K,
             )
-            cam.guidance["bkgd_voxel_depth"] = (
-                v_val.astype(np.float16),
-                v_src.astype(np.int32),
-            )
+            v_val_f16 = v_val.astype(np.float16)
+            v_src_i32 = v_src.astype(np.int32)
+            _bkgd_voxel_cache_save(_vox_cache_dir, cam.id, img_H, img_W, v_val_f16, v_src_i32)
+            cam.guidance["bkgd_voxel_depth"] = (v_val_f16, v_src_i32)
+            _vox_misses += 1
+        if is_main_process():
+            print(f"[bkgd_voxel_cache] hits={_vox_hits}, misses={_vox_misses}")
 
         if is_main_process():
             print(f"VRAM preload complete for {len(local_cameras)} views")
