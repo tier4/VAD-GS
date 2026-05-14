@@ -303,7 +303,13 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         if is_main_process():
             print(f"Preloading {preload_label} to VRAM")
 
-        for cam in local_cameras:
+        _preload_bar = tqdm(
+            local_cameras,
+            desc="Preload (img + guidance)",
+            unit="view",
+            disable=not is_main_process(),
+        )
+        for cam in _preload_bar:
             # Trigger lazy loading of image and all guidance data
             _ = cam.original_image
             for key in list(cam.guidance.keys()):
@@ -315,19 +321,19 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             for key in list(cam.guidance.keys()):
                 cam.guidance[key] = cam.guidance[key]
 
-        if is_main_process():
-            print(f"VRAM preload complete for {len(local_cameras)} views")
-
         # The per-camera bkgd_voxel_depth is the dominant per-iter cost
         # (~1.6s on this dataset). It is deterministic for a given
         # (camera, image_shape) under the current trellis state, so
         # precompute it for every preloaded view here. The cache cap is
         # bumped to len(local_cameras) below, so the LRU never evicts.
-        if is_main_process():
-            print(f"Precomputing bkgd_voxel_depth for {len(local_cameras)} views")
         _trellis = gaussians.background.grape_trellis
-        _vox_t0 = time.time()
-        for cam in local_cameras:
+        _vox_bar = tqdm(
+            local_cameras,
+            desc="Preload (bkgd_voxel_depth)",
+            unit="view",
+            disable=not is_main_process(),
+        )
+        for cam in _vox_bar:
             if "bkgd_voxel_depth" in cam.guidance:
                 continue
             img = cam.original_image
@@ -341,8 +347,9 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 v_src.astype(np.int32),
             )
             del _mask, _uvs
+
         if is_main_process():
-            print(f"bkgd_voxel_depth precompute done in {time.time() - _vox_t0:.1f}s")
+            print(f"VRAM preload complete for {len(local_cameras)} views")
     else:
         local_cameras = None  # lazy-load every iter
 
