@@ -5,6 +5,7 @@ the t4_devkit library. The output format matches drivestudio_utils.py's
 generate_dataparser_outputs() for compatibility with the VAD-GS pipeline.
 """
 
+import concurrent.futures
 import os
 import json
 import math
@@ -762,14 +763,19 @@ def generate_dataparser_outputs_t4(
 
     # Compute object bounding masks
     print("Computing object bounding masks...")
-    obj_bounds = []
-    obj_view_dict = {}
-    for i, image_filename in tqdm(enumerate(image_filenames)):
+
+    def _compute_obj_bound(i: int):
+        """Project each tracklet's 3D bbox into image i; return obj_bound mask
+        plus the view-dict updates this image contributes."""
         cam = cams[i]
         h, w = image_heights[cam], image_widths[cam]
         obj_bound = np.zeros((h, w), dtype=np.uint8)
         obj_tracklets = object_tracklets_vehicle[frames_idx[i]]
         ixt, ext = ixts[i], exts[i]
+        # Avoid recomputing the (constant per-image) extrinsic inverse inside
+        # the inner per-tracklet loop.
+        ext_inv = np.linalg.inv(ext)
+        view_updates: list[tuple[int, list]] = []
 
         for obj_tracklet in obj_tracklets:
             track_id = int(obj_tracklet[0])
@@ -792,18 +798,37 @@ def generate_dataparser_outputs_t4(
                 mask = get_bound_2d_mask(
                     corners_3d=corners_vehicle[..., :3],
                     K=ixt,
-                    pose=np.linalg.inv(ext),
+                    pose=ext_inv,
                     H=h, W=w,
                 )
                 obj_bound = np.logical_or(obj_bound, mask)
 
                 if mask.sum() < 20 * 20 * 10:
                     continue
+                view_updates.append((track_id, [int(mask.sum()), obj_pose_vehicle]))
+
+        return i, obj_bound, view_updates
+
+    _bound_workers = max(
+        1,
+        min(16, int(os.environ.get("VAD_GS_NUM_THREADS", str((os.cpu_count() or 8) // 4)))),
+    )
+
+    obj_bounds: list = [None] * len(image_filenames)
+    obj_view_dict: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_bound_workers) as _pool:
+        _futures = [_pool.submit(_compute_obj_bound, i) for i in range(len(image_filenames))]
+        for _fut in tqdm(
+            concurrent.futures.as_completed(_futures),
+            total=len(_futures),
+            desc=f"obj bounds ({_bound_workers}t)",
+        ):
+            i, obj_bound, view_updates = _fut.result()
+            obj_bounds[i] = obj_bound
+            for track_id, payload in view_updates:
                 if track_id not in obj_view_dict:
                     obj_view_dict[track_id] = {}
-                obj_view_dict[track_id][i] = [mask.sum(), obj_pose_vehicle]
-
-        obj_bounds.append(obj_bound)
+                obj_view_dict[track_id][i] = payload
 
     result["obj_bounds"] = obj_bounds
     result["obj_view_dict"] = obj_view_dict
