@@ -34,22 +34,33 @@ class Dataset():
         scene_info: SceneInfo = sceneLoadTypeCallbacks[dataset_type](self.source_path, **cfg.data)
 
         if cfg.mode == 'train':
-            print(f'Saving input pointcloud to {os.path.join(self.model_path, "input.ply")}')
-            pcd = scene_info.point_cloud
-            storePly(os.path.join(self.model_path, "input.ply"), pcd.points, pcd.colors)
+            ply_path = os.path.join(self.model_path, "input.ply")
+            # Skip rewriting when sweep_run.py has symlinked a shared cache copy
+            # (deterministic from the dataset, so the rewrite would just duplicate
+            # bytes back into the cache and risk parallel-agent write races).
+            if os.path.lexists(ply_path):
+                print(f'input.ply already present at {ply_path} — skipping write')
+            else:
+                print(f'Saving input pointcloud to {ply_path}')
+                pcd = scene_info.point_cloud
+                storePly(ply_path, pcd.points, pcd.colors)
 
-            json_cams = []
-            camlist = []
-            if scene_info.test_cameras:
-                camlist.extend(scene_info.test_cameras)
-            if scene_info.train_cameras:
-                camlist.extend(scene_info.train_cameras)
-            for id, cam in enumerate(camlist):
-                json_cams.append(camera_to_JSON(id, cam))
+            cams_path = os.path.join(self.model_path, "cameras.json")
+            if os.path.lexists(cams_path):
+                print(f'cameras.json already present at {cams_path} — skipping write')
+            else:
+                json_cams = []
+                camlist = []
+                if scene_info.test_cameras:
+                    camlist.extend(scene_info.test_cameras)
+                if scene_info.train_cameras:
+                    camlist.extend(scene_info.train_cameras)
+                for id, cam in enumerate(camlist):
+                    json_cams.append(camera_to_JSON(id, cam))
 
-            print(f'Saving input camera to {os.path.join(self.model_path, "cameras.json")}')
-            with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
-                json.dump(json_cams, file)
+                print(f'Saving input camera to {cams_path}')
+                with open(cams_path, 'w') as file:
+                    json.dump(json_cams, file)
        
         self.scene_info = scene_info
         

@@ -125,11 +125,18 @@ def _compute_model_path(base_config: Path, overrides: dict[str, str]) -> Path:
     return (workspace / "output" / task / exp_name).resolve()
 
 
-def _link_preprocess_cache(base_config: Path, overrides: dict[str, str], cache_from: str) -> None:
-    """Symlink <model_path>/{input_ply,colmap} -> <cache>/{input_ply,colmap}.
+# Names symlinked from the prebuilt cache into each sweep run's model_path.
+# All are deterministic from the dataset (hparam-independent), so sharing them
+# across runs is safe and saves ~160MB per run (mostly input.ply at ~150MB).
+_CACHE_LINK_NAMES = ("input_ply", "colmap", "input.ply", "cameras.json", "obj_bounds")
 
+
+def _link_preprocess_cache(base_config: Path, overrides: dict[str, str], cache_from: str) -> None:
+    """Symlink hparam-independent artifacts from a prebuilt cache into model_path.
+
+    Handles both files (e.g. ``input.ply``) and directories (e.g. ``colmap``).
     Skips a name if the cache doesn't have it. Idempotent: if a link already
-    points at the right target, leaves it alone; if a real directory exists,
+    points at the right target, leaves it alone; if a real file/dir exists,
     refuses to clobber it (prints a warning instead).
     """
     cache_dir = _resolve_cache_dir(cache_from)
@@ -137,21 +144,21 @@ def _link_preprocess_cache(base_config: Path, overrides: dict[str, str], cache_f
     model_path.mkdir(parents=True, exist_ok=True)
 
     linked = []
-    for name in ("input_ply", "colmap"):
+    for name in _CACHE_LINK_NAMES:
         src = cache_dir / name
-        if not src.is_dir():
-            print(f"[sweep_run] cache missing {name}/ at {src} — skipping")
+        if not src.exists():
+            print(f"[sweep_run] cache missing {name} at {src} — skipping")
             continue
         dst = model_path / name
         if dst.is_symlink():
-            if dst.resolve() == src:
+            if dst.resolve() == src.resolve():
                 linked.append(name)
                 continue
             dst.unlink()
         elif dst.exists():
-            print(f"[sweep_run] {dst} already exists as a real directory — leaving as-is")
+            print(f"[sweep_run] {dst} already exists as a real file/dir — leaving as-is")
             continue
-        os.symlink(src, dst, target_is_directory=True)
+        os.symlink(src, dst, target_is_directory=src.is_dir())
         linked.append(name)
 
     if linked:
