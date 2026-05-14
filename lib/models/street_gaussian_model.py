@@ -257,23 +257,22 @@ class StreetGaussianModel(nn.Module):
 
 
         if len(self.graph_obj_list) > 0:
+            track_ids = [getattr(self, obj_name).track_id for obj_name in self.graph_obj_list]
+            obj_rots_b = self.actor_pose.get_tracking_rotation_batched(track_ids, self.viewpoint_camera)   # (B, 4)
+            obj_trans_b = self.actor_pose.get_tracking_translation_batched(track_ids, self.viewpoint_camera)  # (B, 3)
+
+            ego_pose = self.viewpoint_camera.ego_pose
+            ego_pose_rot = matrix_to_quaternion(ego_pose[:3, :3].unsqueeze(0))  # (1, 4)
+            obj_rots_b = quaternion_raw_multiply(ego_pose_rot.expand(obj_rots_b.shape[0], -1), obj_rots_b)  # (B, 4)
+            obj_trans_b = obj_trans_b @ ego_pose[:3, :3].T + ego_pose[:3, 3]  # (B, 3)
+
             self.obj_rots = []
             self.obj_trans = []
             for i, obj_name in enumerate(self.graph_obj_list):
                 obj_model: GaussianModelActor = getattr(self, obj_name)
-                track_id = obj_model.track_id
-                obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
-                obj_trans = self.actor_pose.get_tracking_translation(track_id, self.viewpoint_camera)
-                ego_pose = self.viewpoint_camera.ego_pose
-                ego_pose_rot = matrix_to_quaternion(ego_pose[:3, :3].unsqueeze(0)).squeeze(0)
-                obj_rot = quaternion_raw_multiply(ego_pose_rot.unsqueeze(0), obj_rot.unsqueeze(0)).squeeze(0)
-                obj_trans = ego_pose[:3, :3] @ obj_trans + ego_pose[:3, 3]
-
-                obj_rot = obj_rot.expand(obj_model.get_xyz.shape[0], -1)
-                obj_trans = obj_trans.unsqueeze(0).expand(obj_model.get_xyz.shape[0], -1)
-
-                self.obj_rots.append(obj_rot)
-                self.obj_trans.append(obj_trans)
+                N = obj_model.get_xyz.shape[0]
+                self.obj_rots.append(obj_rots_b[i].expand(N, -1))
+                self.obj_trans.append(obj_trans_b[i].unsqueeze(0).expand(N, -1))
 
             self.obj_rots = torch.cat(self.obj_rots, dim=0)
             self.obj_trans = torch.cat(self.obj_trans, dim=0)
@@ -477,24 +476,22 @@ class StreetGaussianModel(nn.Module):
     
     def get_normals(self, camera: Camera) -> torch.Tensor:
         normals = []
-        
-        if self.get_visibility('background'):
-            normals_bkgd = self.background.get_normals(camera)            
-            normals.append(normals_bkgd)
-            
-        for i, obj_name in enumerate(self.graph_obj_list):
-            obj_model: GaussianModelActor = getattr(self, obj_name)
-            track_id = obj_model.track_id
 
-            normals_obj_local = obj_model.get_normals(camera) # [N, 3]
-                    
-            obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
-            # obj_rot = quaternion_to_matrix(obj_rot.unsqueeze(0)).squeeze(0)
-            obj_rot = quaternion_to_matrix(obj_rot).squeeze(0)
-            
-            normals_obj_global = normals_obj_local @ obj_rot.T
-            normals_obj_global = torch.nn.functional.normalize(normals_obj_global)                
-            normals.append(normals_obj_global)
+        if self.get_visibility('background'):
+            normals_bkgd = self.background.get_normals(camera)
+            normals.append(normals_bkgd)
+
+        if len(self.graph_obj_list) > 0:
+            track_ids = [getattr(self, obj_name).track_id for obj_name in self.graph_obj_list]
+            obj_rots_b = self.actor_pose.get_tracking_rotation_batched(track_ids, self.viewpoint_camera)  # (B, 4)
+            obj_rots_mat = quaternion_to_matrix(obj_rots_b)  # (B, 3, 3)
+
+            for i, obj_name in enumerate(self.graph_obj_list):
+                obj_model: GaussianModelActor = getattr(self, obj_name)
+                normals_obj_local = obj_model.get_normals(camera)  # [N, 3]
+                normals_obj_global = normals_obj_local @ obj_rots_mat[i].T
+                normals_obj_global = torch.nn.functional.normalize(normals_obj_global)
+                normals.append(normals_obj_global)
 
         if len(normals) == 0:
             return torch.empty(0, 3, device='cuda')

@@ -29,6 +29,141 @@ class ActorPose(nn.Module):
         for track_id in self.obj_info.keys():
             self.obj_info[track_id]['track_idx'] = torch.argwhere(self.track_ids == track_id)
 
+        self._build_batched_lookup()
+
+    def _build_batched_lookup(self):
+        """Pre-compute dense (T, L) lookup tables so per-track-id closest-frame
+        queries can be batched without CPU syncs. Used by the *_batched APIs."""
+        ts_arr = np.asarray(self.timestamps, dtype=np.float64)
+
+        track_ids_sorted = sorted(int(t) for t in self.obj_info.keys())
+        self._track_id_to_pos = {tid: i for i, tid in enumerate(track_ids_sorted)}
+
+        rows_frame, rows_col, rows_ts = [], [], []
+        max_len = 0
+        for tid in track_ids_sorted:
+            idx = self.obj_info[tid]['track_idx']  # (K, 2) cuda long
+            frames = idx[:, 0].detach().cpu().numpy().astype(np.int64)
+            cols = idx[:, 1].detach().cpu().numpy().astype(np.int64)
+            ts = ts_arr[frames]
+            order = np.argsort(ts)
+            rows_frame.append(frames[order])
+            rows_col.append(cols[order])
+            rows_ts.append(ts[order])
+            max_len = max(max_len, len(ts))
+
+        T = len(track_ids_sorted)
+        dense_frame = np.zeros((T, max_len), dtype=np.int64)
+        dense_col = np.zeros((T, max_len), dtype=np.int64)
+        dense_ts = np.full((T, max_len), np.inf, dtype=np.float64)
+        for r in range(T):
+            L = len(rows_ts[r])
+            dense_frame[r, :L] = rows_frame[r]
+            dense_col[r, :L] = rows_col[r]
+            dense_ts[r, :L] = rows_ts[r]
+
+        device = self.input_trans.device
+        self.register_buffer('_dense_frame', torch.from_numpy(dense_frame).to(device), persistent=False)
+        self.register_buffer('_dense_col', torch.from_numpy(dense_col).to(device), persistent=False)
+        self.register_buffer('_dense_ts', torch.from_numpy(dense_ts).to(device), persistent=False)
+
+    def _batched_closest_indices(self, track_ids, timestamp):
+        """For each track_id in `track_ids`, find the two closest-in-time
+        (frame, col) entries to `timestamp`. Fully on-device, no CPU sync.
+
+        Returns f1, c1, t1, f2, c2, t2 each shape (B,)."""
+        pos = torch.as_tensor(
+            [self._track_id_to_pos[int(t)] for t in track_ids],
+            dtype=torch.long, device=self._dense_ts.device,
+        )
+        ts_rows = self._dense_ts.index_select(0, pos)       # (B, L)
+        fr_rows = self._dense_frame.index_select(0, pos)    # (B, L)
+        co_rows = self._dense_col.index_select(0, pos)      # (B, L)
+
+        dt = (ts_rows - float(timestamp)).abs()
+        _, top2 = dt.topk(2, dim=1, largest=False)          # (B, 2)
+        i1 = top2[:, :1]
+        i2 = top2[:, 1:]
+        f1 = fr_rows.gather(1, i1).squeeze(1)
+        f2 = fr_rows.gather(1, i2).squeeze(1)
+        c1 = co_rows.gather(1, i1).squeeze(1)
+        c2 = co_rows.gather(1, i2).squeeze(1)
+        t1 = ts_rows.gather(1, i1).squeeze(1)
+        t2 = ts_rows.gather(1, i2).squeeze(1)
+        return f1, c1, t1, f2, c2, t2
+
+    @staticmethod
+    def _slerp_batched(q0, q1, t):
+        """Batched slerp matching the behavior of the per-id `quaternion_slerp`
+        path (which delegates to roma.utils.unitquat_slerp — that function takes
+        the shortest-arc path between q0 and q1)."""
+        q0 = torch.nn.functional.normalize(q0, dim=-1)
+        q1 = torch.nn.functional.normalize(q1, dim=-1)
+        dot = (q0 * q1).sum(dim=-1, keepdim=True)
+        q1 = torch.where(dot < 0, -q1, q1)
+        cos_omega = dot.abs().clamp(max=1.0)
+        omega = torch.acos(cos_omega)
+        sin_omega = torch.sin(omega)
+        t = t.to(q0.dtype).unsqueeze(-1)
+        s0 = torch.sin((1.0 - t) * omega)
+        s1 = torch.sin(t * omega)
+        small = sin_omega.abs() < 1e-6
+        denom = torch.where(small, torch.ones_like(sin_omega), sin_omega)
+        w0 = torch.where(small, 1.0 - t, s0 / denom)
+        w1 = torch.where(small, t, s1 / denom)
+        return w0 * q0 + w1 * q1
+
+    def _get_tracking_translation_batched(self, track_ids, timestamp):
+        f1, c1, t1, f2, c2, t2 = self._batched_closest_indices(track_ids, timestamp)
+        trans1 = self.input_trans[f1, c1]
+        trans2 = self.input_trans[f2, c2]
+        if self.opt_track:
+            trans1 = trans1 + self.opt_trans[f1, c1]
+            trans2 = trans2 + self.opt_trans[f2, c2]
+        dtype = trans1.dtype
+        w1 = (t2 - float(timestamp)).to(dtype).unsqueeze(-1)
+        w2 = (float(timestamp) - t1).to(dtype).unsqueeze(-1)
+        denom = (t2 - t1).to(dtype).unsqueeze(-1)
+        return (trans1 * w1 + trans2 * w2) / denom
+
+    def _get_tracking_rotation_batched(self, track_ids, timestamp):
+        f1, c1, t1, f2, c2, t2 = self._batched_closest_indices(track_ids, timestamp)
+        rots1 = self.input_rots[f1, c1]
+        rots2 = self.input_rots[f2, c2]
+        if self.opt_track:
+            # opt_rots has a trailing length-1 dim; squeeze so broadcasting matches
+            # quaternion_raw_multiply_theta's per-element shape contract (B,) vs (B,4).
+            theta1 = self.opt_rots[f1, c1].squeeze(-1)
+            # NOTE: mirrors the (likely buggy) per-id path which reused f1/rots1
+            # for the second sample. Preserved here to keep training behavior
+            # bit-identical; revisit separately.
+            theta2 = self.opt_rots[f1, c2].squeeze(-1)
+            rots1 = quaternion_raw_multiply_theta(rots1, theta1)
+            rots2 = quaternion_raw_multiply_theta(rots1, theta2)
+        r = (float(timestamp) - t1) / (t2 - t1)
+        return self._slerp_batched(rots1, rots2, r)
+
+    def get_tracking_translation_batched(self, track_ids, camera: Camera):
+        """Batched equivalent of get_tracking_translation for a list of track_ids.
+        Returns (B, 3) tensor in graph_obj_list order."""
+        if len(track_ids) == 0:
+            return torch.empty(0, 3, device=self._dense_ts.device)
+        if self.opt_track and camera.meta['is_val']:
+            # Val branch needs per-track camera-time clamping; fall back to loop.
+            outs = [self.get_tracking_translation(int(t), camera) for t in track_ids]
+            return torch.stack(outs, dim=0)
+        return self._get_tracking_translation_batched(track_ids, camera.meta['timestamp'])
+
+    def get_tracking_rotation_batched(self, track_ids, camera: Camera):
+        """Batched equivalent of get_tracking_rotation for a list of track_ids.
+        Returns (B, 4) tensor in graph_obj_list order."""
+        if len(track_ids) == 0:
+            return torch.empty(0, 4, device=self._dense_ts.device)
+        if self.opt_track and camera.meta['is_val']:
+            outs = [self.get_tracking_rotation(int(t), camera) for t in track_ids]
+            return torch.stack(outs, dim=0)
+        return self._get_tracking_rotation_batched(track_ids, camera.meta['timestamp'])
+
     def save_state_dict(self, is_final):
         state_dict = dict()
         if self.opt_track:
