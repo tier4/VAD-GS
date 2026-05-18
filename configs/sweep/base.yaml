@@ -126,9 +126,11 @@ optim:
   lambda_depth_lidar: 0.1
   # Foreground shape regularizers (object Gaussians only). Penalize
   # anisotropic / oversized object Gaussians — counters the "flat /
-  # needle-shaped Gaussian" failure mode visible in renders. Start
-  # modest; sweep overrides these.
-  lambda_shape_pena: 0.001
+  # needle-shaped Gaussian" failure mode visible in renders. Default
+  # lowered to 1e-4 after smoke run (lambda=1e-3 crushed Gaussians to
+  # near-perfect spheres in ~5k iter, over-regularizing). Sweep
+  # explores [0, 5e-5, 1e-4, 5e-4].
+  lambda_shape_pena: 0.0001
   lambda_scale_pena: 0.
 
   track_position_lr_delay_mult: 0.01

@@ -69,9 +69,12 @@ parameters:
   # Anisotropy penalty on object Gaussians (max_scale / min_scale).
   # 0 = off (no penalty). Directly attacks the "flat / needle" failure
   # mode. Computed in train.py:loss_obj_shape; applies only to object
-  # Gaussians (BG retains its anisotropy).
+  # Gaussians (BG retains its anisotropy). Range shifted down by ~1 OOM
+  # after the smoke run: lambda=0.001 crushed obj_shape_pena to ~1.0017
+  # (essentially perfect spheres) within 5k iter, which over-regularizes
+  # objects that legitimately need anisotropy (vehicle bodies, mirrors).
   optim.lambda_shape_pena:
-    values: [0., 0.0005, 0.001, 0.005]
+    values: [0., 0.00005, 0.0001, 0.0005]
 
   # ----- Shared densify/prune knobs ------------------------------------
 
