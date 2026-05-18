@@ -520,8 +520,10 @@ def _check_and_coerce_cfg_value_type(replacement, original, key, full_key):
             return False, None
 
     # Conditionally casts
-    # list <-> tuple
-    casts = [(tuple, list), (list, tuple)]
+    # list <-> tuple, int -> float (covers wandb sweep configs where
+    # a YAML float like `0.` round-trips through JSON to int 0 and is
+    # then assigned to a float-typed field).
+    casts = [(tuple, list), (list, tuple), (int, float)]
     # For py2: allow converting from str (bytes) to a unicode string
     try:
         casts.append((str, unicode))  # noqa: F821
