@@ -44,6 +44,7 @@ cfg.train.checkpoint_iterations = [30000]
 cfg.train.start_checkpoint = None
 cfg.train.importance_sampling = False
 cfg.train.preload_vram = False  # if True, preload all train views to VRAM at startup (single-GPU). Distributed always preloads.
+cfg.train.log_image_interval = 100  # save a debug composite to <model_path>/log_images every N iters. Raise to reduce disk I/O (esp. for parallel sweep agents).
 
 cfg.optim = CN()
 cfg.optim.use_amp = False # If set to True, use Automatic Mixed Precision (AMP) for training.
@@ -83,6 +84,11 @@ cfg.optim.lambda_color_correction = 0.
 cfg.optim.lambda_pose_correction = 0.
 cfg.optim.lambda_scale_flatten = 0.
 cfg.optim.lambda_opacity_sparse = 0.
+# Foreground (object) shape regularizers — penalize anisotropy
+# (max/min scale ratio) and oversized object Gaussians. See
+# train.py loss_obj_shape block.
+cfg.optim.lambda_shape_pena = 0.
+cfg.optim.lambda_scale_pena = 0.
 
 
 cfg.model = CN()

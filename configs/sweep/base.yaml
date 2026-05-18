@@ -65,12 +65,23 @@ train:
   # (min_iter=10000, eta=2 => {10000, 20000, 40000, 50000}) so the
   # early-stop decision lands on a real test evaluation.
   test_iterations: [10000, 20000, 40000, 50000]
-  save_iterations: [50000]
-  checkpoint_iterations: [50000]
+  # sweep does not consume the final checkpoint / PLY (the wandb-logged PSNR
+  # is the sweep metric). Skipping these saves saves ~2GB/run:
+  #   - point_cloud/ (629MB) + viewer/ (770MB) gated by save_iterations
+  #   - trained_model/ (629MB) gated by checkpoint_iterations
+  # With 8 parallel agents this is the difference between filling /
+  # (365G) mid-sweep vs. running indefinitely.
+  save_iterations: []
+  checkpoint_iterations: []
   # Sweep agents are CPU/disk-bound when 8 of them lazy-load jpegs from the
   # same dataset every iter. Preloading all train views to VRAM removes the
   # contention at the cost of ~7GB per GPU (well within H100's 80GB).
   preload_vram: true
+  # log_images is debug-only output (composite jpgs under <model_path>/log_images).
+  # 8 parallel sweep agents at the default cadence (100) write 4000 jpgs/run to
+  # the same disk; raise to 1000 → 50 saves per 50k-iter run, still enough to
+  # eyeball densification progress at the test rungs.
+  log_image_interval: 1000
 
 optim:
   use_amp: false
@@ -79,28 +90,27 @@ optim:
   densification_interval: 100
   prop_voxel_interval: 5
 
-  densify_from_iter: 500
+  densify_from_iter: 250
   densify_grad_threshold_bkgd: 0.001
   densify_grad_abs_bkgd: True
   densify_grad_threshold_obj: 0.0002
-  densify_grad_abs_obj: False
-  densify_until_iter: 40000
+  densify_grad_abs_obj: True
+  densify_until_iter: 25000
 
   hard_depth_start: 0
-  hard_depth_end: 40000
+  # Align with densify_until_iter (upstream nuScenes/Waymo pattern).
+  hard_depth_end: 25000
   propagated_iteration_begin: 0
-  propagated_iteration_end: 40000
+  propagated_iteration_end: 25000
   propagation_interval: 5
-  lambda_shape_pena: 0
-  lambda_scale_pena: 0
 
   feature_lr: 0.0025
   max_screen_size: 20
   min_opacity: 0.01
   opacity_lr: 0.05
-  opacity_reset_interval: 5000
+  opacity_reset_interval: 3000
   percent_big_ws: 0.1
-  percent_dense: 0.01
+  percent_dense: 0.005
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 1.6e-05
@@ -114,6 +124,12 @@ optim:
   lambda_mask: 0.1
   lambda_reg: 0.1
   lambda_depth_lidar: 0.1
+  # Foreground shape regularizers (object Gaussians only). Penalize
+  # anisotropic / oversized object Gaussians — counters the "flat /
+  # needle-shaped Gaussian" failure mode visible in renders. Start
+  # modest; sweep overrides these.
+  lambda_shape_pena: 0.001
+  lambda_scale_pena: 0.
 
   track_position_lr_delay_mult: 0.01
   track_position_lr_init: 0.005

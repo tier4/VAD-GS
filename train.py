@@ -1312,10 +1312,25 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 _pending_scalars.append(('l1_loss', Ll1.detach()))
                 loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
 
-            # shape_pena = (gaussians.get_scaling.max(dim=1).values / gaussians.get_scaling.min(dim=1).values).mean()
-            # scale_pena = ((gaussians.get_scaling.max(dim=1, keepdim=True).values)**2).mean()
-            # loss_reg = optim_args.lambda_shape_pena*shape_pena + optim_args.lambda_scale_pena*scale_pena
-            # loss += loss_reg
+            # Foreground shape regularization: penalize anisotropy
+            # (max/min scale ratio) and oversized scales on OBJECT Gaussians
+            # only. BG Gaussians are allowed to remain anisotropic (roads,
+            # walls). Symptom this targets: flat / needle-shaped foreground
+            # Gaussians that the densifier doesn't split because signed
+            # gradients cancel across high-frequency edges (cf. AbsGS).
+            with perf_section("loss_obj_shape"):
+                if (optim_args.lambda_shape_pena > 0 or optim_args.lambda_scale_pena > 0) and gaussians.include_obj and len(gaussians.obj_list) > 0:
+                    obj_scales = torch.cat(
+                        [getattr(gaussians, n).get_scaling for n in gaussians.obj_list], dim=0
+                    )
+                    smax = obj_scales.max(dim=1).values
+                    smin = obj_scales.min(dim=1).values.clamp(min=1e-6)
+                    shape_pena = (smax / smin).mean()
+                    scale_pena = (smax ** 2).mean()
+                    loss_reg = optim_args.lambda_shape_pena * shape_pena + optim_args.lambda_scale_pena * scale_pena
+                    _pending_scalars.append(('obj_shape_pena', shape_pena.detach()))
+                    _pending_scalars.append(('obj_scale_pena', scale_pena.detach()))
+                    loss += loss_reg
 
 
             # sky loss
@@ -1418,7 +1433,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         iter_end.record()
 
         is_save_images = True
-        if is_save_images and (iteration % 100 == 0) and is_main_process():
+        if is_save_images and (iteration % cfg.train.log_image_interval == 0) and is_main_process():
             # row0: gt_image, image, depth
             # row1: acc, image_obj, acc_obj
             depth_colored, _ = visualize_depth_numpy(soft_render_pkg['depth'].detach().cpu().numpy().squeeze(0))
@@ -1725,6 +1740,8 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                psnr_obj_sum = 0.0
+                psnr_obj_count = 0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderer.render(viewpoint, scene.gaussians)["rgb"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -1732,7 +1749,7 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                         tb_writer.add_images(config['name'] + "_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    
+
                     if hasattr(viewpoint, 'original_mask'):
                         mask = viewpoint.original_mask.cuda().bool()
                     else:
@@ -1740,19 +1757,38 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                     l1_test += l1_loss(image, gt_image, mask).mean().double()
                     psnr_test += psnr(image, gt_image, mask).mean().double()
 
+                    # Foreground-only PSNR: use dynamic_mask guidance (same
+                    # convention as train.py:1337 / mvs.py:376 — pixel is
+                    # foreground iff any channel != 255). Views with no
+                    # foreground are skipped.
+                    dyn = viewpoint.guidance.get('dynamic_mask') if hasattr(viewpoint, 'guidance') else None
+                    if dyn is not None:
+                        obj_mask = torch.any(dyn.to(image.device) != 255, dim=0).unsqueeze(0)
+                        if obj_mask.any():
+                            psnr_obj_sum += psnr(image, gt_image, obj_mask).mean().double()
+                            psnr_obj_count += 1
+
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                psnr_obj_mean = (psnr_obj_sum / psnr_obj_count) if psnr_obj_count > 0 else None
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} PSNR_obj {} ({} views)".format(
+                    iteration, config['name'], l1_test, psnr_test,
+                    psnr_obj_mean if psnr_obj_mean is not None else "n/a", psnr_obj_count))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    if psnr_obj_mean is not None:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr_obj', psnr_obj_mean, iteration)
 
                 if _wandb_active():
                     metric_prefix = config['name']  # e.g. "test/test_view" or "test/train_view"
-                    _wandb_log({
+                    log_payload = {
                         f"{metric_prefix}/psnr": float(psnr_test),
                         f"{metric_prefix}/l1_loss": float(l1_test),
-                    }, step=iteration)
+                    }
+                    if psnr_obj_mean is not None:
+                        log_payload[f"{metric_prefix}/psnr_obj"] = float(psnr_obj_mean)
+                    _wandb_log(log_payload, step=iteration)
                     if _wandb.run is not None:
                         # Track best PSNR per split as a run-level summary for sweep ranking.
                         summary_key = f"{metric_prefix}/best_psnr"
@@ -1760,6 +1796,12 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                         if prev is None or float(psnr_test) > float(prev):
                             _wandb.run.summary[summary_key] = float(psnr_test)
                             _wandb.run.summary[f"{metric_prefix}/best_psnr_iter"] = iteration
+                        if psnr_obj_mean is not None:
+                            obj_key = f"{metric_prefix}/best_psnr_obj"
+                            prev_obj = _wandb.run.summary.get(obj_key)
+                            if prev_obj is None or float(psnr_obj_mean) > float(prev_obj):
+                                _wandb.run.summary[obj_key] = float(psnr_obj_mean)
+                                _wandb.run.summary[f"{metric_prefix}/best_psnr_obj_iter"] = iteration
 
         if tb_writer:
             tb_writer.add_histogram("test/opacity_histogram", scene.gaussians.get_opacity, iteration)

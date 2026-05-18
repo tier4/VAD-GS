@@ -21,8 +21,31 @@ from __future__ import annotations
 import argparse
 import os
 import runpy
+import signal
 import sys
 from pathlib import Path
+
+
+def _install_graceful_term_handler() -> None:
+    """Mark a SIGTERM-killed run as Finished (exit 0) instead of Crashed.
+
+    wandb's hyperband early-termination works by having the agent SIGTERM
+    the training subprocess. Without a handler, Python exits via signal
+    and wandb's atexit logic records the run as "Crashed" — which is what
+    we want to avoid for the (intentional) hyperband stops.
+    """
+    def _on_term(signum, _frame):
+        try:
+            import wandb  # may not be imported yet in --no-wandb mode
+            if getattr(wandb, "run", None) is not None:
+                print(f"[sweep_run] received signal {signum}; finishing wandb run cleanly")
+                wandb.finish(exit_code=0)
+        except Exception as exc:
+            print(f"[sweep_run] wandb.finish() during signal {signum} failed: {exc}")
+        finally:
+            sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -166,6 +189,7 @@ def _link_preprocess_cache(base_config: Path, overrides: dict[str, str], cache_f
 
 
 def main() -> None:
+    _install_graceful_term_handler()
     parser = argparse.ArgumentParser(description="wandb sweep wrapper for VAD-GS")
     parser.add_argument(
         "--base-config",

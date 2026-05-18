@@ -1,52 +1,43 @@
 # wandb sweep config for VAD-GS T4 training.
 #
-# Focus: foreground (object) densification. Background / sky already look
-# acceptable in the reference run, so bkgd-specific knobs are pinned and
-# we explore obj-side gradient thresholds + the shared densify/prune
-# parameters (percent_dense, percent_big_ws, min_opacity, ...) that affect
-# how aggressively foreground Gaussians clone, split, and survive pruning.
+# Focus: foreground (object) quality — specifically the "flat / needle"
+# failure mode seen in renders. ad2ukmu6 (the previous bayes sweep)
+# optimized whole-image PSNR, which is dominated by background pixels.
+# The optimizer therefore could not see foreground degradation:
+# `densify_grad_threshold_obj` had corr ≈ -0.05 with the sweep metric.
 #
-# Bias correction (2026-05-14): the previous version had three problems
-# that systematically pushed runs toward "fewer Gaussians":
-#   1. hyperband min_iter=3000 cut runs before densification even started.
-#   2. metric was best_psnr (max across rungs), so early-killed sparse
-#      runs registered their peak and competed with full-length runs.
-#   3. parameter ranges allowed an effectively "do not densify / prune
-#      everything" regime (e.g. densify_grad_threshold_obj up to 1e-3,
-#      min_opacity up to 0.05).
-# This revision pushes the first hyperband cut out to iter 10000 (after
-# meaningful densification), switches the metric to the final-rung psnr,
-# and tightens the param ranges to the densify-friendly half.
-#
-# Loss weights and LRs are intentionally *not* swept here — those affect
-# everything globally; once a good densification operating point is found
-# we can sweep them in a second pass.
+# This revision:
+#   1. Switches the sweep metric to a per-pixel foreground PSNR
+#      (`test/test_view/psnr_obj`), computed in train.py:training_report
+#      using the dynamic_mask guidance already loaded on each viewpoint.
+#   2. Tightens the densify/prune ranges to match the upstream Waymo /
+#      nuScenes defaults (the ad2ukmu6 ranges had drifted far enough that
+#      upstream values were excluded from the search space — e.g.
+#      percent_big_ws=0.1 and max_screen_size=20 were never tried).
+#   3. Adds `lambda_shape_pena` (anisotropy penalty on object Gaussians,
+#      train.py:loss_obj_shape) to the sweep — direct attack on the flat
+#      Gaussian symptom.
+#   4. Pins `densify_grad_abs_obj=True` (AbsGS) in base.yaml: the previous
+#      sweep showed False slightly better, but only under the
+#      foreground-blind metric. AbsGS is the canonical fix for flat
+#      Gaussians at high-frequency edges, so we restore it.
 #
 # Usage:
 #   1. Create the sweep:
 #        SWEEP_ID=$(python script/sweep/sweep_init.py configs/sweep/t4_sweep.yaml)
 #   2. Launch N parallel agents (one per GPU):
 #        NUM_AGENTS=8 SWEEP_ID=$SWEEP_ID bash script/sweep/sweep_launch.sh
-#
-# The agent invokes script/sweep/sweep_run.py, which loads
-# configs/sweep/base.yaml as the baseline and overrides the keys
-# listed under `parameters` below using yacs `key value` format.
 
-# entity / project are normally pulled from .env (WANDB_ENTITY / WANDB_PROJECT)
-# by script/sweep/sweep_init.py, so they are intentionally NOT hardcoded here.
 program: script/sweep/sweep_run.py
 method: bayes
 
 metric:
-  # Latest test-view PSNR (the value logged at the most recent
-  # test_iteration). Pairing this with hyperband below means only the
-  # surviving runs' iter-50000 PSNR competes — runs killed at an early
-  # rung cannot win with their iter-10000 reading.
-  name: test/test_view/psnr
+  # Foreground PSNR (computed only on pixels where dynamic_mask != 255).
+  # Hardens the bayes optimizer against the BG-bias that wrecked the
+  # previous sweep.
+  name: test/test_view/psnr_obj
   goal: maximize
 
-# wandb agent will pass each sampled config as `--key=value` CLI args.
-# sweep_run.py reads them back via wandb.config and converts to yacs opts.
 command:
   - ${env}
   - python
@@ -58,9 +49,6 @@ command:
 # Early stop weak runs once we have signal.
 # With min_iter=10000 and eta=2, the rung iterations land at
 # {10000, 20000, 40000, 50000} — matching the test_iterations in base.yaml.
-# The first cut now happens *after* densification has had time to play out
-# (densify_from_iter <= 500 + 10000 iters of clones/splits), so growth-
-# oriented runs are no longer killed before their density matters.
 early_terminate:
   type: hyperband
   min_iter: 10000
@@ -70,78 +58,59 @@ parameters:
   # ----- Foreground-only knobs -----------------------------------------
 
   # Object-side gradient threshold for clone/split. Lower => more
-  # foreground Gaussians get cloned/split. This is the single biggest
-  # knob for foreground geometry quality.
-  # Default 2.0e-4; sweep on the *densify-friendly* half — upper bound
-  # capped at 3e-4 (was 1e-3, which effectively disabled obj densify).
+  # foreground Gaussians get cloned/split. Range pushed lower than the
+  # previous sweep ([5e-5, 3e-4]) — under the foreground PSNR metric we
+  # want growth-friendly bias.
   optim.densify_grad_threshold_obj:
     distribution: log_uniform_values
-    min: 5.0e-05
-    max: 3.0e-04
+    min: 3.0e-05
+    max: 1.5e-04
 
-  # AbsGS-style absolute-gradient densification on objects: ranks
-  # candidates by |∂L/∂μ| instead of ∂L/∂μ. Sometimes catches
-  # high-frequency object edges the signed gradient misses.
-  optim.densify_grad_abs_obj:
-    values: [false, true]
+  # Anisotropy penalty on object Gaussians (max_scale / min_scale).
+  # 0 = off (no penalty). Directly attacks the "flat / needle" failure
+  # mode. Computed in train.py:loss_obj_shape; applies only to object
+  # Gaussians (BG retains its anisotropy).
+  optim.lambda_shape_pena:
+    values: [0., 0.0005, 0.001, 0.005]
 
-  # ----- Shared densify/prune knobs (affect both bkgd and obj, but ----
-  # the bkgd path is robust to them — leaving room to find a better
-  # operating point for foreground) -------------------------------------
+  # ----- Shared densify/prune knobs ------------------------------------
 
   # Clone if scale <= percent_dense * extent, else split. Smaller =>
-  # more clones (densifies thin structures), larger => more splits
-  # (rebuilds large surfaces).
+  # more clones (densifies thin structures). Includes upstream default
+  # (0.01) and a more growth-friendly 0.003 below the sweep low end.
   optim.percent_dense:
-    values: [0.005, 0.01, 0.02, 0.03]
+    values: [0.003, 0.005, 0.01]
 
-  # Big-point pruning aggressiveness (world-space). Lower => prune more
-  # aggressively. Foreground often needs this looser so vehicles /
-  # pedestrians don't get cleared mid-training, so the aggressive end
-  # (0.05, 0.1) is removed.
+  # Big-point pruning aggressiveness (world-space). 0.1 is the upstream
+  # nuScenes / Waymo default and was outside the previous sweep range —
+  # restored as the lower bound here.
   optim.percent_big_ws:
-    values: [0.2, 0.4]
+    values: [0.1, 0.2]
 
-  # Opacity prune threshold. Lower keeps more low-opacity points alive
-  # long enough to recover; higher prunes faster. Upper bound capped
-  # at 0.02 (was 0.05 — 10× default, aggressive).
+  # Opacity prune threshold.
   optim.min_opacity:
     distribution: log_uniform_values
-    min: 0.003
-    max: 0.02
+    min: 0.005
+    max: 0.015
 
-  # Screen-space big-point pruning. 0 disables, otherwise larger keeps
-  # bigger projected Gaussians. The aggressive end (20) is removed —
-  # foreground at close range loses too much detail there.
+  # Screen-space big-point pruning. 20 is the upstream default — was
+  # excluded from the previous sweep ({0, 40, 80}). 40 was the worst
+  # value in ad2ukmu6 and is dropped.
   optim.max_screen_size:
-    values: [0, 40, 80]
-
-  # Tiny-radii pruning. 0 disables. 1 prunes 1-pixel splats. The
-  # aggressive value (2) is removed since it noticeably eats foreground
-  # detail.
-  optim.prune_small_radii:
-    values: [0, 1]
+    values: [20, 80]
 
   # ----- Densification schedule ----------------------------------------
 
-  # Densify every N iterations. Faster cadence => more clones per epoch
-  # but also more transient grad noise.
   optim.densification_interval:
-    values: [50, 100, 200]
+    values: [50, 100]
 
-  # When to start densifying. Late starts (1000) are removed — with the
-  # hyperband cut at 10000, runs that only get ~8000 iters of growth
-  # before the rung lose to runs that got 9500-9750.
-  optim.densify_from_iter:
-    values: [250, 500]
-
-  # When to stop densifying. Late end means more foreground refinement
-  # but risks oscillation against opacity-reset. 25000 removed — too
-  # short relative to the 50k total budget.
+  # When to stop densifying. 25000 follows Waymo upstream (50% of the
+  # 50k budget — leaves 25k iter for the post-densify shaping phase
+  # where obj_acc_loss fires). 30000 as a small bracket.
   optim.densify_until_iter:
-    values: [35000, 40000, 45000]
+    values: [20000, 25000, 30000]
 
-  # Opacity reset cadence: aggressive reset prunes too hard, but never
-  # resetting leaves stale Gaussians.
+  # Opacity reset cadence. 5000 was the worst value in ad2ukmu6 and is
+  # dropped. 3000 is the upstream default and best ad2ukmu6 value.
   optim.opacity_reset_interval:
-    values: [3000, 5000, 8000, 12000]
+    values: [3000, 5000]

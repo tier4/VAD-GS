@@ -30,6 +30,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."  # repo root
 
+# Resolve a python interpreter. Prefer the repo's venv (where deps are
+# installed) over the system PATH, since some shells don't activate it.
+if [[ -x ".venv/bin/python" ]]; then
+    PYTHON="${PYTHON:-$(pwd)/.venv/bin/python}"
+else
+    PYTHON="${PYTHON:-python}"
+fi
+if [[ -x ".venv/bin/wandb" ]]; then
+    WANDB_CLI="${WANDB_CLI:-$(pwd)/.venv/bin/wandb}"
+else
+    WANDB_CLI="${WANDB_CLI:-wandb}"
+fi
+export PYTHON WANDB_CLI
+
 SWEEP_YAML="${1:-}"
 NUM_AGENTS="${NUM_AGENTS:-8}"
 GPU_OFFSET="${GPU_OFFSET:-0}"
@@ -71,7 +85,7 @@ if [[ -z "${SWEEP_ID:-}" ]]; then
         exit 1
     fi
     echo "[launch] creating sweep from $SWEEP_YAML"
-    SWEEP_ID=$(python script/sweep/sweep_init.py "$SWEEP_YAML" | tail -n1)
+    SWEEP_ID=$("$PYTHON" script/sweep/sweep_init.py "$SWEEP_YAML" | tail -n1)
     echo "[launch] SWEEP_ID=$SWEEP_ID"
 fi
 
@@ -91,23 +105,29 @@ for i in $(seq 0 $((NUM_AGENTS - 1))); do
     log_file="$LOG_DIR/agent_gpu${gpu}.log"
     echo "[launch] agent $i -> GPU $gpu, log=$log_file"
 
+    # wandb sweep yaml's `command:` expands `${env} python ...` to
+    # `/usr/bin/env python` — so `python` must be on PATH for the agent's
+    # subprocess. Prepend .venv/bin so the venv interpreter resolves.
+    AGENT_PATH="$(dirname "$PYTHON"):$PATH"
     if [[ -n "$COUNT" ]]; then
+        PATH="$AGENT_PATH" \
         CUDA_VISIBLE_DEVICES="$gpu" \
         OMP_NUM_THREADS="$THREADS_PER_AGENT" \
         MKL_NUM_THREADS="$THREADS_PER_AGENT" \
         OPENBLAS_NUM_THREADS="$THREADS_PER_AGENT" \
         NUMEXPR_NUM_THREADS="$THREADS_PER_AGENT" \
         VAD_GS_NUM_THREADS="$THREADS_PER_AGENT" \
-            wandb agent --count "$COUNT" "$SWEEP_ID" \
+            "$WANDB_CLI" agent --count "$COUNT" "$SWEEP_ID" \
             > "$log_file" 2>&1 &
     else
+        PATH="$AGENT_PATH" \
         CUDA_VISIBLE_DEVICES="$gpu" \
         OMP_NUM_THREADS="$THREADS_PER_AGENT" \
         MKL_NUM_THREADS="$THREADS_PER_AGENT" \
         OPENBLAS_NUM_THREADS="$THREADS_PER_AGENT" \
         NUMEXPR_NUM_THREADS="$THREADS_PER_AGENT" \
         VAD_GS_NUM_THREADS="$THREADS_PER_AGENT" \
-            wandb agent "$SWEEP_ID" \
+            "$WANDB_CLI" agent "$SWEEP_ID" \
             > "$log_file" 2>&1 &
     fi
     AGENT_PIDS+=("$!")
