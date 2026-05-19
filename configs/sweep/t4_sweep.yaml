@@ -1,26 +1,34 @@
 # wandb sweep config for VAD-GS T4 training.
 #
-# Focus: foreground (object) quality — specifically the "flat / needle"
-# failure mode seen in renders. ad2ukmu6 (the previous bayes sweep)
-# optimized whole-image PSNR, which is dominated by background pixels.
-# The optimizer therefore could not see foreground degradation:
-# `densify_grad_threshold_obj` had corr ≈ -0.05 with the sweep metric.
+# Focus (this revision): the BACKGROUND model. lsobybow (the previous
+# bayes sweep, optimized for `test/test_view/psnr_obj`) confirmed that
+# `obj_shape_pena` saturates at ~1.001 regardless of λ_shape — the obj
+# anisotropy penalty is doing its job on the few hundred actor Gaussians,
+# but the visually-bad "needle-shaped" Gaussians the user is seeing live
+# in the BG model (signs, poles, parked cars, foreground BG within ~30m
+# of the ego), which the obj-only penalty cannot reach. lsobybow's 8
+# finished runs all clustered at psnr_obj 15.65-15.94 (0.3dB band) — the
+# existing sweep axes had run out of useful signal.
 #
-# This revision:
-#   1. Switches the sweep metric to a per-pixel foreground PSNR
-#      (`test/test_view/psnr_obj`), computed in train.py:training_report
-#      using the dynamic_mask guidance already loaded on each viewpoint.
-#   2. Tightens the densify/prune ranges to match the upstream Waymo /
-#      nuScenes defaults (the ad2ukmu6 ranges had drifted far enough that
-#      upstream values were excluded from the search space — e.g.
-#      percent_big_ws=0.1 and max_screen_size=20 were never tried).
-#   3. Adds `lambda_shape_pena` (anisotropy penalty on object Gaussians,
-#      train.py:loss_obj_shape) to the sweep — direct attack on the flat
-#      Gaussian symptom.
-#   4. Pins `densify_grad_abs_obj=True` (AbsGS) in base.yaml: the previous
-#      sweep showed False slightly better, but only under the
-#      foreground-blind metric. AbsGS is the canonical fix for flat
-#      Gaussians at high-frequency edges, so we restore it.
+# This revision changes the experiment:
+#   1. Sweep metric → overall `test/test_view/psnr` (BG static-FG is
+#      30-40% of pixels; improvements there dominate the overall PSNR
+#      gradient, unlike obj which is 5-15%). Per-layer PSNRs
+#      (psnr_bkgd_near / psnr_bkgd_far / psnr_sky / psnr_obj) are logged
+#      separately for post-hoc analysis (train.py:training_report).
+#   2. New axis: `lambda_shape_pena_bkgd` — the same anisotropy penalty
+#      (smax/smin) applied to the BG model (train.py:loss_bkgd_shape).
+#      Range starts much lower than the obj-side λ because BG has
+#      orders-of-magnitude more Gaussians and contains legitimately flat
+#      road geometry that over-regularization would crush to spheres.
+#   3. Compensating axis: `densify_grad_threshold_bkgd` — isotropizing
+#      pancake BG Gaussians halves their on-screen coverage (~a² → ~0.7a²
+#      at constant volume), so density has to compensate or holes appear.
+#      Range pushes the threshold down by ~2-3x from the base default to
+#      let the densifier pick up the slack.
+#   4. Other lsobybow-saturated knobs are pinned to their lsobybow-best
+#      values via base.yaml / fixed sweep entries below, freeing search
+#      budget for the new BG axes.
 #
 # Usage:
 #   1. Create the sweep:
@@ -32,10 +40,10 @@ program: script/sweep/sweep_run.py
 method: bayes
 
 metric:
-  # Foreground PSNR (computed only on pixels where dynamic_mask != 255).
-  # Hardens the bayes optimizer against the BG-bias that wrecked the
-  # previous sweep.
-  name: test/test_view/psnr_obj
+  # Overall PSNR. BG static-foreground (the layer we're trying to fix)
+  # is the largest single layer by pixel count, so the optimizer gets
+  # strong gradient there. Per-layer PSNRs are still logged for analysis.
+  name: test/test_view/psnr
   goal: maximize
 
 command:
@@ -55,65 +63,73 @@ early_terminate:
   eta: 2
 
 parameters:
-  # ----- Foreground-only knobs -----------------------------------------
+  # ===== NEW BG axes (the experiment) ==================================
 
-  # Object-side gradient threshold for clone/split. Lower => more
-  # foreground Gaussians get cloned/split. Range pushed lower than the
-  # previous sweep ([5e-5, 3e-4]) — under the foreground PSNR metric we
-  # want growth-friendly bias.
-  optim.densify_grad_threshold_obj:
+  # Anisotropy penalty on BG Gaussians (smax/smin). 0 = off. Range is
+  # ~1 OOM below the obj-side range because:
+  #   (a) BG has ~1.7M-7.6M Gaussians vs ~10²-10³ obj — same λ would
+  #       contribute ~10⁴x more to the loss
+  #   (b) BG contains legitimate pancakes (road surface) we don't want
+  #       to crush — too-high λ flattens road quality
+  optim.lambda_shape_pena_bkgd:
+    values: [0., 1.0e-6, 5.0e-6, 2.0e-5, 1.0e-4]
+
+  # BG densify gradient threshold. Lower = more BG densification.
+  # Compensates for the screen-coverage loss when BG Gaussians are
+  # isotropized by the shape penalty above. Base default is 1.0e-3;
+  # range here goes down to 3.0e-4 (3x more aggressive).
+  optim.densify_grad_threshold_bkgd:
     distribution: log_uniform_values
-    min: 3.0e-05
-    max: 1.5e-04
+    min: 3.0e-04
+    max: 1.5e-03
 
-  # Anisotropy penalty on object Gaussians (max_scale / min_scale).
-  # 0 = off (no penalty). Directly attacks the "flat / needle" failure
-  # mode. Computed in train.py:loss_obj_shape; applies only to object
-  # Gaussians (BG retains its anisotropy). Range shifted down by ~1 OOM
-  # after the smoke run: lambda=0.001 crushed obj_shape_pena to ~1.0017
-  # (essentially perfect spheres) within 5k iter, which over-regularizes
-  # objects that legitimately need anisotropy (vehicle bodies, mirrors).
-  optim.lambda_shape_pena:
-    values: [0., 0.00005, 0.0001, 0.0005]
-
-  # ----- Shared densify/prune knobs ------------------------------------
-
-  # Clone if scale <= percent_dense * extent, else split. Smaller =>
-  # more clones (densifies thin structures). Includes upstream default
-  # (0.01) and a more growth-friendly 0.003 below the sweep low end.
-  optim.percent_dense:
-    values: [0.003, 0.005, 0.01]
-
-  # Big-point pruning aggressiveness (world-space). 0.1 is the upstream
-  # nuScenes / Waymo default and was outside the previous sweep range —
-  # restored as the lower bound here.
-  optim.percent_big_ws:
-    values: [0.1, 0.2]
-
-  # Opacity prune threshold.
-  optim.min_opacity:
-    distribution: log_uniform_values
-    min: 0.005
-    max: 0.015
-
-  # Screen-space big-point pruning. 20 is the upstream default — was
-  # excluded from the previous sweep ({0, 40, 80}). 40 was the worst
-  # value in ad2ukmu6 and is dropped.
-  optim.max_screen_size:
-    values: [20, 80]
-
-  # ----- Densification schedule ----------------------------------------
-
-  optim.densification_interval:
-    values: [50, 100]
-
-  # When to stop densifying. 25000 follows Waymo upstream (50% of the
-  # 50k budget — leaves 25k iter for the post-densify shaping phase
-  # where obj_acc_loss fires). 30000 as a small bracket.
+  # Extends the BG densification window to give the post-shape-penalty
+  # state time to backfill holes. base.yaml default is 25000.
   optim.densify_until_iter:
-    values: [20000, 25000, 30000]
+    values: [25000, 30000, 35000]
 
-  # Opacity reset cadence. 5000 was the worst value in ad2ukmu6 and is
-  # dropped. 3000 is the upstream default and best ad2ukmu6 value.
+  # Clone if scale <= percent_dense * extent, else split. Smaller BG
+  # Gaussians (from shape penalty) tilt this toward clone — keeping
+  # 0.01 in the range lets split stay active.
+  optim.percent_dense:
+    values: [0.005, 0.01]
+
+  # ===== Pinned from lsobybow (top-quartile values) =====================
+  # These ran out of signal in lsobybow (the 8 finished runs clustered
+  # in a 0.3dB band on psnr_obj). Pinned via single-value sweep entries
+  # so they stay explicit in the sweep manifest while not consuming
+  # bayes-optimizer budget.
+
+  # Obj shape penalty: lsobybow top-4 (psnr_obj 15.83-15.94) all had
+  # λ_shape ∈ {1e-4, 5e-4}. Pin at 5e-4 — that's giddy-sweep-7's value
+  # (the lsobybow #1).
+  optim.lambda_shape_pena:
+    value: 0.0005
+
+  # Obj densify threshold: top-4 lsobybow values were
+  # {3.4e-5, 6.1e-5, 5.8e-5, 1.2e-4}. Pin at 5e-5 (cluster center).
+  optim.densify_grad_threshold_obj:
+    value: 0.00005
+
+  # Opacity prune: top-4 lsobybow values were {1.10e-2, 9.06e-3,
+  # 1.14e-2, 1.30e-2}. Pin at 0.01 (upstream default, near cluster).
+  optim.min_opacity:
+    value: 0.01
+
+  # Screen-size prune: 20 is the upstream default; top-2 lsobybow had
+  # max_screen_size=20.
+  optim.max_screen_size:
+    value: 20
+
+  # Big-WS prune: top-3 lsobybow values were {0.2, 0.2, 0.2}.
+  optim.percent_big_ws:
+    value: 0.2
+
+  # Opacity reset: top-3 lsobybow values were {3000, 3000, 3000}.
   optim.opacity_reset_interval:
-    values: [3000, 5000]
+    value: 3000
+
+  # Densify cadence: top-2 lsobybow values were {100, 50}. Pin at 100
+  # (upstream default).
+  optim.densification_interval:
+    value: 100

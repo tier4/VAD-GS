@@ -89,6 +89,13 @@ cfg.optim.lambda_opacity_sparse = 0.
 # train.py loss_obj_shape block.
 cfg.optim.lambda_shape_pena = 0.
 cfg.optim.lambda_scale_pena = 0.
+# Same regularizers on the BACKGROUND model. Applied to bkgd Gaussians
+# (roads, signs, poles, buildings — everything outside tracked actor
+# boxes). Tune independently from the obj weights because BG has orders
+# of magnitude more Gaussians and contains legitimately flat geometry
+# (road surfaces) that we don't want to crush to spheres — start small.
+cfg.optim.lambda_shape_pena_bkgd = 0.
+cfg.optim.lambda_scale_pena_bkgd = 0.
 
 
 cfg.model = CN()

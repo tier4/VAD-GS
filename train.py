@@ -1332,6 +1332,25 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                     _pending_scalars.append(('obj_scale_pena', scale_pena.detach()))
                     loss += loss_reg
 
+            # Same regularizer applied to BACKGROUND Gaussians (roads,
+            # signs, poles, distant buildings — everything outside tracked
+            # actor boxes). Targets the needle-shaped static-foreground
+            # Gaussians visible in renders that the obj-only penalty above
+            # cannot reach. Separate lambdas so BG can be tuned much lower:
+            # roads are legitimately flat (one thin axis) and over-
+            # regularization here would crush road geometry.
+            with perf_section("loss_bkgd_shape"):
+                if (optim_args.lambda_shape_pena_bkgd > 0 or optim_args.lambda_scale_pena_bkgd > 0) and gaussians.include_background:
+                    bkgd_scales = gaussians.background.get_scaling
+                    smax_b = bkgd_scales.max(dim=1).values
+                    smin_b = bkgd_scales.min(dim=1).values.clamp(min=1e-6)
+                    shape_pena_b = (smax_b / smin_b).mean()
+                    scale_pena_b = (smax_b ** 2).mean()
+                    loss_reg_b = optim_args.lambda_shape_pena_bkgd * shape_pena_b + optim_args.lambda_scale_pena_bkgd * scale_pena_b
+                    _pending_scalars.append(('bkgd_shape_pena', shape_pena_b.detach()))
+                    _pending_scalars.append(('bkgd_scale_pena', scale_pena_b.detach()))
+                    loss += loss_reg_b
+
 
             # sky loss
             with perf_section("loss_sky"):
@@ -1736,14 +1755,31 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
         validation_configs = ({'name': 'test/test_view', 'cameras' : scene.getTestCameras()},
                               {'name': 'test/train_view', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
+        # Per-layer eval split. The shape-penalty work targets the static
+        # foreground (signs, poles, parked cars within ~30m) which the
+        # overall `psnr` and dynamic-only `psnr_obj` both hide. We split
+        # each view into 4 mutually-exclusive layers using the rendered
+        # depth (metric, dense) and the dynamic_mask / sky_mask guidance:
+        #   obj       : dynamic actors                 (dyn_mask != 255)
+        #   bkgd_near : non-sky, non-dyn, depth <= NEAR_FAR_THRESHOLD
+        #   bkgd_far  : non-sky, non-dyn, depth >  NEAR_FAR_THRESHOLD
+        #   sky       : sky_mask
+        # Rendered depth (not lidar/mono) so the split is dense and
+        # metric-consistent. Holes/uncovered pixels read depth~0 and land
+        # in bkgd_near — that's where the user's pain point already is,
+        # so the metric still attributes them correctly.
+        NEAR_FAR_THRESHOLD = 30.0  # meters; driving-scene foreground cutoff
+
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
-                psnr_obj_sum = 0.0
-                psnr_obj_count = 0
+                layer_sum: dict[str, float] = {'obj': 0.0, 'bkgd_near': 0.0, 'bkgd_far': 0.0, 'sky': 0.0}
+                layer_count: dict[str, int] = {'obj': 0, 'bkgd_near': 0, 'bkgd_far': 0, 'sky': 0}
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderer.render(viewpoint, scene.gaussians)["rgb"], 0.0, 1.0)
+                    render_pkg = renderer.render(viewpoint, scene.gaussians)
+                    image = torch.clamp(render_pkg["rgb"], 0.0, 1.0)
+                    depth = render_pkg.get("depth")  # (1, H, W), metric units
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
@@ -1757,28 +1793,71 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                     l1_test += l1_loss(image, gt_image, mask).mean().double()
                     psnr_test += psnr(image, gt_image, mask).mean().double()
 
-                    # Foreground-only PSNR: use dynamic_mask guidance (same
-                    # convention as train.py:1337 / mvs.py:376 — pixel is
-                    # foreground iff any channel != 255). Views with no
-                    # foreground are skipped.
-                    dyn = viewpoint.guidance.get('dynamic_mask') if hasattr(viewpoint, 'guidance') else None
+                    # Build layer masks (each (1, H, W) bool, AND'd with `mask`).
+                    # dynamic_mask: per-channel id image; foreground iff any
+                    # channel != 255 (same convention as train.py:1337 /
+                    # mvs.py:376). sky_mask: (1, H, W) bool/float.
+                    guidance = getattr(viewpoint, 'guidance', None) or {}
+                    dyn = guidance.get('dynamic_mask')
+                    sky = guidance.get('sky_mask')
+
+                    obj_mask = None
                     if dyn is not None:
-                        obj_mask = torch.any(dyn.to(image.device) != 255, dim=0).unsqueeze(0)
-                        if obj_mask.any():
-                            psnr_obj_sum += psnr(image, gt_image, obj_mask).mean().double()
-                            psnr_obj_count += 1
+                        obj_mask = torch.any(dyn.to(image.device) != 255, dim=0, keepdim=True) & mask
+                    sky_mask_bool = None
+                    if sky is not None:
+                        sky_t = sky.to(image.device).bool()
+                        if sky_t.dim() == 2:
+                            sky_t = sky_t.unsqueeze(0)
+                        sky_mask_bool = sky_t & mask
+
+                    # Static-foreground / distant split needs rendered depth.
+                    # If depth is missing (renderer placeholder path), skip
+                    # the near/far split for this view.
+                    if depth is not None:
+                        non_sky_non_dyn = mask.clone()
+                        if sky_mask_bool is not None:
+                            non_sky_non_dyn = non_sky_non_dyn & ~sky_mask_bool
+                        if obj_mask is not None:
+                            non_sky_non_dyn = non_sky_non_dyn & ~obj_mask
+                        depth_near = depth <= NEAR_FAR_THRESHOLD
+                        depth_far = depth > NEAR_FAR_THRESHOLD
+                        bkgd_near_mask = non_sky_non_dyn & depth_near
+                        bkgd_far_mask = non_sky_non_dyn & depth_far
+                    else:
+                        bkgd_near_mask = None
+                        bkgd_far_mask = None
+
+                    for layer_name, layer_mask in (
+                        ('obj', obj_mask),
+                        ('bkgd_near', bkgd_near_mask),
+                        ('bkgd_far', bkgd_far_mask),
+                        ('sky', sky_mask_bool),
+                    ):
+                        if layer_mask is not None and layer_mask.any():
+                            layer_sum[layer_name] += float(psnr(image, gt_image, layer_mask).mean().double())
+                            layer_count[layer_name] += 1
 
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
-                psnr_obj_mean = (psnr_obj_sum / psnr_obj_count) if psnr_obj_count > 0 else None
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} PSNR_obj {} ({} views)".format(
-                    iteration, config['name'], l1_test, psnr_test,
-                    psnr_obj_mean if psnr_obj_mean is not None else "n/a", psnr_obj_count))
+                layer_mean: dict[str, float | None] = {
+                    k: (layer_sum[k] / layer_count[k]) if layer_count[k] > 0 else None
+                    for k in layer_sum
+                }
+                psnr_obj_mean = layer_mean['obj']
+                print("\n[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.3f} | obj {} near {} far {} sky {}".format(
+                    iteration, config['name'], float(l1_test), float(psnr_test),
+                    f"{layer_mean['obj']:.3f}({layer_count['obj']})"            if layer_mean['obj'] is not None      else "n/a",
+                    f"{layer_mean['bkgd_near']:.3f}({layer_count['bkgd_near']})" if layer_mean['bkgd_near'] is not None else "n/a",
+                    f"{layer_mean['bkgd_far']:.3f}({layer_count['bkgd_far']})"   if layer_mean['bkgd_far'] is not None  else "n/a",
+                    f"{layer_mean['sky']:.3f}({layer_count['sky']})"            if layer_mean['sky'] is not None      else "n/a",
+                ))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-                    if psnr_obj_mean is not None:
-                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr_obj', psnr_obj_mean, iteration)
+                    for layer_name, val in layer_mean.items():
+                        if val is not None:
+                            tb_writer.add_scalar(config['name'] + f'/loss_viewpoint - psnr_{layer_name}', val, iteration)
 
                 if _wandb_active():
                     metric_prefix = config['name']  # e.g. "test/test_view" or "test/train_view"
@@ -1786,22 +1865,26 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                         f"{metric_prefix}/psnr": float(psnr_test),
                         f"{metric_prefix}/l1_loss": float(l1_test),
                     }
-                    if psnr_obj_mean is not None:
-                        log_payload[f"{metric_prefix}/psnr_obj"] = float(psnr_obj_mean)
+                    for layer_name, val in layer_mean.items():
+                        if val is not None:
+                            log_payload[f"{metric_prefix}/psnr_{layer_name}"] = float(val)
                     _wandb_log(log_payload, step=iteration)
                     if _wandb.run is not None:
-                        # Track best PSNR per split as a run-level summary for sweep ranking.
+                        # Track best PSNR per split / per layer as run-level
+                        # summaries so sweep ranking can target any of them.
                         summary_key = f"{metric_prefix}/best_psnr"
                         prev = _wandb.run.summary.get(summary_key)
                         if prev is None or float(psnr_test) > float(prev):
                             _wandb.run.summary[summary_key] = float(psnr_test)
                             _wandb.run.summary[f"{metric_prefix}/best_psnr_iter"] = iteration
-                        if psnr_obj_mean is not None:
-                            obj_key = f"{metric_prefix}/best_psnr_obj"
-                            prev_obj = _wandb.run.summary.get(obj_key)
-                            if prev_obj is None or float(psnr_obj_mean) > float(prev_obj):
-                                _wandb.run.summary[obj_key] = float(psnr_obj_mean)
-                                _wandb.run.summary[f"{metric_prefix}/best_psnr_obj_iter"] = iteration
+                        for layer_name, val in layer_mean.items():
+                            if val is None:
+                                continue
+                            key = f"{metric_prefix}/best_psnr_{layer_name}"
+                            prev_v = _wandb.run.summary.get(key)
+                            if prev_v is None or float(val) > float(prev_v):
+                                _wandb.run.summary[key] = float(val)
+                                _wandb.run.summary[f"{metric_prefix}/best_psnr_{layer_name}_iter"] = iteration
 
         if tb_writer:
             tb_writer.add_histogram("test/opacity_histogram", scene.gaussians.get_opacity, iteration)
