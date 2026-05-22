@@ -1757,12 +1757,37 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
                 # Step1: render foreground
 
+                # dynamic_mask pixel values come from generate_sam_masks.py's
+                # dataset-wide remap (no static / FoV filter); obj_NNN models
+                # are keyed by t4_utils' per-run sequential remap. Without the
+                # lookup below the two disagree and this loop dispatches to
+                # the wrong obj model (or skips it entirely) — the symptom is
+                # the blurry "where dynamic objects used to be" patches in
+                # the merged finetune render. scene_info.metadata carries the
+                # mapping built once in t4_utils so the existing checkpoints
+                # (saved with the sequential remap) keep loading unchanged.
+                _mask_to_seq = dataset.scene_info.metadata.get("dynamic_mask_to_seq_id", {})
                 for dynamic_key in torch.unique(dynamic_mask):
                     if dynamic_key == 255:
                         continue
 
                     dynamic_id = dynamic_key.item()
-                    obj_name = "obj_%.3d"%dynamic_id
+                    if _mask_to_seq:
+                        _seq_id = _mask_to_seq.get(int(dynamic_id))
+                        if _seq_id is None:
+                            # Object exists in sam_masks but not in this run's
+                            # obj models (eg. static-filtered, or out of
+                            # selected_frames). Skip — main BG loss already
+                            # excludes these pixels via dynamic_mask != 255.
+                            continue
+                        obj_name = "obj_%.3d" % int(_seq_id)
+                    else:
+                        # Legacy path (no lookup published): assume dynamic_id
+                        # already matches the seq_id namespace. This is the
+                        # old behaviour and is wrong on most T4 datasets, but
+                        # keep it as a fallback so non-T4 readers / older
+                        # pre-processed datasets continue running.
+                        obj_name = "obj_%.3d" % dynamic_id
                     if obj_name not in include_list:
                         continue
 

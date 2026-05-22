@@ -745,6 +745,38 @@ def generate_dataparser_outputs_t4(
         object_info[track_id]["start_timestamp"] = max(object_start_frame, min_timestamp)
         object_info[track_id]["end_timestamp"] = min(object_end_frame, max_timestamp)
 
+    # Build dynamic_mask pixel value → t4_utils seq_id lookup. Without this
+    # train.py's `for dynamic_key in torch.unique(dynamic_mask): obj_name =
+    # "obj_%.3d" % dynamic_key` dispatches to the WRONG obj model: the
+    # dynamic_mask PNGs were stamped by generate_sam_masks.py with a
+    # *dataset-wide* {raw_id → mask_value} remap (no static / FoV filter),
+    # while obj models are keyed by the per-run sequential remap above
+    # (selected_frames-filtered, dynamic-only).
+    # The user-visible symptom of the mismatch is the "blurry where cars
+    # used to be" artifact in the merged finetune render: obj-specific view
+    # selection / depth propagation runs on the wrong model id, so dynamic
+    # actors never get their auxiliary refinement signal even though their
+    # main loss (which only checks `dynamic_mask != 255`) still works.
+    _mask_to_seq = {}
+    _sam_path = os.path.join(datadir, "preprocessed", "sam_masks", "track_id_mapping.json")
+    if os.path.exists(_sam_path):
+        try:
+            with open(_sam_path, "r") as _f:
+                _sam_raw_to_mask = {int(k): int(v) for k, v in json.load(_f).items()}
+            for _seq_id, _info in object_info.items():
+                _raw_id = _info.get("original_instance_token_prefix")
+                if _raw_id is None:
+                    continue
+                _mv = _sam_raw_to_mask.get(int(_raw_id))
+                if _mv is not None:
+                    _mask_to_seq[int(_mv)] = int(_seq_id)
+            print(
+                f"[track_id] dynamic_mask→seq_id lookup built: "
+                f"{len(_mask_to_seq)}/{len(object_info)} objs matched against sam_masks"
+            )
+        except Exception as _exc:
+            print(f"[track_id] WARNING: failed to load {_sam_path}: {_exc}")
+
     result = dict()
     result["num_frames"] = num_frames
     result["exts"] = exts
@@ -760,6 +792,7 @@ def generate_dataparser_outputs_t4(
     result["cams_timestamps"] = cams_timestamps
     result["tracklet_timestamps"] = frames_timestamps
     result["ego_frame_poses"] = ego_frame_poses
+    result["dynamic_mask_to_seq_id"] = _mask_to_seq
 
     # Compute object bounding masks
     print("Computing object bounding masks...")

@@ -143,6 +143,12 @@ def readT4Info(path: str, images: str = "images", split_train: int = -1, split_t
     scene_metadata["obj_view_dict"] = obj_view_dict
     scene_metadata["c2ws"] = c2ws
     scene_metadata["ixts"] = ixts
+    # Lookup from dynamic_mask pixel value (sam_masks dataset-wide remap)
+    # to obj seq_id (t4_utils per-run sequential remap). Used by train.py
+    # to dispatch dynamic_mask pixels to the correct obj_NNN model — the
+    # two remaps are independent and disagree as soon as static-filter
+    # or selected_frames drop any object.
+    scene_metadata["dynamic_mask_to_seq_id"] = output.get("dynamic_mask_to_seq_id", {})
 
     camera_timestamps = dict()
     for cam in sorted(set(cams)):
