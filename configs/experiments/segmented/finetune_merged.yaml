@@ -38,7 +38,7 @@ train:
   test_iterations: [2000, 8000, 16000]
   save_iterations: [16000]
   checkpoint_iterations: [8000, 16000]
-  log_image_interval: 10
+  log_image_interval: 100
 
   bg_init_from:  output/t4_exp/merged_bg/iteration_0.pth
   obj_init_from: output/t4_exp/merged_obj/iteration_0.pth
@@ -73,5 +73,19 @@ optim:
   propagated_iteration_begin: 99999999
   propagated_iteration_end: 0
 
-  percent_dense: 0.015
-  percent_dense_obj: 0.07
+  # Free-space LiDAR opacity penalty: BG Gaussians whose center sits in
+  # observed empty space (in front of a positive LiDAR return) are pushed
+  # toward opacity 0 every iter. Continuous companion to bg_lidar_prune
+  # (one-shot pre-train) — catches floaters that drift forward of LiDAR
+  # surfaces during fine-tuning. Densify is off here so the opacity-only
+  # gradient never gets cancelled by new spawn. start_iter=0: BG was
+  # already pre-conditioned by bg_lidar_prune, so no warmup needed.
+  lambda_lidar_freespace: 0.1
+  lidar_freespace_start_iter: 0
+
+  # seg_base re-enables use_voxel_depth to mirror the nuscenes reference
+  # for per-segment training. Override back to False here: the voxel-
+  # depth visualization is currently buggy and the LiDAR side is already
+  # covered by bg_lidar_prune (one-shot) + lambda_lidar_freespace
+  # (continuous). Re-flip to True only if we want all three layered.
+  use_voxel_depth: False

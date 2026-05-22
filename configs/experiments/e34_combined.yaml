@@ -11,6 +11,7 @@ parent_cfg: configs/example/t4_train_h100x8.yaml
 
 exp_name: e34_combined_pd015_obj07
 
+# OBSOLETE: percent_dense_obj was removed when aligning back to the
+# nuscenes mainline. Only the BG side of this experiment survives.
 optim:
   percent_dense: 0.015      # BG threshold ≈ voxel size
-  percent_dense_obj: 0.07   # obj threshold ≈ voxel size

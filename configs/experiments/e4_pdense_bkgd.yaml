@@ -21,4 +21,3 @@ exp_name: e34_e4_pdense015
 
 optim:
   percent_dense: 0.015      # was 0.01 — BG clone/split threshold now ≈ voxel size
-  percent_dense_obj: 0.01   # baseline (obj unchanged in this run)

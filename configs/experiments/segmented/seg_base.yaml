@@ -108,12 +108,10 @@ optim:
   opacity_lr: 0.05
   opacity_reset_interval: 3000
   percent_big_ws: 0.1
-  # E-3/E-4 fix from the BG/obj clone-vs-split analysis:
-  #   - BG: percent_dense * extent = 0.015 * 10 = 0.15 m ≈ voxel_size
-  #   - obj: percent_dense_obj * actor_extent ≈ 0.07 * 2.25 = 0.157 m ≈ voxel_size
-  # (Original nuscenes_train_000.yaml had 0.01 / no obj split.)
-  percent_dense: 0.015
-  percent_dense_obj: 0.07
+  # percent_dense: not overridden — falls back to cfg.optim.percent_dense
+  # (= 0.01, the 3DGS / VAD-GS mainline default). The earlier override
+  # to 0.015 was a T4-specific voxel-size alignment that doesn't exist
+  # upstream; reverted to match the working mainline recipe.
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 1.6e-05
@@ -154,7 +152,12 @@ optim:
   track_rotation_max_steps: 30000
 
   normal_loss: True
-  use_voxel_depth: False
+  # Match the nuscenes reference (configs/example/nuscenes_train_000.yaml):
+  # voxel-binned LiDAR depth gives the per-segment BG a metric-depth
+  # constraint while it's still being densified. bg_lidar_prune /
+  # freespace_loss don't run during segment training, so without this
+  # the segment depth is only constrained by RGB + monodepth.
+  use_voxel_depth: True
   use_lidar_depth: False
   skip_view_selection: False
 
