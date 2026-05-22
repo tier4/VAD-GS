@@ -344,6 +344,12 @@ class GaussianModel(nn.Module):
         args = cfg.optim
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # max_radii2D must follow get_xyz.shape[0] too, otherwise a later
+        # load_state_dict() that swaps in a checkpoint of a different size
+        # (e.g. merge_bg_checkpoints output, which drops aux keys when not
+        # all sources have them) leaves max_radii2D at the pre-load size,
+        # and prune_points() then index-errors.
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.active_sh_degree = 0
                 
         l = [
