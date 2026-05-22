@@ -213,14 +213,22 @@ def _lru_touch_bkgd_voxel_cache(tracker: OrderedDict, cam, max_size: int = BKGD_
                 pass
 
 
-# --- BG-vs-LiDAR conflict analysis (dry-run + hard prune) -------------------
+# --- BG-vs-LiDAR / sky-mask conflict analysis (dry-run + hard prune) --------
 # After bg_init_from stacks per-segment BG checkpoints, many merged Gaussians
-# can sit "in front of" LiDAR returns — visible as the foliage-like floaters
-# in iter ~1000 renders. The soft lidar_depth loss decays them slowly through
-# alpha blending; this group of helpers replaces that slow correction with a
-# one-shot prune: for every (Gaussian, view) pair we vote conflict/consistent
-# against the per-pixel LiDAR depth, then drop Gaussians that lose the vote
-# by K or more across views.
+# end up as floaters — visible as the foliage-like artefacts in iter ~1000
+# renders. Two complementary signals are voted per (Gaussian, view):
+#
+#   1. LiDAR conflict — Gaussian center sits in front of the LiDAR return.
+#      Works on whatever pixels LiDAR observes (mid-range walls, trees, ...)
+#      but is blind to sky / road / glass / far-distance pixels where LiDAR
+#      has no return.
+#
+#   2. Sky-mask conflict — Gaussian center projects onto a sky_mask=True
+#      pixel. Sky should be rendered by sky_cubemap, never by a BG Gaussian,
+#      so even a single sky-mask hit is suspicious and a low K_sky default
+#      (e.g. 1) is appropriate.
+#
+# A Gaussian is dropped when EITHER signal fires above its own threshold.
 def _bg_lidar_prune_scan(
     gaussians,
     cameras: list,
@@ -228,17 +236,19 @@ def _bg_lidar_prune_scan(
     tau_scale_mul: float,
     tau_eps: float,
 ) -> tuple | None:
-    """Vote every (BG Gaussian, camera) pair against lidar_depth.
+    """Vote every (BG Gaussian, camera) pair against lidar_depth and sky_mask.
 
-    Per pair: project g.xyz into c → (u, v, d_g); look up lidar_depth d_ref;
-    if d_ref > 0 then count this view as either:
-        conflict   when d_g + tau < d_ref         (Gaussian sits in front)
-        consistent when |d_g - d_ref| <= tau      (Gaussian on LiDAR surface)
-    with tau = tau_scale_mul * max(g.scaling) + tau_eps.
+    Per pair: project g.xyz into c → (u, v, d_g); inspect:
+      - lidar_depth[v,u]: if positive, count conflict (d_g+tau < d_ref) or
+        consistent (|d_g-d_ref| <= tau) where tau = tau_scale_mul *
+        max(g.scaling) + tau_eps.
+      - sky_mask[v,u]: if True, count a sky_conflict. Sky belongs to
+        sky_cubemap; any BG Gaussian landing on a sky pixel is wrong.
 
     Returns (visible_count, lidar_hit_count, conflict_count, consistent_count,
-    cams_with_lidar) — all int32 tensors of shape (N,) on the BG device, or
-    None if there is no BG model / no Gaussians.
+    sky_conflict_count, sky_hit_view_count, cams_with_lidar, cams_with_sky)
+    — int32 tensors of shape (N,) on the BG device, or None if there is no
+    BG model / no Gaussians.
     """
     bg = getattr(gaussians, "background", None)
     if bg is None:
@@ -251,18 +261,34 @@ def _bg_lidar_prune_scan(
         print("[bg_lidar_prune] background has 0 Gaussians; skipping")
         return None
     scales = bg.get_scaling.detach()                # (N, 3)
-    max_scale = scales.max(dim=1).values            # (N,)
     device = xyz.device
     pts_h = torch.cat(
         [xyz, torch.ones((N, 1), device=device, dtype=xyz.dtype)], dim=-1,
     )  # (N, 4) world homogeneous, row-vector form
 
+    # Pre-compute per-Gaussian rotation matrices (local-to-world) once. They
+    # are needed below to convert each view's camera-z direction into the
+    # Gaussian's local frame, so we can compute the ellipsoid's actual extent
+    # along the camera ray instead of falling back to max(scale_xyz). That
+    # matters most for disc-shaped "veil" floaters whose long axes lie in
+    # the wall plane (perpendicular to the ray) — there max(scale) wildly
+    # over-estimates the camera-z extent and the old LiDAR conflict test
+    # was too forgiving.
+    quat = bg.get_rotation.detach()                 # (N, 4) normalized
+    R_g = quaternion_to_matrix(quat)                # (N, 3, 3) local -> world
+    scales_sq = scales * scales                     # (N, 3)
+
     visible_count = torch.zeros(N, dtype=torch.int32, device=device)
     lidar_hit_count = torch.zeros(N, dtype=torch.int32, device=device)
     conflict_count = torch.zeros(N, dtype=torch.int32, device=device)
     consistent_count = torch.zeros(N, dtype=torch.int32, device=device)
+    sky_conflict_count = torch.zeros(N, dtype=torch.int32, device=device)
+    # How many of the visible views had a sky_mask at all (mostly for the
+    # report — sky_mask is expected to exist for every train view).
+    sky_hit_view_count = torch.zeros(N, dtype=torch.int32, device=device)
 
     cams_with_lidar = 0
+    cams_with_sky = 0
     for cam in tqdm(
         cameras,
         desc="[bg_lidar_prune] scanning",
@@ -272,45 +298,149 @@ def _bg_lidar_prune_scan(
         # LazyGuidanceDict triggers a disk read on .get() if not already
         # cached; both LazyGuidanceDict and plain dict expose .get(key, None).
         ld = cam.guidance.get("lidar_depth")
-        if ld is None:
+        sm = cam.guidance.get("sky_mask")
+        if ld is None and sm is None:
             continue
-        cams_with_lidar += 1
-        if isinstance(ld, np.ndarray):
-            ld = torch.from_numpy(ld)
-        if ld.device != device:
-            ld = ld.to(device, non_blocking=True)
-        if ld.dim() == 3:
-            ld = ld.squeeze(0)
-        H, W = int(ld.shape[-2]), int(ld.shape[-1])
 
-        # world_view_transform is stored as W2C^T (see Camera.__init__), so
-        # for row vectors:  pts_h @ wvt == (W2C @ pts_h^T)^T == view_pts_h.
-        view_pts_h = pts_h @ cam.world_view_transform
+        # Common projection: only need to do this once per camera.
+        H_img, W_img = cam.image_height, cam.image_width
+        view_pts_h = pts_h @ cam.world_view_transform   # (N, 4)
         view_pts = view_pts_h[:, :3]
         d_g = view_pts[:, 2]
         in_front = d_g > cam.znear
 
         # Pinhole projection through K (pixel-space intrinsic).
-        proj = view_pts @ cam.K.T                   # (N, 3)
+        proj = view_pts @ cam.K.T                       # (N, 3)
         z = proj[:, 2].clamp(min=1e-6)
         u_i = (proj[:, 0] / z).round().long()
         v_i = (proj[:, 1] / z).round().long()
-        in_img = in_front & (u_i >= 0) & (u_i < W) & (v_i >= 0) & (v_i < H)
+        in_img = in_front & (u_i >= 0) & (u_i < W_img) & (v_i >= 0) & (v_i < H_img)
         visible_count += in_img.to(torch.int32)
+        u_clip = u_i.clamp(0, W_img - 1)
+        v_clip = v_i.clamp(0, H_img - 1)
 
-        u_clip = u_i.clamp(0, W - 1)
-        v_clip = v_i.clamp(0, H - 1)
-        d_ref = ld[v_clip, u_clip]                  # (N,)
-        valid_ref = in_img & (d_ref > 0)
-        lidar_hit_count += valid_ref.to(torch.int32)
+        # LiDAR-side voting.
+        if ld is not None:
+            cams_with_lidar += 1
+            if isinstance(ld, np.ndarray):
+                ld = torch.from_numpy(ld)
+            if ld.device != device:
+                ld = ld.to(device, non_blocking=True)
+            if ld.dim() == 3:
+                ld = ld.squeeze(0)
+            d_ref = ld[v_clip, u_clip]                  # (N,)
+            valid_ref = in_img & (d_ref > 0)
+            lidar_hit_count += valid_ref.to(torch.int32)
 
-        tau = tau_scale_mul * max_scale + tau_eps   # (N,)
-        conflict = valid_ref & ((d_g + tau) < d_ref)
-        consistent = valid_ref & ((d_g - d_ref).abs() <= tau)
-        conflict_count += conflict.to(torch.int32)
-        consistent_count += consistent.to(torch.int32)
+            # Ellipsoid-aware tau: tolerance is the Gaussian's actual semi-
+            # axis length along the camera ray, not max(scale_xyz). The
+            # world-frame camera-z direction is the third column of W2C^T
+            # (= world_view_transform), rotated into each Gaussian's local
+            # frame via R_g^T. Then extent_z² = sum_i z_local[i]² * s_i².
+            z_world = cam.world_view_transform[:3, 2]            # (3,) camera-z in world
+            z_local = torch.einsum('nji,j->ni', R_g, z_world)     # (N, 3) = R_g^T @ z_world
+            extent_z_sq = (z_local * z_local * scales_sq).sum(dim=-1)
+            extent_z = extent_z_sq.clamp(min=1e-12).sqrt()        # (N,)
+            tau = tau_scale_mul * extent_z + tau_eps              # (N,)
+            conflict = valid_ref & ((d_g + tau) < d_ref)
+            consistent = valid_ref & ((d_g - d_ref).abs() <= tau)
+            conflict_count += conflict.to(torch.int32)
+            consistent_count += consistent.to(torch.int32)
 
-    return visible_count, lidar_hit_count, conflict_count, consistent_count, cams_with_lidar
+        # Sky-mask voting.
+        if sm is not None:
+            cams_with_sky += 1
+            if isinstance(sm, np.ndarray):
+                sm = torch.from_numpy(sm)
+            if sm.device != device:
+                sm = sm.to(device, non_blocking=True)
+            if sm.dim() == 3:
+                sm = sm.squeeze(0)
+            # sky_mask is a bool tensor (True == sky pixel).
+            sky_at_pixel = sm[v_clip, u_clip].to(torch.bool)
+            # A Gaussian "conflicts with sky" when its center projects
+            # in-image and lands on a sky pixel — depth is irrelevant since
+            # sky pixels should have no BG geometry at any depth.
+            sky_conflict = in_img & sky_at_pixel
+            sky_conflict_count += sky_conflict.to(torch.int32)
+            sky_hit_view_count += in_img.to(torch.int32)
+
+    return (
+        visible_count,
+        lidar_hit_count,
+        conflict_count,
+        consistent_count,
+        sky_conflict_count,
+        sky_hit_view_count,
+        cams_with_lidar,
+        cams_with_sky,
+    )
+
+
+def _bg_scale_anomaly_score(
+    gaussians,
+    *,
+    voxel_size: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Per-Gaussian (scale_anomaly_ratio, neighbor_count_in_voxel).
+
+    Bins BG Gaussians into a voxel grid of edge `voxel_size`; for each
+    Gaussian, takes the mean max(scale_xyz) of the OTHER Gaussians in
+    the same voxel cell, and returns self_max_scale / neighbor_mean.
+
+    Gaussians alone in a voxel get ratio = 1.0 and neighbor_count = 0,
+    so they are never flagged (the caller must require
+    neighbor_count >= some minimum to act on the ratio).
+
+    Cost: O(N) hash + scatter — ~1s for 37M Gaussians on GPU. Voxel-grid
+    statistics give a coarse but cheap stand-in for true K-NN mean, which
+    is what we actually want: "is this Gaussian much bigger than its
+    neighbours, suggesting it's a balloon stand-in for a region that
+    should be filled by many small Gaussians?"
+    """
+    bg = getattr(gaussians, "background", None)
+    if bg is None or bg.get_xyz.shape[0] == 0:
+        return None
+    xyz = bg.get_xyz.detach()
+    max_scale = bg.get_scaling.detach().max(dim=1).values  # (N,)
+    device = xyz.device
+    N = xyz.shape[0]
+
+    # Hash 3D voxel id into one int64 so torch.unique stays 1-D (faster
+    # than dim-0 unique on (N, 3)). Bias by a large offset so negative
+    # world coords pack into a positive range; 21 bits per axis supports
+    # +/- 1M voxels (i.e. +/- 500 km at voxel_size = 0.5 m), well past
+    # any realistic scene extent.
+    voxel_id = torch.floor(xyz / voxel_size).to(torch.long)
+    OFFSET = 1 << 20
+    BITS = 21
+    SHIFT_X = 2 * BITS
+    SHIFT_Y = BITS
+    hashed = (
+        ((voxel_id[:, 0] + OFFSET) << SHIFT_X)
+        | ((voxel_id[:, 1] + OFFSET) << SHIFT_Y)
+        | (voxel_id[:, 2] + OFFSET)
+    )
+    _, inverse = torch.unique(hashed, return_inverse=True)
+    M = int(inverse.max().item()) + 1
+
+    voxel_sum = torch.zeros(M, device=device, dtype=torch.float32)
+    voxel_count = torch.zeros(M, device=device, dtype=torch.float32)
+    voxel_sum.scatter_add_(0, inverse, max_scale.float())
+    voxel_count.scatter_add_(0, inverse, torch.ones_like(max_scale, dtype=torch.float32))
+    per_g_sum = voxel_sum[inverse]
+    per_g_count = voxel_count[inverse]
+
+    # "Mean of neighbours" excludes the Gaussian itself.
+    nbr_sum = per_g_sum - max_scale
+    nbr_count_f = (per_g_count - 1.0).clamp(min=0.0)
+    nbr_mean = torch.where(
+        nbr_count_f > 0,
+        nbr_sum / nbr_count_f.clamp(min=1.0),
+        max_scale,  # alone -> ratio 1.0 by construction
+    )
+    ratio = max_scale / nbr_mean.clamp(min=1e-9)
+    return ratio, nbr_count_f.to(torch.int32)
 
 
 def _bg_lidar_prune_print_stats(
@@ -319,23 +449,29 @@ def _bg_lidar_prune_print_stats(
     lidar_hit_count: torch.Tensor,
     conflict_count: torch.Tensor,
     consistent_count: torch.Tensor,
+    sky_conflict_count: torch.Tensor,
+    sky_hit_view_count: torch.Tensor,
+    scale_anomaly_ratio: torch.Tensor | None,
+    scale_voxel_nbr_count: torch.Tensor | None,
     cams_with_lidar: int,
+    cams_with_sky: int,
     n_cameras: int,
     tau_scale_mul: float,
     tau_eps: float,
+    scale_voxel_size: float | None,
+    scale_min_neighbors: int,
     *,
     header: str = "[bg_lidar_prune dry-run]",
 ) -> None:
-    """Pretty-print the conflict-vote histogram and prune-candidate table.
-
-    Shared by both the dry-run path and the hard-prune path (the latter logs
-    the same stats just before dropping points, so the run record always
-    shows what was about to be cut)."""
+    """Pretty-print conflict-vote histograms (lidar + sky) and prune-candidate
+    tables. Shared by both the dry-run path and the hard-prune path (the
+    latter logs the same stats just before dropping points, so the run
+    record always shows what was about to be cut)."""
     print()
     sep = "=" * 72
     print(sep)
     print(header)
-    print(f"  cameras scanned: {n_cameras}, with lidar_depth: {cams_with_lidar}")
+    print(f"  cameras scanned: {n_cameras}, with lidar_depth: {cams_with_lidar}, with sky_mask: {cams_with_sky}")
     print(f"  tau = {tau_scale_mul} * max(scale_xyz) + {tau_eps}")
     print(f"  total BG Gaussians: {N:,}")
 
@@ -351,7 +487,7 @@ def _bg_lidar_prune_print_stats(
     )
 
     print()
-    print("  conflict-vote histogram (BG center in front of LiDAR by > tau):")
+    print("  LiDAR-conflict-vote histogram (BG center in front of LiDAR by > tau):")
     print(f"    {'range':>8}  {'count':>12}  {'pct of N':>8}  {'pct w/ lidar':>13}")
     n_with_lidar = max(int(has_lidar_hit.sum()), 1)
     for lo, hi in [(0, 0), (1, 2), (3, 5), (6, 10), (11, 20), (21, 50), (51, None)]:
@@ -368,12 +504,85 @@ def _bg_lidar_prune_print_stats(
         )
 
     print()
-    print("  prune candidates per K (conflict_views ≥ K AND conflict > consistent):")
-    print(f"    {'K':>4}  {'n_pruned':>12}  {'pct of N':>8}")
-    for K in (1, 3, 5, 10, 20, 50):
-        m = (conflict_count >= K) & (conflict_count > consistent_count)
+    print("  Sky-mask-conflict-vote histogram (BG center projects onto sky pixel):")
+    print(f"    {'range':>8}  {'count':>12}  {'pct of N':>8}")
+    for lo, hi in [(0, 0), (1, 1), (2, 5), (6, 20), (21, 100), (101, None)]:
+        if hi is None:
+            m = sky_conflict_count >= lo
+            label = f"≥{lo}"
+        else:
+            m = (sky_conflict_count >= lo) & (sky_conflict_count <= hi)
+            label = f"{lo}-{hi}" if lo != hi else f"{lo}"
         cnt = int(m.sum())
-        print(f"    {K:>4}  {cnt:>12,d}  {100. * cnt / N:>7.2f}%")
+        print(f"    {label:>8}  {cnt:>12,d}  {100. * cnt / N:>7.2f}%")
+
+    if scale_anomaly_ratio is not None and scale_voxel_nbr_count is not None:
+        print()
+        print(
+            f"  Scale-anomaly-ratio histogram (self_max_scale / voxel_mean[nbrs]; "
+            f"voxel={scale_voxel_size}m, min_nbrs={scale_min_neighbors}):"
+        )
+        print(f"    {'range':>10}  {'count':>12}  {'pct of N':>8}")
+        has_nbr = scale_voxel_nbr_count >= scale_min_neighbors
+        # Show only Gaussians with enough neighbors (rest can't be scored).
+        for lo, hi in [
+            (0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 5.0),
+            (5.0, 10.0), (10.0, 20.0), (20.0, None),
+        ]:
+            if hi is None:
+                m = has_nbr & (scale_anomaly_ratio >= lo)
+                label = f"≥{lo:.0f}"
+            else:
+                m = has_nbr & (scale_anomaly_ratio >= lo) & (scale_anomaly_ratio < hi)
+                label = f"{lo:.1f}-{hi:.1f}"
+            cnt = int(m.sum())
+            print(f"    {label:>10}  {cnt:>12,d}  {100. * cnt / N:>7.2f}%")
+        n_no_nbr = int((~has_nbr).sum())
+        print(
+            f"    {'no signal':>10}  {n_no_nbr:>12,d}  {100. * n_no_nbr / N:>7.2f}%  "
+            f"(< {scale_min_neighbors} neighbors in voxel)"
+        )
+
+    print()
+    print("  Combined prune candidates per (K_lidar, K_sky, scale_thr):")
+    print(f"    {'K_lidar':>8} {'K_sky':>6} {'scale':>6}  {'n_pruned':>12}  {'pct of N':>8}")
+    has_nbr = (
+        scale_voxel_nbr_count >= scale_min_neighbors
+        if scale_voxel_nbr_count is not None
+        else None
+    )
+    for K_lidar, K_sky, scale_thr in [
+        (5, 1, 0.0),   # default sky-aware
+        (5, 1, 5.0),
+        (5, 1, 3.0),
+        (5, 1, 2.0),
+        (5, 0, 5.0),   # scale-only on top of LiDAR=5
+        (5, 0, 3.0),
+        (0, 0, 5.0),   # scale alone
+        (0, 0, 3.0),
+        (5, 0, 0.0),   # old LiDAR-only K=5
+        (3, 0, 0.0),   # old LiDAR-only K=3
+    ]:
+        lidar_m = (
+            (conflict_count >= K_lidar) & (conflict_count > consistent_count)
+            if K_lidar > 0
+            else torch.zeros_like(conflict_count, dtype=torch.bool)
+        )
+        sky_m = (
+            sky_conflict_count >= K_sky
+            if K_sky > 0
+            else torch.zeros_like(sky_conflict_count, dtype=torch.bool)
+        )
+        if scale_thr > 0 and scale_anomaly_ratio is not None and has_nbr is not None:
+            scale_m = has_nbr & (scale_anomaly_ratio >= scale_thr)
+        else:
+            scale_m = torch.zeros_like(conflict_count, dtype=torch.bool)
+        combined = lidar_m | sky_m | scale_m
+        cnt = int(combined.sum())
+        print(
+            f"    {K_lidar:>8d} {K_sky:>6d} {scale_thr:>6.1f}  "
+            f"{cnt:>12,d}  {100. * cnt / N:>7.2f}%"
+        )
     print(sep)
 
 
@@ -383,6 +592,8 @@ def _bg_lidar_prune_dry_run(
     *,
     tau_scale_mul: float,
     tau_eps: float,
+    scale_voxel_size: float,
+    scale_min_neighbors: int,
 ) -> None:
     """Read-only conflict analysis — prints stats, does not mutate state."""
     bg = getattr(gaussians, "background", None)
@@ -394,12 +605,23 @@ def _bg_lidar_prune_dry_run(
     )
     if result is None:
         return
-    visible_count, lidar_hit_count, conflict_count, consistent_count, cams_with_lidar = result
+    (visible_count, lidar_hit_count, conflict_count, consistent_count,
+     sky_conflict_count, sky_hit_view_count,
+     cams_with_lidar, cams_with_sky) = result
     N = bg.get_xyz.shape[0]
+    scale_anomaly_ratio, scale_voxel_nbr_count = (None, None)
+    if scale_voxel_size > 0:
+        out = _bg_scale_anomaly_score(gaussians, voxel_size=scale_voxel_size)
+        if out is not None:
+            scale_anomaly_ratio, scale_voxel_nbr_count = out
     _bg_lidar_prune_print_stats(
         N, visible_count, lidar_hit_count, conflict_count, consistent_count,
-        cams_with_lidar=cams_with_lidar, n_cameras=len(cameras),
+        sky_conflict_count, sky_hit_view_count,
+        scale_anomaly_ratio, scale_voxel_nbr_count,
+        cams_with_lidar=cams_with_lidar, cams_with_sky=cams_with_sky,
+        n_cameras=len(cameras),
         tau_scale_mul=tau_scale_mul, tau_eps=tau_eps,
+        scale_voxel_size=scale_voxel_size, scale_min_neighbors=scale_min_neighbors,
         header="[bg_lidar_prune dry-run]",
     )
 
@@ -411,11 +633,20 @@ def _bg_lidar_prune_apply(
     tau_scale_mul: float,
     tau_eps: float,
     min_conflict_views: int,
+    min_sky_conflict_views: int,
+    scale_anomaly_thr: float,
+    scale_voxel_size: float,
+    scale_min_neighbors: int,
 ) -> int:
-    """Drop BG Gaussians that conflict with LiDAR in min_conflict_views views.
+    """Drop BG Gaussians flagged by any of the three signals.
 
-    Prune rule: conflict_count >= min_conflict_views AND
-                conflict_count > consistent_count.
+    Prune rule: union of
+      LiDAR  : conflict_count >= K_lidar AND conflict > consistent
+      Sky    : sky_conflict_count >= K_sky
+      Scale  : (max_scale / voxel_neighbor_mean_scale) >= scale_thr
+               AND nbr_count >= scale_min_neighbors
+    Disable a signal by setting its threshold to 0.
+
     Returns the number of Gaussians actually pruned.
 
     Called on every DDP rank — the result is deterministic given identical
@@ -431,30 +662,75 @@ def _bg_lidar_prune_apply(
     )
     if result is None:
         return 0
-    visible_count, lidar_hit_count, conflict_count, consistent_count, cams_with_lidar = result
+    (visible_count, lidar_hit_count, conflict_count, consistent_count,
+     sky_conflict_count, sky_hit_view_count,
+     cams_with_lidar, cams_with_sky) = result
+    scale_anomaly_ratio, scale_voxel_nbr_count = (None, None)
+    if scale_voxel_size > 0 and (scale_anomaly_thr > 0):
+        out = _bg_scale_anomaly_score(gaussians, voxel_size=scale_voxel_size)
+        if out is not None:
+            scale_anomaly_ratio, scale_voxel_nbr_count = out
     N_before = bg.get_xyz.shape[0]
     if is_main_process():
         _bg_lidar_prune_print_stats(
             N_before, visible_count, lidar_hit_count, conflict_count, consistent_count,
-            cams_with_lidar=cams_with_lidar, n_cameras=len(cameras),
+            sky_conflict_count, sky_hit_view_count,
+            scale_anomaly_ratio, scale_voxel_nbr_count,
+            cams_with_lidar=cams_with_lidar, cams_with_sky=cams_with_sky,
+            n_cameras=len(cameras),
             tau_scale_mul=tau_scale_mul, tau_eps=tau_eps,
-            header=f"[bg_lidar_prune apply, K={min_conflict_views}]",
+            scale_voxel_size=scale_voxel_size, scale_min_neighbors=scale_min_neighbors,
+            header=(
+                f"[bg_lidar_prune apply, K_lidar={min_conflict_views}, "
+                f"K_sky={min_sky_conflict_views}, scale_thr={scale_anomaly_thr}]"
+            ),
         )
 
-    prune_mask = (conflict_count >= int(min_conflict_views)) & (
-        conflict_count > consistent_count
+    K_lidar = int(min_conflict_views)
+    K_sky = int(min_sky_conflict_views)
+    lidar_mask = (
+        (conflict_count >= K_lidar) & (conflict_count > consistent_count)
+        if K_lidar > 0
+        else torch.zeros_like(conflict_count, dtype=torch.bool)
     )
+    sky_mask = (
+        sky_conflict_count >= K_sky
+        if K_sky > 0
+        else torch.zeros_like(sky_conflict_count, dtype=torch.bool)
+    )
+    if (
+        scale_anomaly_thr > 0
+        and scale_anomaly_ratio is not None
+        and scale_voxel_nbr_count is not None
+    ):
+        scale_mask = (
+            (scale_voxel_nbr_count >= int(scale_min_neighbors))
+            & (scale_anomaly_ratio >= float(scale_anomaly_thr))
+        )
+    else:
+        scale_mask = torch.zeros_like(conflict_count, dtype=torch.bool)
+    prune_mask = lidar_mask | sky_mask | scale_mask
     n_prune = int(prune_mask.sum())
+    n_lidar_only = int((lidar_mask & ~sky_mask & ~scale_mask).sum())
+    n_sky_only = int((sky_mask & ~lidar_mask & ~scale_mask).sum())
+    n_scale_only = int((scale_mask & ~lidar_mask & ~sky_mask).sum())
+    n_overlap = n_prune - n_lidar_only - n_sky_only - n_scale_only
     if n_prune == 0:
         if is_main_process():
-            print(f"[bg_lidar_prune] no Gaussians match prune rule at K={min_conflict_views}; nothing to do")
+            print(
+                f"[bg_lidar_prune] no Gaussians match prune rule "
+                f"(K_lidar={K_lidar}, K_sky={K_sky}, scale_thr={scale_anomaly_thr}); "
+                f"nothing to do"
+            )
         return 0
     bg.prune_points(prune_mask)
     N_after = bg.get_xyz.shape[0]
     if is_main_process():
         print(
             f"[bg_lidar_prune] pruned {n_prune:,} / {N_before:,} "
-            f"({100. * n_prune / N_before:.2f}%) -> BG now has {N_after:,} Gaussians"
+            f"({100. * n_prune / N_before:.2f}%) -> BG now has {N_after:,} Gaussians  "
+            f"[breakdown: lidar-only={n_lidar_only:,}, sky-only={n_sky_only:,}, "
+            f"scale-only={n_scale_only:,}, overlap={n_overlap:,}]"
         )
     return n_prune
 
@@ -741,6 +1017,10 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             tau_scale_mul=float(training_args.get("bg_lidar_prune_tau_scale_mul", 3.0)),
             tau_eps=float(training_args.get("bg_lidar_prune_tau_eps", 0.05)),
             min_conflict_views=int(training_args.get("bg_lidar_prune_min_conflict_views", 5)),
+            min_sky_conflict_views=int(training_args.get("bg_lidar_prune_min_sky_conflict_views", 1)),
+            scale_anomaly_thr=float(training_args.get("bg_lidar_prune_scale_anomaly_thr", 5.0)),
+            scale_voxel_size=float(training_args.get("bg_lidar_prune_scale_voxel_size", 0.5)),
+            scale_min_neighbors=int(training_args.get("bg_lidar_prune_scale_min_neighbors", 3)),
         )
 
     print(f'Starting from {start_iter}')
@@ -927,6 +1207,8 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 scene.getTrainCameras(),
                 tau_scale_mul=float(training_args.get("bg_lidar_prune_tau_scale_mul", 3.0)),
                 tau_eps=float(training_args.get("bg_lidar_prune_tau_eps", 0.05)),
+                scale_voxel_size=float(training_args.get("bg_lidar_prune_scale_voxel_size", 0.5)),
+                scale_min_neighbors=int(training_args.get("bg_lidar_prune_scale_min_neighbors", 3)),
             )
             print("[bg_lidar_prune] dry-run complete — returning before training loop")
         if is_distributed():

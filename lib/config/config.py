@@ -49,9 +49,13 @@ cfg.train.bg_init_from = ''  # Path to a checkpoint whose `background` state sho
 cfg.train.obj_init_from = ''  # Path to a `merged_obj` checkpoint produced by script/experiments/merge_obj_checkpoints.py. The loader matches actors across segments via the seq_id <-> T4 track_id maps and replaces each obj_<full_seq_id>'s freshly-built state with the best-segment's trained state. Leave empty for normal flow.
 cfg.train.bg_lidar_prune_dry_run = False  # If True, after bg_init_from loads, vote every train view's lidar_depth against each merged BG Gaussian's center depth, print a conflict-vote histogram, then exit. Read-only — used to pick prune thresholds before enabling hard prune.
 cfg.train.bg_lidar_prune_enable = False  # If True, hard-prune merged BG Gaussians whose center sits in front of LiDAR returns in >= bg_lidar_prune_min_conflict_views views (and conflict outnumbers consistent). Runs once after bg_init_from + obj_init_from, before the training loop.
-cfg.train.bg_lidar_prune_min_conflict_views = 5  # K threshold: a Gaussian is pruned only when it conflicts with LiDAR in at least this many views AND conflict_count > consistent_count. 5 is a conservative starting point per dry-run histogram (>= K=5 ~6% of N).
+cfg.train.bg_lidar_prune_min_conflict_views = 5  # K_lidar threshold: a Gaussian is pruned via LiDAR signal when it conflicts with LiDAR in at least this many views AND conflict_count > consistent_count. Set 0 to disable the LiDAR signal entirely.
+cfg.train.bg_lidar_prune_min_sky_conflict_views = 1  # K_sky threshold: a Gaussian is pruned via sky-mask signal when its center projects onto a sky_mask pixel in at least this many views. Sky belongs to sky_cubemap, never to BG, so K_sky=1 (any one view) is the natural default. Set 0 to disable the sky signal.
 cfg.train.bg_lidar_prune_tau_scale_mul = 3.0  # A Gaussian is flagged as "in front of LiDAR" only when (center_depth + tau) < lidar_depth, where tau = tau_scale_mul * max(scaling_xyz) + tau_eps. Larger -> more permissive (Gaussian radius is forgiven).
 cfg.train.bg_lidar_prune_tau_eps = 0.05  # Absolute slack (scene-unit meters) added to tau on top of the scale-derived term.
+cfg.train.bg_lidar_prune_scale_anomaly_thr = 5.0  # Scale-anomaly threshold: a Gaussian is pruned when its max(scale_xyz) is >= this multiple of the mean max(scale_xyz) of OTHER Gaussians in the same voxel cell. Set 0 to disable the scale signal.
+cfg.train.bg_lidar_prune_scale_voxel_size = 0.5  # Voxel edge length (scene-unit meters) used to bin Gaussians for the scale-anomaly check. Larger -> coarser neighborhood definition.
+cfg.train.bg_lidar_prune_scale_min_neighbors = 3  # Minimum neighbor Gaussians (excluding self) in the same voxel before the scale-anomaly score is acted on. Avoids flagging Gaussians in very sparse voxels where the mean estimate is noisy.
 
 cfg.optim = CN()
 cfg.optim.use_amp = False # If set to True, use Automatic Mixed Precision (AMP) for training.

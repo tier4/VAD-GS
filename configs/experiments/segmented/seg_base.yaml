@@ -141,7 +141,7 @@ optim:
   track_rotation_max_steps: 30000
 
   normal_loss: True
-  use_voxel_depth: True
+  use_voxel_depth: False
   use_lidar_depth: False
   skip_view_selection: False
 
