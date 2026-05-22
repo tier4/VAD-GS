@@ -89,6 +89,18 @@ cfg.optim.lambda_sky_scale = []
 cfg.optim.lambda_semantic = 0.
 cfg.optim.lambda_reg = 0.
 cfg.optim.lambda_depth_lidar = 0.
+# Continuous "free-space" LiDAR loss: at each iter, project every BG
+# Gaussian center into the current view; if the center sits in front of
+# a positive LiDAR return ((d_g + tau) < lidar_depth) it lands in
+# observed empty space, so we add a differentiable penalty on those
+# Gaussians' opacity to push them away. Uses the same ellipsoid-aware
+# tau formula as bg_lidar_prune (tau = tau_scale_mul * extent_along_ray
+# + tau_eps). Geometry is detached for the mask — only opacity
+# receives gradient, which composes naturally with densify/prune.
+cfg.optim.lambda_lidar_freespace = 0.
+cfg.optim.lidar_freespace_tau_scale_mul = 3.0
+cfg.optim.lidar_freespace_tau_eps = 0.05
+cfg.optim.lidar_freespace_start_iter = 0  # delay activation until BG has had time to settle; 0 means active from iter 1.
 cfg.optim.lambda_depth_mono = 0.
 cfg.optim.lambda_normal_mono = 0.
 cfg.optim.lambda_color_correction = 0.

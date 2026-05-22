@@ -2103,6 +2103,68 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                         loss += optim_args.lambda_depth_lidar * voxel_depth_loss
                         del expected_depth, depth_error, voxel_depth_loss
 
+            # Continuous free-space LiDAR loss: penalize BG Gaussians whose
+            # center projects into observed empty space (d_g + tau < lidar).
+            # Geometry (xyz, scale, rot) is detached so gradient flows only
+            # through opacity — these Gaussians fade out rather than fleeing
+            # the ray. Mirrors the bg_lidar_prune mask criterion so the two
+            # mechanisms agree on what counts as a free-space conflict.
+            with perf_section("loss_lidar_freespace"):
+                if (
+                    optim_args.lambda_lidar_freespace > 0
+                    and iteration >= optim_args.lidar_freespace_start_iter
+                    and lidar_depth is not None
+                    and getattr(gaussians, "background", None) is not None
+                    and gaussians.background.get_xyz.shape[0] > 0
+                ):
+                    bg = gaussians.background
+                    with torch.no_grad():
+                        xyz_d = bg.get_xyz.detach()
+                        N_bg = xyz_d.shape[0]
+                        pts_h = torch.cat(
+                            [xyz_d, torch.ones((N_bg, 1), device=xyz_d.device, dtype=xyz_d.dtype)],
+                            dim=-1,
+                        )
+                        view_pts = (pts_h @ viewpoint_cam.world_view_transform)[:, :3]
+                        d_g = view_pts[:, 2]
+                        in_front = d_g > viewpoint_cam.znear
+
+                        proj = view_pts @ viewpoint_cam.K.T
+                        z = proj[:, 2].clamp(min=1e-6)
+                        u_i = (proj[:, 0] / z).round().long()
+                        v_i = (proj[:, 1] / z).round().long()
+                        ld = lidar_depth.squeeze(0) if lidar_depth.dim() == 3 else lidar_depth
+                        H_img, W_img = ld.shape[-2], ld.shape[-1]
+                        in_img = in_front & (u_i >= 0) & (u_i < W_img) & (v_i >= 0) & (v_i < H_img)
+
+                        conflict_mask = torch.zeros(N_bg, dtype=torch.bool, device=xyz_d.device)
+                        if in_img.any():
+                            u_clip = u_i.clamp(0, W_img - 1)
+                            v_clip = v_i.clamp(0, H_img - 1)
+                            d_ref = ld[v_clip, u_clip]
+                            valid_ref = in_img & (d_ref > 0)
+                            if valid_ref.any():
+                                # Ellipsoid extent along the camera ray (matches
+                                # _bg_lidar_prune_scan exactly).
+                                scales_sq = (bg.get_scaling.detach()) ** 2
+                                R_g = quaternion_to_matrix(bg.get_rotation.detach())
+                                z_world = viewpoint_cam.world_view_transform[:3, 2]
+                                z_local = torch.einsum('nji,j->ni', R_g, z_world)
+                                extent_z = (z_local * z_local * scales_sq).sum(dim=-1).clamp(min=1e-12).sqrt()
+                                tau = optim_args.lidar_freespace_tau_scale_mul * extent_z + optim_args.lidar_freespace_tau_eps
+                                conflict_mask = valid_ref & ((d_g + tau) < d_ref)
+
+                    n_conflict = int(conflict_mask.sum().item())
+                    if n_conflict > 0:
+                        # get_opacity is post-sigmoid in (0, 1); L1 mean pushes
+                        # conflicting Gaussians' opacity toward 0.
+                        opacity_bg = bg.get_opacity.squeeze(-1)
+                        freespace_loss = opacity_bg[conflict_mask].mean()
+                        _pending_scalars.append(('lidar_freespace_loss', freespace_loss.detach()))
+                        _pending_scalars.append(('lidar_freespace_n', torch.tensor(float(n_conflict), device=opacity_bg.device)))
+                        loss += optim_args.lambda_lidar_freespace * freespace_loss
+                        del opacity_bg, freespace_loss
+
 
             # color correction loss
             with perf_section("loss_color_correction"):

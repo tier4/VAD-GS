@@ -127,6 +127,14 @@ optim:
   lambda_mask: 0.1
   lambda_reg: 0.1
   lambda_depth_lidar: 0.1
+  # Continuous free-space LiDAR opacity penalty (BG only). When > 0,
+  # BG Gaussians whose center projects in front of a positive LiDAR
+  # return are pushed toward opacity 0 (differentiable counterpart of
+  # bg_lidar_prune). Default 0 = off; set ~0.05–0.2 in the run config.
+  lambda_lidar_freespace: 0
+  lidar_freespace_tau_scale_mul: 3.0
+  lidar_freespace_tau_eps: 0.05
+  lidar_freespace_start_iter: 0
   lambda_shape_pena: 0
   lambda_scale_pena: 0
 
