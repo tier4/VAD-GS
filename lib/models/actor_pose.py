@@ -101,7 +101,16 @@ class ActorPose(nn.Module):
         q1 = torch.nn.functional.normalize(q1, dim=-1)
         dot = (q0 * q1).sum(dim=-1, keepdim=True)
         q1 = torch.where(dot < 0, -q1, q1)
-        cos_omega = dot.abs().clamp(max=1.0)
+        # clamp strictly below 1.0: d/dx acos(x) = -1/sqrt(1-x^2) is -inf at
+        # x=1, so even though the small-omega forward branch masks out the
+        # s0/denom path, the chain rule still evaluates `0 * (-inf) = NaN`
+        # through acos and poisons opt_rots.grad. For an actor with nearly
+        # constant rotation between two adjacent frames (parked or
+        # straight-driving car), q0 ≈ q1 ⇒ dot ≈ 1 ⇒ this triggers on iter 0
+        # and silently NaNs every actor's _xyz by iter 1. (1 - 1e-7) keeps
+        # the slerp result bit-identical for any rotation > ~0.025° while
+        # making the acos gradient finite everywhere.
+        cos_omega = dot.abs().clamp(max=1.0 - 1e-7)
         omega = torch.acos(cos_omega)
         sin_omega = torch.sin(omega)
         t = t.to(q0.dtype).unsqueeze(-1)
