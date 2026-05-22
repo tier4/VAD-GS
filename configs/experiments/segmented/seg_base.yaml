@@ -127,6 +127,11 @@ optim:
   lambda_mask: 0.1
   lambda_reg: 0.1
   lambda_depth_lidar: 0.1
+  # Skip obj in opacity_reset (would otherwise trigger the actor-death
+  # cascade: opacity=0.01 -> rotation grad explodes -> quaternion goes
+  # NaN -> Gaussians culled by rasterizer -> BG silently bakes in the
+  # actor). See cfg.optim.opacity_reset_exclude_obj docstring.
+  opacity_reset_exclude_obj: True
   # Continuous free-space LiDAR opacity penalty (BG only). When > 0,
   # BG Gaussians whose center projects in front of a positive LiDAR
   # return are pushed toward opacity 0 (differentiable counterpart of

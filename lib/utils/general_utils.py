@@ -123,9 +123,18 @@ def quaternion_to_matrix_numpy(r):
 
 
 def quaternion_to_matrix(r):
+    # Clamp norm before division: a quaternion can drift toward zero
+    # norm during training (most often for actor _rotation when low
+    # opacity makes the rendering gradient on rotation unstable), and
+    # an unprotected r/norm then produces NaN that silently propagates
+    # through densify_and_split into _xyz. The CUDA rasterizer culls
+    # NaN-coord Gaussians, so the symptom is silent actor death + BG
+    # burn-in — no loss/PSNR warning. eps=1e-8 is large enough to dwarf
+    # fp32 round-off near the unit-quaternion manifold yet small enough
+    # to leave the healthy gradient signal untouched.
     norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
 
-    q = r / norm[:, None]
+    q = r / norm.clamp(min=1e-8)[:, None]
 
     R = torch.zeros((q.size(0), 3, 3), device='cuda')
 

@@ -47,6 +47,7 @@ cfg.train.preload_vram = False  # if True, preload all train views to VRAM at st
 cfg.train.log_image_interval = 100  # save a debug composite to <model_path>/log_images every N iters. Raise to reduce disk I/O (esp. for parallel sweep agents).
 cfg.train.bg_init_from = ''  # Path to a checkpoint whose `background` state should overwrite the freshly-built BG model after training_setup. Used by the segmented-BG-merge pipeline (see configs/experiments/segmented/finetune_merged.yaml) to fine-tune from a stack of per-segment BG Gaussians. Leave empty for normal flow.
 cfg.train.obj_init_from = ''  # Path to a `merged_obj` checkpoint produced by script/experiments/merge_obj_checkpoints.py. The loader matches actors across segments via the seq_id <-> T4 track_id maps and replaces each obj_<full_seq_id>'s freshly-built state with the best-segment's trained state. Leave empty for normal flow.
+cfg.train.nan_check_interval = 50  # After optimizer step, scan every model's _xyz / _rotation for NaN every N iters. 0 disables. Catches actor-rotation divergence at the iter it happens (instead of letting the rasterizer silently cull NaN-coord Gaussians while BG bakes in the actor — see commit fixing quaternion_to_matrix).
 cfg.train.bg_lidar_prune_dry_run = False  # If True, after bg_init_from loads, vote every train view's lidar_depth against each merged BG Gaussian's center depth, print a conflict-vote histogram, then exit. Read-only — used to pick prune thresholds before enabling hard prune.
 cfg.train.bg_lidar_prune_enable = False  # If True, hard-prune merged BG Gaussians whose center sits in front of LiDAR returns in >= bg_lidar_prune_min_conflict_views views (and conflict outnumbers consistent). Runs once after bg_init_from + obj_init_from, before the training loop.
 cfg.train.bg_lidar_prune_min_conflict_views = 5  # K_lidar threshold: a Gaussian is pruned via LiDAR signal when it conflicts with LiDAR in at least this many views AND conflict_count > consistent_count. Set 0 to disable the LiDAR signal entirely.
@@ -89,6 +90,15 @@ cfg.optim.lambda_sky_scale = []
 cfg.optim.lambda_semantic = 0.
 cfg.optim.lambda_reg = 0.
 cfg.optim.lambda_depth_lidar = 0.
+# When True, opacity_reset() skips obj_* submodels. The reset is a 3DGS
+# trick to deflate BG floaters, but for actors it pushes opacity to 0.01
+# while the BG has enough capacity to fake the actor's pixels, so the
+# actor's rendering gradient collapses, its _rotation drifts toward zero
+# norm, and quaternion_to_matrix produces NaN that silently propagates
+# into _xyz (NaN-coord Gaussians get culled by the rasterizer, so loss
+# and PSNR look OK while every actor dies). Leave False for BG-only
+# scenes; turn ON for any segment / fine-tune that has obj models.
+cfg.optim.opacity_reset_exclude_obj = False
 # Continuous "free-space" LiDAR loss: at each iter, project every BG
 # Gaussian center into the current view; if the center sits in front of
 # a positive LiDAR return ((d_g + tau) < lidar_depth) it lands in

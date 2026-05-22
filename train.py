@@ -2344,12 +2344,14 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                             scalar_dict.update(scalars)
                             tensor_dict.update(tensors)
 
-            # Reset opacity
+            # Reset opacity. exclude_obj guards against the actor-death
+            # cascade documented at cfg.optim.opacity_reset_exclude_obj.
             if iteration < optim_args.densify_until_iter:
+                _reset_exclude = ['obj_'] if optim_args.get('opacity_reset_exclude_obj', False) else []
                 if iteration % optim_args.opacity_reset_interval == 0:
-                    gaussians.reset_opacity()
+                    gaussians.reset_opacity(exclude_list=_reset_exclude)
                 if data_args.white_background and iteration == optim_args.densify_from_iter:
-                    gaussians.reset_opacity()
+                    gaussians.reset_opacity(exclude_list=_reset_exclude)
 
             with perf_section("training_report"):
                 # NOTE: called on every rank — eval is sharded inside via
@@ -2367,6 +2369,32 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                     scaler.update()
                     if is_distributed():
                         sync_grad_scaler(scaler)
+
+                # NaN guard. The CUDA rasterizer culls Gaussians whose
+                # projected coords are NaN, so an actor whose _rotation
+                # / _xyz has gone NaN renders as "absent" — loss, PSNR,
+                # and gradient norms all look fine while every actor in
+                # the scene silently dies and the BG bakes in the
+                # actor's pixels. Scan every nan_check_interval iters
+                # right after the optimizer step so we fail loudly at
+                # the iter the corruption first appears.
+                _nan_check_iv = int(training_args.get('nan_check_interval', 50) or 0)
+                if _nan_check_iv > 0 and iteration % _nan_check_iv == 0:
+                    for _mname in gaussians.model_name_id.keys():
+                        _m = getattr(gaussians, _mname)
+                        for _pname in ('_xyz', '_rotation'):
+                            _p = getattr(_m, _pname, None)
+                            if _p is None:
+                                continue
+                            _nan = int(torch.isnan(_p).sum())
+                            if _nan > 0:
+                                raise RuntimeError(
+                                    f"[NaN guard] iter={iteration} model={_mname} "
+                                    f"{_pname} has {_nan}/{_p.numel()} NaN values "
+                                    f"(shape={tuple(_p.shape)}). "
+                                    f"See cfg.optim.opacity_reset_exclude_obj / "
+                                    f"quaternion_to_matrix eps fixes."
+                                )
 
             if (iteration in training_args.checkpoint_iterations) and is_main_process():
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
