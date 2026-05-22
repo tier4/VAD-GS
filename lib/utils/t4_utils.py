@@ -999,6 +999,25 @@ def _build_pointcloud_t4(
 
         lidar_points_sensor = read_lidar_t4(lidar_path)
 
+        # Drop returns that fall inside the ego-vehicle envelope (lidar hits
+        # on its own roof / hood / mirrors). A rectangular bbox in the lidar
+        # sensor frame matches the T4 vehicle geometry better than a sphere:
+        # inspecting a single frame of LIDAR_CONCAT shows a clearly blind
+        # interior (X ∈ [-2.5, 2.5], Y ∈ [-0.5, 1.0]) surrounded by a halo of
+        # near-sensor returns from mirrors / pillars / accessories sticking
+        # out laterally (Y reach ±2.5 m). Returns vertically span only Z ∈
+        # [-0.04, 1.75] m relative to the sensor.
+        # The envelope below is a slightly inflated AABB that catches that
+        # halo while leaving genuine road / roadside returns alone (they sit
+        # at Y ≳ 2.5 m or X ≳ 3 m for the closest road tiles).
+        _EGO_BBOX_MIN = np.array([-3.0, -1.5,  -2.0], dtype=lidar_points_sensor.dtype)
+        _EGO_BBOX_MAX = np.array([ 3.0,  2.0,   2.5], dtype=lidar_points_sensor.dtype)
+        _ego_inside = (
+            (lidar_points_sensor >= _EGO_BBOX_MIN).all(axis=1)
+            & (lidar_points_sensor <= _EGO_BBOX_MAX).all(axis=1)
+        )
+        lidar_points_sensor = lidar_points_sensor[~_ego_inside]
+
         # Transform LiDAR points: sensor -> ego -> world (normalized)
         lidar_ego_pose = ego_pose_by_token[lidar_sd["ego_pose_token"]]
         l_sensor_to_ego = make_transform(lidar_cs["translation"], lidar_cs["rotation"])
