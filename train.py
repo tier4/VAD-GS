@@ -213,6 +213,252 @@ def _lru_touch_bkgd_voxel_cache(tracker: OrderedDict, cam, max_size: int = BKGD_
                 pass
 
 
+# --- BG-vs-LiDAR conflict analysis (dry-run + hard prune) -------------------
+# After bg_init_from stacks per-segment BG checkpoints, many merged Gaussians
+# can sit "in front of" LiDAR returns — visible as the foliage-like floaters
+# in iter ~1000 renders. The soft lidar_depth loss decays them slowly through
+# alpha blending; this group of helpers replaces that slow correction with a
+# one-shot prune: for every (Gaussian, view) pair we vote conflict/consistent
+# against the per-pixel LiDAR depth, then drop Gaussians that lose the vote
+# by K or more across views.
+def _bg_lidar_prune_scan(
+    gaussians,
+    cameras: list,
+    *,
+    tau_scale_mul: float,
+    tau_eps: float,
+) -> tuple | None:
+    """Vote every (BG Gaussian, camera) pair against lidar_depth.
+
+    Per pair: project g.xyz into c → (u, v, d_g); look up lidar_depth d_ref;
+    if d_ref > 0 then count this view as either:
+        conflict   when d_g + tau < d_ref         (Gaussian sits in front)
+        consistent when |d_g - d_ref| <= tau      (Gaussian on LiDAR surface)
+    with tau = tau_scale_mul * max(g.scaling) + tau_eps.
+
+    Returns (visible_count, lidar_hit_count, conflict_count, consistent_count,
+    cams_with_lidar) — all int32 tensors of shape (N,) on the BG device, or
+    None if there is no BG model / no Gaussians.
+    """
+    bg = getattr(gaussians, "background", None)
+    if bg is None:
+        print("[bg_lidar_prune] no background model on gaussians; skipping")
+        return None
+
+    xyz = bg.get_xyz.detach()
+    N = xyz.shape[0]
+    if N == 0:
+        print("[bg_lidar_prune] background has 0 Gaussians; skipping")
+        return None
+    scales = bg.get_scaling.detach()                # (N, 3)
+    max_scale = scales.max(dim=1).values            # (N,)
+    device = xyz.device
+    pts_h = torch.cat(
+        [xyz, torch.ones((N, 1), device=device, dtype=xyz.dtype)], dim=-1,
+    )  # (N, 4) world homogeneous, row-vector form
+
+    visible_count = torch.zeros(N, dtype=torch.int32, device=device)
+    lidar_hit_count = torch.zeros(N, dtype=torch.int32, device=device)
+    conflict_count = torch.zeros(N, dtype=torch.int32, device=device)
+    consistent_count = torch.zeros(N, dtype=torch.int32, device=device)
+
+    cams_with_lidar = 0
+    for cam in tqdm(
+        cameras,
+        desc="[bg_lidar_prune] scanning",
+        unit="view",
+        disable=not is_main_process(),
+    ):
+        # LazyGuidanceDict triggers a disk read on .get() if not already
+        # cached; both LazyGuidanceDict and plain dict expose .get(key, None).
+        ld = cam.guidance.get("lidar_depth")
+        if ld is None:
+            continue
+        cams_with_lidar += 1
+        if isinstance(ld, np.ndarray):
+            ld = torch.from_numpy(ld)
+        if ld.device != device:
+            ld = ld.to(device, non_blocking=True)
+        if ld.dim() == 3:
+            ld = ld.squeeze(0)
+        H, W = int(ld.shape[-2]), int(ld.shape[-1])
+
+        # world_view_transform is stored as W2C^T (see Camera.__init__), so
+        # for row vectors:  pts_h @ wvt == (W2C @ pts_h^T)^T == view_pts_h.
+        view_pts_h = pts_h @ cam.world_view_transform
+        view_pts = view_pts_h[:, :3]
+        d_g = view_pts[:, 2]
+        in_front = d_g > cam.znear
+
+        # Pinhole projection through K (pixel-space intrinsic).
+        proj = view_pts @ cam.K.T                   # (N, 3)
+        z = proj[:, 2].clamp(min=1e-6)
+        u_i = (proj[:, 0] / z).round().long()
+        v_i = (proj[:, 1] / z).round().long()
+        in_img = in_front & (u_i >= 0) & (u_i < W) & (v_i >= 0) & (v_i < H)
+        visible_count += in_img.to(torch.int32)
+
+        u_clip = u_i.clamp(0, W - 1)
+        v_clip = v_i.clamp(0, H - 1)
+        d_ref = ld[v_clip, u_clip]                  # (N,)
+        valid_ref = in_img & (d_ref > 0)
+        lidar_hit_count += valid_ref.to(torch.int32)
+
+        tau = tau_scale_mul * max_scale + tau_eps   # (N,)
+        conflict = valid_ref & ((d_g + tau) < d_ref)
+        consistent = valid_ref & ((d_g - d_ref).abs() <= tau)
+        conflict_count += conflict.to(torch.int32)
+        consistent_count += consistent.to(torch.int32)
+
+    return visible_count, lidar_hit_count, conflict_count, consistent_count, cams_with_lidar
+
+
+def _bg_lidar_prune_print_stats(
+    N: int,
+    visible_count: torch.Tensor,
+    lidar_hit_count: torch.Tensor,
+    conflict_count: torch.Tensor,
+    consistent_count: torch.Tensor,
+    cams_with_lidar: int,
+    n_cameras: int,
+    tau_scale_mul: float,
+    tau_eps: float,
+    *,
+    header: str = "[bg_lidar_prune dry-run]",
+) -> None:
+    """Pretty-print the conflict-vote histogram and prune-candidate table.
+
+    Shared by both the dry-run path and the hard-prune path (the latter logs
+    the same stats just before dropping points, so the run record always
+    shows what was about to be cut)."""
+    print()
+    sep = "=" * 72
+    print(sep)
+    print(header)
+    print(f"  cameras scanned: {n_cameras}, with lidar_depth: {cams_with_lidar}")
+    print(f"  tau = {tau_scale_mul} * max(scale_xyz) + {tau_eps}")
+    print(f"  total BG Gaussians: {N:,}")
+
+    has_any_view = visible_count > 0
+    print(
+        f"  projected into ≥1 view  : {int(has_any_view.sum()):>12,d}  "
+        f"({100. * has_any_view.float().mean().item():>5.1f}%)"
+    )
+    has_lidar_hit = lidar_hit_count > 0
+    print(
+        f"  has valid lidar in ≥1 vw: {int(has_lidar_hit.sum()):>12,d}  "
+        f"({100. * has_lidar_hit.float().mean().item():>5.1f}%)"
+    )
+
+    print()
+    print("  conflict-vote histogram (BG center in front of LiDAR by > tau):")
+    print(f"    {'range':>8}  {'count':>12}  {'pct of N':>8}  {'pct w/ lidar':>13}")
+    n_with_lidar = max(int(has_lidar_hit.sum()), 1)
+    for lo, hi in [(0, 0), (1, 2), (3, 5), (6, 10), (11, 20), (21, 50), (51, None)]:
+        if hi is None:
+            m = conflict_count >= lo
+            label = f"≥{lo}"
+        else:
+            m = (conflict_count >= lo) & (conflict_count <= hi)
+            label = f"{lo}-{hi}"
+        cnt = int(m.sum())
+        print(
+            f"    {label:>8}  {cnt:>12,d}  {100. * cnt / N:>7.2f}%  "
+            f"{100. * cnt / n_with_lidar:>12.2f}%"
+        )
+
+    print()
+    print("  prune candidates per K (conflict_views ≥ K AND conflict > consistent):")
+    print(f"    {'K':>4}  {'n_pruned':>12}  {'pct of N':>8}")
+    for K in (1, 3, 5, 10, 20, 50):
+        m = (conflict_count >= K) & (conflict_count > consistent_count)
+        cnt = int(m.sum())
+        print(f"    {K:>4}  {cnt:>12,d}  {100. * cnt / N:>7.2f}%")
+    print(sep)
+
+
+def _bg_lidar_prune_dry_run(
+    gaussians,
+    cameras: list,
+    *,
+    tau_scale_mul: float,
+    tau_eps: float,
+) -> None:
+    """Read-only conflict analysis — prints stats, does not mutate state."""
+    bg = getattr(gaussians, "background", None)
+    if bg is None:
+        return
+    result = _bg_lidar_prune_scan(
+        gaussians, cameras,
+        tau_scale_mul=tau_scale_mul, tau_eps=tau_eps,
+    )
+    if result is None:
+        return
+    visible_count, lidar_hit_count, conflict_count, consistent_count, cams_with_lidar = result
+    N = bg.get_xyz.shape[0]
+    _bg_lidar_prune_print_stats(
+        N, visible_count, lidar_hit_count, conflict_count, consistent_count,
+        cams_with_lidar=cams_with_lidar, n_cameras=len(cameras),
+        tau_scale_mul=tau_scale_mul, tau_eps=tau_eps,
+        header="[bg_lidar_prune dry-run]",
+    )
+
+
+def _bg_lidar_prune_apply(
+    gaussians,
+    cameras: list,
+    *,
+    tau_scale_mul: float,
+    tau_eps: float,
+    min_conflict_views: int,
+) -> int:
+    """Drop BG Gaussians that conflict with LiDAR in min_conflict_views views.
+
+    Prune rule: conflict_count >= min_conflict_views AND
+                conflict_count > consistent_count.
+    Returns the number of Gaussians actually pruned.
+
+    Called on every DDP rank — the result is deterministic given identical
+    inputs (the BG state and the train cameras are shared across ranks), so
+    each rank ends up with the same pruned BG without needing a broadcast.
+    """
+    bg = getattr(gaussians, "background", None)
+    if bg is None:
+        return 0
+    result = _bg_lidar_prune_scan(
+        gaussians, cameras,
+        tau_scale_mul=tau_scale_mul, tau_eps=tau_eps,
+    )
+    if result is None:
+        return 0
+    visible_count, lidar_hit_count, conflict_count, consistent_count, cams_with_lidar = result
+    N_before = bg.get_xyz.shape[0]
+    if is_main_process():
+        _bg_lidar_prune_print_stats(
+            N_before, visible_count, lidar_hit_count, conflict_count, consistent_count,
+            cams_with_lidar=cams_with_lidar, n_cameras=len(cameras),
+            tau_scale_mul=tau_scale_mul, tau_eps=tau_eps,
+            header=f"[bg_lidar_prune apply, K={min_conflict_views}]",
+        )
+
+    prune_mask = (conflict_count >= int(min_conflict_views)) & (
+        conflict_count > consistent_count
+    )
+    n_prune = int(prune_mask.sum())
+    if n_prune == 0:
+        if is_main_process():
+            print(f"[bg_lidar_prune] no Gaussians match prune rule at K={min_conflict_views}; nothing to do")
+        return 0
+    bg.prune_points(prune_mask)
+    N_after = bg.get_xyz.shape[0]
+    if is_main_process():
+        print(
+            f"[bg_lidar_prune] pruned {n_prune:,} / {N_before:,} "
+            f"({100. * n_prune / N_before:.2f}%) -> BG now has {N_after:,} Gaussians"
+        )
+    return n_prune
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -230,6 +476,83 @@ except ImportError:
 def _wandb_active() -> bool:
     """True when a wandb run has been initialised (by the sweep wrapper)."""
     return WANDB_FOUND and getattr(_wandb, "run", None) is not None
+
+
+def _load_dotenv_for_wandb() -> None:
+    """Populate WANDB_ENTITY / WANDB_PROJECT from <repo>/.env when not already set.
+
+    Mirrors script/sweep/sweep_run.py:_load_dotenv so a `torchrun train.py ...`
+    invocation (no sweep wrapper) can still find the wandb credentials the
+    sweep flow uses.
+    """
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, "r") as f:
+        for raw in f.read().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+def _init_wandb_for_direct_run(cfg) -> None:
+    """Initialise wandb when train.py is invoked directly (i.e. not via a sweep).
+
+    Guards:
+      * If wandb is not installed → no-op.
+      * If WANDB_DISABLED is truthy → no-op (escape hatch).
+      * If a wandb run already exists (sweep wrapper called init) → no-op.
+      * Only rank 0 calls wandb.init() — otherwise 8 GPUs create 8 runs.
+
+    Run name uses `cfg.exp_name` so the wandb UI shows e.g.
+    `e34_e4_pdense015` instead of a random adjective-noun handle.
+    """
+    if not WANDB_FOUND:
+        return
+    if os.environ.get("WANDB_DISABLED", "").lower() in ("1", "true", "yes"):
+        return
+    if not is_main_process():
+        return
+    if _wandb_active():
+        return  # sweep wrapper already did wandb.init()
+
+    _load_dotenv_for_wandb()
+    entity = os.environ.get("WANDB_ENTITY") or None
+    project = os.environ.get("WANDB_PROJECT") or None
+    if not project:
+        # No credentials configured — silently stay offline rather than error.
+        return
+
+    try:
+        import yaml as _yaml
+        wandb_config = _yaml.safe_load(cfg.dump())
+    except Exception:
+        wandb_config = None
+
+    try:
+        run = _wandb.init(
+            entity=entity,
+            project=project,
+            name=cfg.exp_name,
+            group=os.environ.get("WANDB_RUN_GROUP") or "experiments",
+            tags=["direct", str(cfg.task)] if cfg.task else ["direct"],
+            config=wandb_config,
+            settings=_wandb.Settings(start_method="thread"),
+        )
+        if run is not None:
+            print(f"[wandb] direct-run init: name={cfg.exp_name} entity={entity} project={project}")
+    except Exception as exc:
+        print(f"[wandb] direct-run init failed (continuing without wandb): {exc}")
 
 
 def _wandb_log(payload: dict, step: int | None = None) -> None:
@@ -339,6 +662,86 @@ def training(rank: int = 0, world_size: int = 1) -> None:
         gaussians.load_state_dict(state_dict)
     except:
         pass
+
+    # Optional BG-only init from a merged checkpoint produced by the
+    # segmented-BG-merge pipeline (script/experiments/merge_bg_checkpoints.py).
+    # Overwrites the freshly-built BG Gaussian state with the stacked
+    # per-segment merge. obj/sky stay as init from input PLY so they
+    # cover the full sequence.
+    bg_init_from = cfg.train.get('bg_init_from', '')
+    if bg_init_from:
+        if not os.path.isabs(bg_init_from):
+            bg_init_from = os.path.join(cfg.workspace, bg_init_from)
+        if not os.path.isfile(bg_init_from):
+            raise FileNotFoundError(f'train.bg_init_from points at missing file: {bg_init_from}')
+        print(f'[bg_init] loading merged BG checkpoint from {bg_init_from}')
+        bg_state = torch.load(bg_init_from, map_location='cpu')
+        if 'background' in bg_state:
+            bg_state = bg_state['background']
+        # Move tensors to the same device the BG model uses (cuda).
+        bg_state = {k: (v.to('cuda') if isinstance(v, torch.Tensor) else v) for k, v in bg_state.items()}
+        if not hasattr(gaussians, 'background') or gaussians.background is None:
+            raise RuntimeError('train.bg_init_from set but model has no background — check model.nsg.include_bkgd.')
+        gaussians.background.load_state_dict(bg_state)
+        print(f'[bg_init] BG now has {gaussians.background.get_xyz.shape[0]} Gaussians')
+
+    # Optional per-actor init from a merged-obj checkpoint produced by
+    # script/experiments/merge_obj_checkpoints.py. For each obj model
+    # built from the full-sequence PLY, look up the actor's T4 track_id
+    # via this run's track_id_map.json, then load the matching actor
+    # state from merged_obj['objs_by_t4_track_id'][t4_id].
+    obj_init_from = cfg.train.get('obj_init_from', '')
+    if obj_init_from:
+        import json as _json_obj_init
+        if not os.path.isabs(obj_init_from):
+            obj_init_from = os.path.join(cfg.workspace, obj_init_from)
+        if not os.path.isfile(obj_init_from):
+            raise FileNotFoundError(f'train.obj_init_from points at missing file: {obj_init_from}')
+        full_seq_map_path = os.path.join(cfg.model_path, 'track_id_map.json')
+        if not os.path.isfile(full_seq_map_path):
+            raise FileNotFoundError(
+                f'obj_init_from set but full-seq track_id_map.json not found at {full_seq_map_path}. '
+                f'Run training once with the patched street_gaussian_model.setup_functions to generate it.'
+            )
+        print(f'[obj_init] loading merged obj checkpoint from {obj_init_from}')
+        merged_obj_state = torch.load(obj_init_from, map_location='cpu')
+        objs_by_t4 = merged_obj_state.get('objs_by_t4_track_id', {})
+        objs_by_t4 = {int(k): v for k, v in objs_by_t4.items()}
+        with open(full_seq_map_path) as _fm:
+            full_seq_map = _json_obj_init.load(_fm)
+        # full-seq: seq_id -> t4_track_id
+        full_seq_seq_to_t4 = {int(k): int(v) for k, v in full_seq_map['seq_id_to_t4_track_id'].items()}
+        loaded = 0
+        skipped_no_match = 0
+        for seq_id, t4_id in full_seq_seq_to_t4.items():
+            model_name = f'obj_{seq_id:03d}'
+            if not hasattr(gaussians, model_name):
+                continue
+            if t4_id not in objs_by_t4:
+                skipped_no_match += 1
+                continue
+            entry = objs_by_t4[t4_id]
+            actor_state = entry['state']
+            actor_state = {k: (v.to('cuda') if isinstance(v, torch.Tensor) else v) for k, v in actor_state.items()}
+            getattr(gaussians, model_name).load_state_dict(actor_state)
+            loaded += 1
+        print(f'[obj_init] loaded {loaded} actor states; {skipped_no_match} full-seq actors had no segment match (kept fresh init)')
+
+    # Hard prune of merged-BG Gaussians that contradict LiDAR returns. Must
+    # run AFTER bg_init_from + obj_init_from (so the BG state being analysed
+    # is the merged one) but BEFORE the per-rank preload section, so the
+    # subsequent bkgd_voxel_depth precompute is not done on Gaussians we are
+    # about to drop. Every rank runs the same deterministic scan + prune;
+    # bg.prune_points() also rebuilds the BG optimizer so subsequent training
+    # sees a consistent param/state mapping.
+    if training_args.get("bg_lidar_prune_enable", False) and not training_args.get("bg_lidar_prune_dry_run", False):
+        _bg_lidar_prune_apply(
+            gaussians,
+            scene.getTrainCameras(),
+            tau_scale_mul=float(training_args.get("bg_lidar_prune_tau_scale_mul", 3.0)),
+            tau_eps=float(training_args.get("bg_lidar_prune_tau_eps", 0.05)),
+            min_conflict_views=int(training_args.get("bg_lidar_prune_min_conflict_views", 5)),
+        )
 
     print(f'Starting from {start_iter}')
     save_cfg(cfg, cfg.model_path, epoch=start_iter)
@@ -511,6 +914,24 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             print(f"VRAM preload complete for {len(local_cameras)} views")
     else:
         local_cameras = None  # lazy-load every iter
+
+    # Optional dry-run: report how many merged BG Gaussians conflict with
+    # LiDAR depth across train views, then return before the training loop.
+    # Read-only — no state mutation. Only rank 0 runs the analysis (BG
+    # state is identical across ranks); other ranks wait at the barrier so
+    # the outer caller's cleanup runs in sync.
+    if training_args.get("bg_lidar_prune_dry_run", False):
+        if is_main_process():
+            _bg_lidar_prune_dry_run(
+                gaussians,
+                scene.getTrainCameras(),
+                tau_scale_mul=float(training_args.get("bg_lidar_prune_tau_scale_mul", 3.0)),
+                tau_eps=float(training_args.get("bg_lidar_prune_tau_eps", 0.05)),
+            )
+            print("[bg_lidar_prune] dry-run complete — returning before training loop")
+        if is_distributed():
+            dist.barrier()
+        return
 
     viewpoint_stack = None
     check_interval = 0
@@ -1956,6 +2377,10 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(cfg.train.quiet)
 
+    # Initialise wandb when launched directly (i.e. not via the sweep wrapper).
+    # No-op for sweep runs (wandb.run already exists) and for non-rank-0 ranks.
+    _init_wandb_for_direct_run(cfg)
+
     # Start GUI server, configure and run training
     torch.autograd.set_detect_anomaly(cfg.train.detect_anomaly)
 
@@ -1984,5 +2409,10 @@ if __name__ == "__main__":
         print('time cost', time_end-time_start,'s')
         print('scene id:', cfg.workspace)
         print("\nTraining complete.")
+        if _wandb_active():
+            try:
+                _wandb.finish()
+            except Exception as exc:
+                print(f"[wandb] finish() failed: {exc}")
 
     cleanup_distributed()

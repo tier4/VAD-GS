@@ -1,0 +1,10 @@
+parent_cfg: configs/experiments/segmented/seg_base.yaml
+
+# Segment 7 of 13 of the T4 segmented-BG-merge pipeline.
+# Frames [280, 340] (length 61).
+# Stride 40 from previous segment (1/3 overlap) — except the last,
+# which is shifted to cover the dataset tail (frame 560).
+
+exp_name: t4_seg_07_f280_340
+data:
+  selected_frames: [280, 340]

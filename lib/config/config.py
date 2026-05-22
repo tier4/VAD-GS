@@ -45,6 +45,13 @@ cfg.train.start_checkpoint = None
 cfg.train.importance_sampling = False
 cfg.train.preload_vram = False  # if True, preload all train views to VRAM at startup (single-GPU). Distributed always preloads.
 cfg.train.log_image_interval = 100  # save a debug composite to <model_path>/log_images every N iters. Raise to reduce disk I/O (esp. for parallel sweep agents).
+cfg.train.bg_init_from = ''  # Path to a checkpoint whose `background` state should overwrite the freshly-built BG model after training_setup. Used by the segmented-BG-merge pipeline (see configs/experiments/segmented/finetune_merged.yaml) to fine-tune from a stack of per-segment BG Gaussians. Leave empty for normal flow.
+cfg.train.obj_init_from = ''  # Path to a `merged_obj` checkpoint produced by script/experiments/merge_obj_checkpoints.py. The loader matches actors across segments via the seq_id <-> T4 track_id maps and replaces each obj_<full_seq_id>'s freshly-built state with the best-segment's trained state. Leave empty for normal flow.
+cfg.train.bg_lidar_prune_dry_run = False  # If True, after bg_init_from loads, vote every train view's lidar_depth against each merged BG Gaussian's center depth, print a conflict-vote histogram, then exit. Read-only — used to pick prune thresholds before enabling hard prune.
+cfg.train.bg_lidar_prune_enable = False  # If True, hard-prune merged BG Gaussians whose center sits in front of LiDAR returns in >= bg_lidar_prune_min_conflict_views views (and conflict outnumbers consistent). Runs once after bg_init_from + obj_init_from, before the training loop.
+cfg.train.bg_lidar_prune_min_conflict_views = 5  # K threshold: a Gaussian is pruned only when it conflicts with LiDAR in at least this many views AND conflict_count > consistent_count. 5 is a conservative starting point per dry-run histogram (>= K=5 ~6% of N).
+cfg.train.bg_lidar_prune_tau_scale_mul = 3.0  # A Gaussian is flagged as "in front of LiDAR" only when (center_depth + tau) < lidar_depth, where tau = tau_scale_mul * max(scaling_xyz) + tau_eps. Larger -> more permissive (Gaussian radius is forgiven).
+cfg.train.bg_lidar_prune_tau_eps = 0.05  # Absolute slack (scene-unit meters) added to tau on top of the scale-derived term.
 
 cfg.optim = CN()
 cfg.optim.use_amp = False # If set to True, use Automatic Mixed Precision (AMP) for training.

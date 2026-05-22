@@ -1,0 +1,16 @@
+parent_cfg: configs/example/t4_train_h100x8.yaml
+
+# E-3 + E-4 combined: align both BG and obj clone/split thresholds to
+# their respective voxel-init scales. See e4_pdense_bkgd.yaml and
+# e3_pdense_obj.yaml for the per-axis rationale.
+#
+# Run order suggestion:
+#   1. e4_pdense_bkgd.yaml  → does BG-only change improve psnr_near?
+#   2. e3_pdense_obj.yaml   → does obj-only change improve psnr_obj?
+#   3. this file            → are the gains additive?
+
+exp_name: e34_combined_pd015_obj07
+
+optim:
+  percent_dense: 0.015      # BG threshold ≈ voxel size
+  percent_dense_obj: 0.07   # obj threshold ≈ voxel size

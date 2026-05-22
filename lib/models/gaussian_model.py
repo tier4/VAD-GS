@@ -192,13 +192,20 @@ class GaussianModel(nn.Module):
 
         self.active_sh_degree = self.max_sh_degree
             
-    def load_state_dict(self, state_dict):  
-        self._xyz = state_dict['xyz']  
-        self._features_dc = state_dict['feature_dc']
-        self._features_rest = state_dict['feature_rest']
-        self._scaling = state_dict['scaling']
-        self._rotation = state_dict['rotation']
-        self._opacity = state_dict['opacity']
+    def load_state_dict(self, state_dict):
+        # Checkpoints saved by the standard state_dict() store nn.Parameter
+        # objects directly, but merged checkpoints (e.g. merge_bg_checkpoints,
+        # merge_obj_checkpoints) detach to plain tensors. Wrap on load so both
+        # paths assign cleanly to the registered Parameter attributes.
+        def _as_param(t):
+            return t if isinstance(t, nn.Parameter) else nn.Parameter(t)
+
+        self._xyz = _as_param(state_dict['xyz'])
+        self._features_dc = _as_param(state_dict['feature_dc'])
+        self._features_rest = _as_param(state_dict['feature_rest'])
+        self._scaling = _as_param(state_dict['scaling'])
+        self._rotation = _as_param(state_dict['rotation'])
+        self._opacity = _as_param(state_dict['opacity'])
         # self._semantic = state_dict['semantic']
         
         if cfg.mode == 'train':

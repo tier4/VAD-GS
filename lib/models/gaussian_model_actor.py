@@ -273,8 +273,8 @@ class GaussianModelActor(GaussianModel):
             {'params': [self._semantic], 'lr': semantic_lr, "name": "semantic"},
         ]
         
-        self.percent_dense = args.percent_dense
-        self.percent_big_ws = args.percent_big_ws
+        self.percent_dense = args.get('percent_dense_{}'.format(tag), args.percent_dense)
+        self.percent_big_ws = args.get('percent_big_ws_{}'.format(tag), args.percent_big_ws)
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
             lr_init=position_lr_init * self.spatial_lr_scale,

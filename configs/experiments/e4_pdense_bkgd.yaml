@@ -1,0 +1,24 @@
+parent_cfg: configs/example/t4_train_h100x8.yaml
+
+# E-4: raise BG percent_dense so the clone/split threshold matches the
+# voxel-init scale.
+#
+# Background init uses voxel_size=0.15m via voxel_down_sample_and_trace
+# (lib/utils/t4_utils.py:1175). distCUDA2 on those points → init scale
+# ≈ 0.15-0.25m. With percent_dense=0.01 and scene_radius=10, the
+# clone-vs-split threshold is `percent_dense * extent = 0.1m`, so every
+# initial BG Gaussian starts in "split" territory and gets fragmented
+# down before any growth can happen.
+#
+# This config raises percent_dense to 0.015 (threshold = 0.15m), so the
+# road surface and other flat-ish BG regions can clone first and only
+# split when the gradient signal genuinely calls for it.
+#
+# percent_dense_obj is pinned to 0.01 so this run isolates the BG
+# effect; E-3 / E-3+E-4 sweeps add obj-side changes in separate configs.
+
+exp_name: e34_e4_pdense015
+
+optim:
+  percent_dense: 0.015      # was 0.01 — BG clone/split threshold now ≈ voxel size
+  percent_dense_obj: 0.01   # baseline (obj unchanged in this run)

@@ -1,0 +1,120 @@
+# wandb sweep config for the segmented-BG-merge pipeline.
+#
+# A single sweep covers all 3 segments by treating `data.selected_frames`
+# as a categorical axis. The bayes optimiser samples (segment × HP)
+# combos and hyperband culls weak runs at the test rungs.
+#
+# Pipeline:
+#   1. SWEEP_ID=$(python script/sweep/sweep_init.py configs/sweep/t4_segmented.yaml)
+#   2. NUM_AGENTS=8 SWEEP_ID=$SWEEP_ID bash script/sweep/sweep_launch.sh
+#   3. After all runs complete:
+#        python script/experiments/select_best_per_segment.py --sweep-id $SWEEP_ID
+#        python script/experiments/merge_bg_checkpoints.py
+#            --ckpts <seg0_best> <seg1_best> <seg2_best> --out merged_bg.pth
+#   4. bash script/train_multigpu.sh \
+#        configs/experiments/segmented/finetune_merged.yaml 8
+#
+# Image count matches the nuscenes_train_000 reference (5 cam × 61 frame
+# = 305 imgs per segment). See configs/experiments/segmented/seg_base.yaml
+# for the per-segment hyperparameter baseline.
+
+program: script/sweep/sweep_run.py
+method: bayes
+
+metric:
+  # Overall PSNR. Per-segment we still get good obj+near signal because
+  # 305 imgs is enough for both BG and obj to converge by iter 30k.
+  name: test/test_view/psnr
+  goal: maximize
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --base-config
+  - configs/experiments/segmented/seg_base.yaml
+  - --exp-prefix
+  - seg
+  - ${args}
+
+# Hyperband cull weak runs at the per-segment test rungs.
+# seg_base.yaml has test_iterations [8000, 16000, 30000]; min_iter 8000
+# and eta=2 → rungs at {8000, 16000, 30000}. Matches the test cadence so
+# early stops land on real evals.
+early_terminate:
+  type: hyperband
+  min_iter: 8000
+  eta: 2
+
+parameters:
+  # ===== Segment axis (categorical 13-way) =============================
+  # 13 overlapping 61-frame windows covering the full 561-frame T4
+  # sequence at stride 40 (1/3 overlap). The last window is shifted to
+  # end at frame 560 so the tail is covered (its overlap with seg_11 is
+  # 1 frame, but ego motion already gives spatial separation there).
+  # Post-hoc we pick the best run within each window
+  # (select_best_per_segment.py).
+  data.selected_frames:
+    values:
+      - [  0,  60]
+      - [ 40, 100]
+      - [ 80, 140]
+      - [120, 180]
+      - [160, 220]
+      - [200, 260]
+      - [240, 300]
+      - [280, 340]
+      - [320, 380]
+      - [360, 420]
+      - [400, 460]
+      - [440, 500]
+      - [500, 560]
+
+  # ===== HP axes ========================================================
+  # Tuned for the segmented setup: each segment is 61 frames so densify
+  # signal is weaker than the 141-frame baseline. Keep ranges modest
+  # around the nu6sy3bm best so we don't fight too many free parameters
+  # at once.
+
+  # BG densify threshold. Lower = more clones/splits. nu6sy3bm best ≈
+  # 4-5e-4 (dn3vad60, kmjnxp0m, ktrhijyp). Range probes ±1 OOM around
+  # that band.
+  optim.densify_grad_threshold_bkgd:
+    distribution: log_uniform_values
+    min: 2.0e-04
+    max: 1.5e-03
+
+  # Obj densify threshold. lsobybow top-4 ∈ {3-12e-5}; pin near cluster
+  # but allow some variation since 61-frame obj signal is weaker.
+  optim.densify_grad_threshold_obj:
+    values: [3.0e-05, 5.0e-05, 1.0e-04]
+
+  # BG shape penalty. nu6sy3bm best 2e-5; allow 0 and slightly higher.
+  optim.lambda_shape_pena_bkgd:
+    values: [0., 1.0e-6, 5.0e-6, 2.0e-5]
+
+  # Obj shape penalty. lsobybow best 5e-4. Allow off + best.
+  optim.lambda_shape_pena:
+    values: [0., 5.0e-4]
+
+  # Clone/split threshold relative to extent. Tuned per side via the E-3
+  # / E-4 fix in seg_base.yaml (0.015 BG / 0.07 obj). Sweep a slight
+  # neighbourhood so we don't blindly trust the analysis.
+  optim.percent_dense:
+    values: [0.01, 0.015, 0.02]
+  optim.percent_dense_obj:
+    values: [0.05, 0.07, 0.1]
+
+  # ===== Pinned ========================================================
+  optim.densify_until_iter:
+    value: 24000
+  optim.opacity_reset_interval:
+    value: 3000
+  optim.densification_interval:
+    value: 100
+  optim.percent_big_ws:
+    value: 0.1
+  optim.min_opacity:
+    value: 0.01
+  optim.max_screen_size:
+    value: 20

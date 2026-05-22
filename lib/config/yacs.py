@@ -520,10 +520,14 @@ def _check_and_coerce_cfg_value_type(replacement, original, key, full_key):
             return False, None
 
     # Conditionally casts
-    # list <-> tuple, int -> float (covers wandb sweep configs where
-    # a YAML float like `0.` round-trips through JSON to int 0 and is
-    # then assigned to a float-typed field).
-    casts = [(tuple, list), (list, tuple), (int, float)]
+    # list <-> tuple, int <-> float. The int->float cast covers wandb
+    # sweep configs where a YAML float like `0.` round-trips through
+    # JSON to int 0 and is then assigned to a float-typed field. The
+    # float->int reverse covers re-loading a saved cfg dump where yacs
+    # serialised `data.extent: 10` as `10.0` (yaml emits whole-number
+    # floats with the trailing `.0`) — re-merging that against a schema
+    # whose default was `10` (int) would otherwise raise.
+    casts = [(tuple, list), (list, tuple), (int, float), (float, int)]
     # For py2: allow converting from str (bytes) to a unicode string
     try:
         casts.append((str, unicode))  # noqa: F821

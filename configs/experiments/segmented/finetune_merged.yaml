@@ -1,0 +1,77 @@
+parent_cfg: configs/experiments/segmented/seg_base.yaml
+
+# Final integration step of the segmented-BG-merge pipeline.
+#
+# Loads:
+#   * `train.bg_init_from`  ← merged BG Gaussians (concat of 13 segments,
+#     produced by script/experiments/merge_bg_checkpoints.py)
+#   * `train.obj_init_from` ← per-actor best segment state (produced by
+#     script/experiments/merge_obj_checkpoints.py — picks the segment
+#     with the highest psnr_obj for each T4 track_id)
+#   * Sky                    ← rebuilt from the full-sequence PLY (no merge)
+#
+# Then trains on the FULL 561-frame T4 sequence:
+#   * BG  : low LR (1/10) — polish merged Gaussians, no densify
+#   * Obj : full LR — actors retain their best-segment init but converge
+#           further on the full-sequence supervision
+#   * Sky : full LR — fresh, learns from scratch
+#
+# obj uses per-tag LR overrides (gaussian_model_actor.py picks up
+# `position_lr_init_obj` etc.) so the BG /10 reduction doesn't starve it.
+# Sky doesn't have per-tag overrides today, so it inherits the BG /10 —
+# accept this for now (sky overfit is a separate issue; see analysis in
+# wandb/sweep-nu6sy3bm), or bump iterations to 16000 to give it time.
+
+exp_name: t4_finetune_merged
+
+# Override seg_base: this final step is launched via torchrun across 8 GPUs,
+# unlike the per-segment seg_* runs which are single-GPU sweep agents.
+dist:
+  enabled: true
+
+data:
+  selected_frames: [0, 560]        # full T4 sequence (561 frames)
+  regenerate_pcd: false
+
+train:
+  iterations: 16000
+  test_iterations: [2000, 8000, 16000]
+  save_iterations: [16000]
+  checkpoint_iterations: [8000, 16000]
+  log_image_interval: 10
+
+  bg_init_from:  output/t4_exp/merged_bg/iteration_0.pth
+  obj_init_from: output/t4_exp/merged_obj/iteration_0.pth
+
+optim:
+  # === BG / sky base-class LR (/10): used to polish merged BG ===
+  position_lr_init: 1.6e-06
+  position_lr_final: 1.6e-07
+  position_lr_max_steps: 16000
+  scaling_lr: 0.0005
+  rotation_lr: 0.0001
+  feature_lr: 0.00025
+
+  # === Obj per-tag LR: full speed since obj also benefits from
+  #     further training on the full-sequence supervision. The
+  #     `args.get('<knob>_obj', args.<knob>)` fallback in
+  #     gaussian_model_actor.py:training_setup picks these up. ===
+  position_lr_init_obj: 1.6e-05
+  position_lr_final_obj: 1.6e-06
+  scaling_lr_obj: 0.005
+  rotation_lr_obj: 0.001
+  feature_lr_obj: 0.0025
+
+  # Densify / opacity reset OFF — refinement only.
+  densify_from_iter: 99999999
+  densify_until_iter: 0
+  opacity_reset_interval: 99999999
+
+  # Hard depth / propagation off (their value is during densification).
+  hard_depth_start: 99999999
+  hard_depth_end: 0
+  propagated_iteration_begin: 99999999
+  propagated_iteration_end: 0
+
+  percent_dense: 0.015
+  percent_dense_obj: 0.07

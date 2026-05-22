@@ -168,11 +168,35 @@ class StreetGaussianModel(nn.Module):
         obj_info = self.metadata['obj_meta']
         tracklet_timestamps = self.metadata['tracklet_timestamps']
         camera_timestamps = self.metadata['camera_timestamps']
-        
+
         self.model_name_id = bidict()
         self.obj_list = []
         self.models_num = 0
         self.obj_info = obj_info
+
+        # Persist the seq_id -> original T4 track_id mapping next to the
+        # checkpoint dir so downstream tools (script/experiments/
+        # merge_obj_checkpoints.py) can match actors across segments.
+        # Best-effort: silent skip on any error / missing field.
+        try:
+            import json as _json
+            from lib.config import cfg as _cfg
+            if _cfg.get('mode', 'train') == 'train' and _cfg.get('model_path'):
+                mapping = {}
+                for seq_id, meta in obj_info.items():
+                    orig = meta.get('original_instance_token_prefix') if isinstance(meta, dict) else None
+                    mapping[str(seq_id)] = orig if orig is not None else seq_id
+                map_path = os.path.join(_cfg.model_path, 'track_id_map.json')
+                if not os.path.exists(map_path):
+                    os.makedirs(_cfg.model_path, exist_ok=True)
+                    with open(map_path, 'w') as _f:
+                        _json.dump({
+                            'seq_id_to_t4_track_id': mapping,
+                            'selected_frames': list(_cfg.data.get('selected_frames', [])),
+                            'exp_name': _cfg.exp_name,
+                        }, _f, indent=2)
+        except Exception:
+            pass
         
         # Build background model
         if self.include_background:

@@ -1,0 +1,151 @@
+# Base config shared by all 3 segments of the T4 segmented-BG-merge pipeline.
+#
+# Strategy:
+#   1. Slice the 141-frame T4 sequence into 3 overlapping 61-frame segments
+#      (slide=40 → ~33% overlap) so each segment matches the nuscenes
+#      reference image count (5 cam × 61 frame = 305 imgs).
+#   2. Train each segment with the same nuscenes-derived hyperparameters,
+#      via a sweep that varies HP per-run (see configs/sweep/t4_segmented.yaml).
+#   3. After all segment sweeps complete, pick the best run per segment,
+#      merge their BG Gaussians (script/experiments/merge_bg_checkpoints.py),
+#      and run a low-LR fine-tune on the full 141-frame sequence with the
+#      merged BG as init (configs/experiments/segmented/finetune_merged.yaml).
+#
+# Per-segment yamls (seg_0.yaml / seg_1.yaml / seg_2.yaml) inherit this and
+# only override `data.selected_frames` and `exp_name`.
+
+task: t4_exp
+source_path: 433a2328-a5a6-4790-87d3-59e930ac7020
+exp_name: t4_seg_base    # overridden per-segment
+
+# Single-GPU per sweep agent (matches existing nu6sy3bm sweep flow).
+dist:
+  enabled: false
+  backend: nccl
+
+data:
+  # T4-specific (NOT DriveStudio like nuscenes_train_000.yaml — type/source
+  # differ, everything else mirrors nuscenes_train_000.yaml as closely as
+  # possible).
+  type: T4
+  white_background: false
+  split_test: 4
+  split_train: -1
+  selected_frames: [0, 60]   # overridden per segment
+
+  scene_index: 0
+  version: 2
+  revision: 0
+  camera_channels:
+    - CAM_FRONT
+    - CAM_FRONT_LEFT
+    - CAM_FRONT_RIGHT
+    - CAM_BACK_LEFT
+    - CAM_BACK_RIGHT
+  lidar_channel: LIDAR_CONCAT
+  cameras: [0, 1, 2, 3, 4]
+
+  extent: 10
+  use_colmap: true
+  filter_colmap: true
+  box_scale: 1.5
+  shuffle: false
+
+  # Segments slice different windows of the same source dataset → must
+  # regenerate the per-segment input_ply/colmap pre-process for each.
+  # The merge step works on per-segment trained_model/*.pth checkpoints,
+  # so cache reuse across segments isn't safe here.
+  regenerate_pcd: true
+
+model:
+  gaussian:
+    sh_degree: 1
+    fourier_dim: 5
+    fourier_scale: 1.
+    flip_prob: 0.
+  nsg:
+    include_bkgd: true
+    include_obj: true
+    include_sky: true
+    opt_track: true
+    flatten_loss: true
+
+train:
+  # nuscenes_train_000.yaml schedule.
+  iterations: 30000
+  test_iterations: [8000, 16000, 30000]
+  save_iterations: [30000]
+  checkpoint_iterations: [4000, 8000, 16000, 24000, 30000]
+  # Sweep cadence (matches base.yaml sweep).
+  log_image_interval: 1000
+  # 305 imgs per segment fits in VRAM at h100 80GB ~ 4GB headroom.
+  preload_vram: true
+
+optim:
+  use_amp: false
+  error_tolerance: 0.01
+
+  prune_box_interval: 100
+  densification_interval: 100
+  prop_voxel_interval: 5
+
+  densify_from_iter: 500
+  densify_grad_threshold_bkgd: 0.001
+  densify_grad_abs_bkgd: True
+  densify_grad_threshold_obj: 0.0002
+  densify_grad_abs_obj: False
+  densify_until_iter: 24000
+
+  hard_depth_start: 0
+  hard_depth_end: 24000
+  propagated_iteration_begin: 0
+  propagated_iteration_end: 24000
+  propagation_interval: 5
+
+  feature_lr: 0.0025
+  max_screen_size: 20
+  min_opacity: 0.01
+  opacity_lr: 0.05
+  opacity_reset_interval: 3000
+  percent_big_ws: 0.1
+  # E-3/E-4 fix from the BG/obj clone-vs-split analysis:
+  #   - BG: percent_dense * extent = 0.015 * 10 = 0.15 m ≈ voxel_size
+  #   - obj: percent_dense_obj * actor_extent ≈ 0.07 * 2.25 = 0.157 m ≈ voxel_size
+  # (Original nuscenes_train_000.yaml had 0.01 / no obj split.)
+  percent_dense: 0.015
+  percent_dense_obj: 0.07
+  position_lr_delay_mult: 0.01
+  position_lr_final: 1.6e-06
+  position_lr_init: 1.6e-05
+  position_lr_max_steps: 50000
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  semantic_lr: 0.01
+
+  lambda_dssim: 0.2
+  lambda_sky: 0.05
+  lambda_mask: 0.1
+  lambda_reg: 0.1
+  lambda_depth_lidar: 0.1
+  lambda_shape_pena: 0
+  lambda_scale_pena: 0
+
+  track_position_lr_delay_mult: 0.01
+  track_position_lr_init: 0.005
+  track_position_lr_final: 5.0e-5
+  track_position_max_steps: 30000
+
+  track_rotation_lr_delay_mult: 0.01
+  track_rotation_lr_init: 0.001
+  track_rotation_lr_final: 1.0e-5
+  track_rotation_max_steps: 30000
+
+  normal_loss: True
+  use_voxel_depth: True
+  use_lidar_depth: False
+  skip_view_selection: False
+
+render:
+  fps: 24
+  concat_cameras: [1, 0, 2]
+  render_normal: True

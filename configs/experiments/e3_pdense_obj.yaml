@@ -1,0 +1,26 @@
+parent_cfg: configs/example/t4_train_h100x8.yaml
+
+# E-3: raise per-actor percent_dense_obj so the clone/split threshold
+# matches the voxel-init scale on actors.
+#
+# Actor init uses voxel_size=0.15m and an actor-local extent
+# (~2.25m for a passenger car, lib/models/gaussian_model_actor.py:47).
+# With percent_dense=0.01, the clone/split threshold becomes
+# `0.01 * 2.25 = 0.0225m`, so every initial actor Gaussian (≈0.15m) is
+# already 6-7x above the split threshold. The first densify cycle
+# fragments every flagged Gaussian; children inherit half the scale and
+# usually exceed the threshold again, so actors get split ~4 times
+# before stabilising. Each car ends with hundreds of tiny Gaussians.
+#
+# This config raises percent_dense_obj to 0.07 so the actor clone/split
+# threshold = `0.07 * 2.25 ≈ 0.157m`, matching the voxel-init scale.
+# BG-side percent_dense stays at 0.01 to isolate the obj effect.
+#
+# Reads the new `args.get('percent_dense_obj', args.percent_dense)`
+# fallback in gaussian_model_actor.py:training_setup.
+
+exp_name: e34_e3_pdense_obj07
+
+optim:
+  percent_dense: 0.01       # baseline (BG unchanged in this run)
+  percent_dense_obj: 0.07   # actor clone/split threshold now ≈ voxel size
