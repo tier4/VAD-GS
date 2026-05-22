@@ -15,6 +15,13 @@
 # only override `data.selected_frames` and `exp_name`.
 
 task: t4_exp
+# Write all outputs (model_path, point_cloud, log_images, trained_model,
+# bg_init_from / obj_init_from resolution) to NVMe (/dev/md0, 28T) instead
+# of the home FS (/dev/sda2, ~85G free). cfg_utils.make_cfg prepends
+# workspace to any relative model_path / *_init_from, so this single
+# top-level override redirects the segmented + finetune pipeline.
+# Override at CLI with `workspace=...` if a different mount is needed.
+workspace: /mnt/nvme/kataoka/VAD-GS
 source_path: 433a2328-a5a6-4790-87d3-59e930ac7020
 exp_name: t4_seg_base    # overridden per-segment
 
