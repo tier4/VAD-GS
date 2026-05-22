@@ -1561,9 +1561,12 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 if data_args.white_background and iteration == optim_args.densify_from_iter:
                     gaussians.reset_opacity()
 
-            if is_main_process():
-                with perf_section("training_report"):
-                    training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer)
+            with perf_section("training_report"):
+                # NOTE: called on every rank — eval is sharded inside via
+                # all_reduce so all GPUs split the test-view renders instead
+                # of rank 0 doing all ~N×cams alone. Rank-0-only logging
+                # (TB / wandb / print) is gated inside the function.
+                training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer)
             del scalar_dict, tensor_dict, soft_render_pkg, image, acc, viewspace_point_tensor, visibility_filter, radii, loss
 
             # Optimizer step
@@ -1769,18 +1772,37 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
         # in bkgd_near — that's where the user's pain point already is,
         # so the metric still attributes them correctly.
         NEAR_FAR_THRESHOLD = 30.0  # meters; driving-scene foreground cutoff
+        LAYER_NAMES = ('obj', 'bkgd_near', 'bkgd_far', 'sky')
+
+        # Distributed eval: shard cameras across ranks. Gaussians are
+        # identical on every rank (gradients are all-reduced each iter),
+        # so per-camera renders are independent. We accumulate sums +
+        # counts locally, then sum-reduce once per validation_config.
+        # Rank 0 alone divides and logs.
+        if is_distributed():
+            world = dist.get_world_size()
+            rank = dist.get_rank()
+        else:
+            world, rank = 1, 0
 
         for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                layer_sum: dict[str, float] = {'obj': 0.0, 'bkgd_near': 0.0, 'bkgd_far': 0.0, 'sky': 0.0}
-                layer_count: dict[str, int] = {'obj': 0, 'bkgd_near': 0, 'bkgd_far': 0, 'sky': 0}
-                for idx, viewpoint in enumerate(config['cameras']):
+            all_cams = config['cameras']
+            if all_cams and len(all_cams) > 0:
+                total_cams = len(all_cams)
+                local_cams = all_cams[rank::world]
+                l1_local = 0.0
+                psnr_local = 0.0
+                layer_sum_local: dict[str, float] = {k: 0.0 for k in LAYER_NAMES}
+                layer_count_local: dict[str, int] = {k: 0 for k in LAYER_NAMES}
+                for idx, viewpoint in enumerate(local_cams):
                     render_pkg = renderer.render(viewpoint, scene.gaussians)
                     image = torch.clamp(render_pkg["rgb"], 0.0, 1.0)
                     depth = render_pkg.get("depth")  # (1, H, W), metric units
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    # TB images: rank 0's first 5 local views (tb_writer is
+                    # None elsewhere). Under sharding these are global cams
+                    # 0, world, 2·world, …, so the sample differs from the
+                    # pre-shard 0..4 but is stable per run.
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
@@ -1790,8 +1812,8 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                         mask = viewpoint.original_mask.cuda().bool()
                     else:
                         mask = torch.ones_like(gt_image[0]).bool()
-                    l1_test += l1_loss(image, gt_image, mask).mean().double()
-                    psnr_test += psnr(image, gt_image, mask).mean().double()
+                    l1_local += float(l1_loss(image, gt_image, mask).mean().double())
+                    psnr_local += float(psnr(image, gt_image, mask).mean().double())
 
                     # Build layer masks (each (1, H, W) bool, AND'd with `mask`).
                     # dynamic_mask: per-channel id image; foreground iff any
@@ -1835,22 +1857,48 @@ def training_report(tb_writer: SummaryWriter | None, iteration: int, scalar_stat
                         ('sky', sky_mask_bool),
                     ):
                         if layer_mask is not None and layer_mask.any():
-                            layer_sum[layer_name] += float(psnr(image, gt_image, layer_mask).mean().double())
-                            layer_count[layer_name] += 1
+                            layer_sum_local[layer_name] += float(psnr(image, gt_image, layer_mask).mean().double())
+                            layer_count_local[layer_name] += 1
 
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])
+                # Reduce partials across ranks. One NCCL all_reduce per
+                # validation_config — pack 10 scalars (l1, psnr, 4 layer
+                # sums, 4 layer counts) into one float64 tensor.
+                if is_distributed():
+                    packed = torch.tensor(
+                        [l1_local, psnr_local,
+                         *[layer_sum_local[k] for k in LAYER_NAMES],
+                         *[float(layer_count_local[k]) for k in LAYER_NAMES]],
+                        device='cuda', dtype=torch.float64,
+                    )
+                    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+                    vals = packed.cpu().tolist()
+                    l1_total = vals[0]
+                    psnr_total = vals[1]
+                    layer_sum_total = {k: vals[2 + i] for i, k in enumerate(LAYER_NAMES)}
+                    layer_count_total = {k: int(vals[2 + len(LAYER_NAMES) + i]) for i, k in enumerate(LAYER_NAMES)}
+                else:
+                    l1_total = l1_local
+                    psnr_total = psnr_local
+                    layer_sum_total = layer_sum_local
+                    layer_count_total = layer_count_local
+
+                # All logging (print, TB scalars, wandb) is rank-0 only.
+                if not is_main_process():
+                    continue
+
+                l1_test = l1_total / total_cams
+                psnr_test = psnr_total / total_cams
                 layer_mean: dict[str, float | None] = {
-                    k: (layer_sum[k] / layer_count[k]) if layer_count[k] > 0 else None
-                    for k in layer_sum
+                    k: (layer_sum_total[k] / layer_count_total[k]) if layer_count_total[k] > 0 else None
+                    for k in LAYER_NAMES
                 }
                 psnr_obj_mean = layer_mean['obj']
                 print("\n[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.3f} | obj {} near {} far {} sky {}".format(
                     iteration, config['name'], float(l1_test), float(psnr_test),
-                    f"{layer_mean['obj']:.3f}({layer_count['obj']})"            if layer_mean['obj'] is not None      else "n/a",
-                    f"{layer_mean['bkgd_near']:.3f}({layer_count['bkgd_near']})" if layer_mean['bkgd_near'] is not None else "n/a",
-                    f"{layer_mean['bkgd_far']:.3f}({layer_count['bkgd_far']})"   if layer_mean['bkgd_far'] is not None  else "n/a",
-                    f"{layer_mean['sky']:.3f}({layer_count['sky']})"            if layer_mean['sky'] is not None      else "n/a",
+                    f"{layer_mean['obj']:.3f}({layer_count_total['obj']})"            if layer_mean['obj'] is not None      else "n/a",
+                    f"{layer_mean['bkgd_near']:.3f}({layer_count_total['bkgd_near']})" if layer_mean['bkgd_near'] is not None else "n/a",
+                    f"{layer_mean['bkgd_far']:.3f}({layer_count_total['bkgd_far']})"   if layer_mean['bkgd_far'] is not None  else "n/a",
+                    f"{layer_mean['sky']:.3f}({layer_count_total['sky']})"            if layer_mean['sky'] is not None      else "n/a",
                 ))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
