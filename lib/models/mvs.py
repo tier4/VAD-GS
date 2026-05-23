@@ -378,7 +378,10 @@ def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, 
     else:
         all_mask = ~sky_mask[0] & torch.any(dynamic_mask==vehicle_name, axis=0)
         obj_view_dict = dataset.scene_info.metadata["obj_view_dict"]
-        if current_view not in obj_view_dict[vehicle_name]:
+        # vehicle_name may be missing entirely if every view's projected
+        # bbox fell below the 20*20*10 area threshold during _compute_obj_bound;
+        # treat absent the same as "current view not present" (early return).
+        if vehicle_name not in obj_view_dict or current_view not in obj_view_dict[vehicle_name]:
             print("obj not exist in ref", current_view)
             return None, None, None
         obj_pose_vehicle = obj_view_dict[vehicle_name][current_view][1]
@@ -419,7 +422,7 @@ def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, 
             src_ext = src_w2c
         else:
             all_mask = ~sky_mask[0] & torch.any(dynamic_mask==vehicle_name, axis=0)
-            if src_idx not in obj_view_dict[vehicle_name]:
+            if vehicle_name not in obj_view_dict or src_idx not in obj_view_dict[vehicle_name]:
                 print("obj not exist in src", src_idx)
                 continue
             obj_pose_vehicle = obj_view_dict[vehicle_name][src_idx][1]
