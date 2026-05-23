@@ -307,7 +307,18 @@ class GaussianModelActor(GaussianModel):
 
         # Prune points below opacity
         prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
-        
+
+        # `big_points_ws` Gaussians have scale > extent * percent_big_ws
+        # (≈ 0.25 m for a 5 m car). At that point they're physically
+        # impossible for the actor — usually leftovers from a degenerate
+        # densify_and_split that the rasterizer silently culls. They are
+        # NOT subject to the min-survivor safety below: keeping them
+        # alive past iter densify_until_iter, where obj_acc_loss enters
+        # the forward and evaluates render_object(acc), produces NaN in
+        # the entropy term and poisons every actor's _xyz on the next
+        # backward (reproducibly hit on seg_02/obj_003 at iter 24000).
+        big_points_ws = torch.zeros_like(prune_mask)
+
         if prune_big_points:
             # Prune big points in world space
             extent = self.extent
@@ -317,23 +328,22 @@ class GaussianModelActor(GaussianModel):
             # Prune points outside the tracking box
             repeat_num = 2
             stds = self.get_scaling.clamp(min=0.0)
-            stds = stds[:, None, :].expand(-1, repeat_num, -1) # [N, M, 1] 
+            stds = stds[:, None, :].expand(-1, repeat_num, -1) # [N, M, 1]
             means = torch.zeros_like(self.get_xyz)
             means = means[:, None, :].expand(-1, repeat_num, -1) # [N, M, 3]
             samples = torch.normal(mean=means, std=stds) # [N, M, 3]
             rots = quaternion_to_matrix(self.get_rotation) # [N, 3, 3]
             rots = rots[:, None, :, :].expand(-1, repeat_num, -1, -1) # [N, M, 3, 3]
             origins = self.get_xyz[:, None, :].expand(-1, repeat_num, -1) # [N, M, 3]
-                        
-            samples_xyz = torch.matmul(rots, samples.unsqueeze(-1)).squeeze(-1) + origins # [N, M, 3]                    
+
+            samples_xyz = torch.matmul(rots, samples.unsqueeze(-1)).squeeze(-1) + origins # [N, M, 3]
             num_gaussians = self.get_xyz.shape[0]
             points_inside_box = torch.logical_and(
                 torch.all((samples_xyz >= self.min_xyz).view(num_gaussians, -1), dim=-1),
                 torch.all((samples_xyz <= self.max_xyz).view(num_gaussians, -1), dim=-1),
             )
-            points_outside_box = torch.logical_not(points_inside_box)           
-            
-            prune_mask = torch.logical_or(prune_mask, big_points_ws)
+            points_outside_box = torch.logical_not(points_inside_box)
+
             if small_radii_thresh > 0:
                 over_small_points_ws = (self.max_radii2D > 0) & (self.max_radii2D <= small_radii_thresh)
                 prune_mask = torch.logical_or(prune_mask, over_small_points_ws)
@@ -342,10 +352,13 @@ class GaussianModelActor(GaussianModel):
 
             prune_mask = torch.logical_or(prune_mask, points_outside_box)
 
-        # Ensure minimum number of gaussians survive for any actor
+        # Ensure minimum number of gaussians survive for any actor — but
+        # the rollback only applies to the soft signals (low-opacity,
+        # outside-box, small-radii). big_points_ws is always pruned.
         if prune_mask.shape[0] - prune_mask.sum() < 100:
             prune_mask[:] = False
 
+        prune_mask = torch.logical_or(prune_mask, big_points_ws)
         self.prune_points(prune_mask)
         
         # Reset
