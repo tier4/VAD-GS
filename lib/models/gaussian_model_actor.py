@@ -288,6 +288,14 @@ class GaussianModelActor(GaussianModel):
         self.tensor_dict = dict()  
             
     def densify_and_prune(self, max_grad, min_opacity, prune_big_points):
+        # An actor can reach 0 Gaussians after an aggressive prune (e.g.
+        # every surviving point was big_points_ws-flagged, now that those
+        # bypass the min-survivor rollback — see c025ca8). The
+        # downstream `samples_xyz.view(num_gaussians, -1)` would then
+        # raise on the 0-element reshape. Nothing to densify or prune.
+        if self.get_xyz.shape[0] == 0:
+            return {}, {}
+
         if not (self.random_initialization or self.deformable):
             max_grad = cfg.optim.get('densify_grad_threshold_obj', max_grad)
             if cfg.optim.get('densify_grad_abs_obj', False):
@@ -296,7 +304,7 @@ class GaussianModelActor(GaussianModel):
                 grads = self.xyz_gradient_accum[:, 0:1] / self.denom
         else:
             grads = self.xyz_gradient_accum[:, 0:1] / self.denom
-        
+
         grads[grads.isnan()] = 0.0
 
         # Clone and Split
