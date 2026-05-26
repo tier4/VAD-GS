@@ -43,6 +43,8 @@
 #
 # Env vars:
 #   NUM_GPUS          number of GPUs to use in parallel (default 8)
+#   NUM_JOBS_PER_GPU  segments co-located on each GPU (default 1).
+#                     Set to 2-3 on 80 GB cards to overlap preload + I/O.
 #   GPU_OFFSET        first GPU id to use (default 0)
 #   LOG_DIR           per-segment stdout/stderr destination (default output/segmented_logs)
 #   WANDB_RUN_GROUP   wandb group name (default t4_segmented_<timestamp>)
@@ -56,6 +58,12 @@ cd "${REPO_ROOT}"
 
 NUM_GPUS="${NUM_GPUS:-8}"
 GPU_OFFSET="${GPU_OFFSET:-0}"
+# Co-locate multiple segments on a single GPU. H100 80 GB has VRAM
+# headroom for 2–3 jobs at the segmented config (~25 GB peak each).
+# Wall-clock benefit comes from overlapping the preload + I/O-bound
+# phases; the GPU-bound training itself will still timeshare. Default
+# 1 (one segment per GPU) to match the original behavior.
+NUM_JOBS_PER_GPU="${NUM_JOBS_PER_GPU:-1}"
 LOG_DIR="${LOG_DIR:-output/segmented_logs}"
 mkdir -p "${LOG_DIR}"
 
@@ -72,9 +80,10 @@ else
 fi
 
 # Cap per-job thread count so N PyTorch processes do not oversubscribe
-# the box. nproc returns logical cores; divide evenly.
+# the box. Total concurrent jobs = NUM_GPUS * NUM_JOBS_PER_GPU.
 TOTAL_CPUS="$(nproc 2>/dev/null || echo 8)"
-THREADS_PER_JOB="$(( TOTAL_CPUS / NUM_GPUS ))"
+TOTAL_JOBS_CONCURRENT="$(( NUM_GPUS * NUM_JOBS_PER_GPU ))"
+THREADS_PER_JOB="$(( TOTAL_CPUS / TOTAL_JOBS_CONCURRENT ))"
 (( THREADS_PER_JOB < 1 )) && THREADS_PER_JOB=1
 
 # --- Pre-flight checks --------------------------------------------------
@@ -108,7 +117,7 @@ fi
 echo "============================================================"
 echo "[train_segments] Segmented BG-merge pipeline — phase 1 (direct train)"
 echo "[train_segments] segments     : ${SEG_INDICES[*]}  (count=${#SEG_INDICES[@]})"
-echo "[train_segments] NUM_GPUS     : ${NUM_GPUS} (offset=${GPU_OFFSET})"
+echo "[train_segments] NUM_GPUS     : ${NUM_GPUS} (offset=${GPU_OFFSET}, jobs/GPU=${NUM_JOBS_PER_GPU})"
 echo "[train_segments] threads/job  : ${THREADS_PER_JOB}"
 echo "[train_segments] LOG_DIR      : ${LOG_DIR}"
 echo "[train_segments] WANDB group  : ${WANDB_RUN_GROUP}"
@@ -127,13 +136,15 @@ PID_SEGS=()
 
 dispatch() {
     local seg_idx="$1"
-    local gpu_slot="$2"
-    local gpu_id=$(( GPU_OFFSET + gpu_slot ))
+    local slot="$2"
+    # Round-robin GPU assignment: slot 0..NUM_GPUS-1 → GPU 0..N-1,
+    # slot NUM_GPUS..2*NUM_GPUS-1 → GPU 0..N-1 again (a 2nd job on each).
+    local gpu_id=$(( GPU_OFFSET + slot % NUM_GPUS ))
     local seg=$(printf "seg_%02d" "${seg_idx}")
     local log_file="${LOG_DIR}/${seg}_gpu${gpu_id}.log"
     local yaml="configs/experiments/segmented/${seg}.yaml"
 
-    echo "[dispatch] ${seg} -> GPU ${gpu_id}, log=${log_file}"
+    echo "[dispatch] ${seg} -> GPU ${gpu_id} (slot ${slot}), log=${log_file}"
 
     (
         CUDA_VISIBLE_DEVICES="${gpu_id}" \
@@ -165,11 +176,11 @@ trap cleanup INT TERM
 wave_idx=0
 i=0
 while (( i < ${#SEG_INDICES[@]} )); do
-    # Fill the wave with up to NUM_GPUS jobs.
+    # Fill the wave with up to NUM_GPUS * NUM_JOBS_PER_GPU jobs.
     PIDS=(); PID_GPUS=(); PID_SEGS=()
     slot=0
     wave_start_idx="${i}"
-    while (( slot < NUM_GPUS && i < ${#SEG_INDICES[@]} )); do
+    while (( slot < TOTAL_JOBS_CONCURRENT && i < ${#SEG_INDICES[@]} )); do
         dispatch "${SEG_INDICES[$i]}" "${slot}"
         slot=$(( slot + 1 ))
         i=$(( i + 1 ))

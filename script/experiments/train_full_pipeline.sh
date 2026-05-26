@@ -22,6 +22,7 @@
 # Env vars:
 #   WORKSPACE_DIR   output root (default /mnt/nvme/kataoka/VAD-GS)
 #   NUM_GPUS        parallel slots for phase 1 (default 8)
+#   NUM_JOBS_PER_GPU segments co-located on each GPU in phase 1 (default 1)
 #   GPU_OFFSET      first GPU id (default 0)
 #   FINETUNE_NPROC  DDP world size for phase 3 (default 8)
 #   WANDB_RUN_GROUP wandb group name (default t4_segpipe_<timestamp>)
@@ -37,6 +38,7 @@ cd "${REPO_ROOT}"
 
 WORKSPACE_DIR="${WORKSPACE_DIR:-/mnt/nvme/kataoka/VAD-GS}"
 NUM_GPUS="${NUM_GPUS:-8}"
+NUM_JOBS_PER_GPU="${NUM_JOBS_PER_GPU:-1}"
 GPU_OFFSET="${GPU_OFFSET:-0}"
 FINETUNE_NPROC="${FINETUNE_NPROC:-8}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -55,7 +57,8 @@ fi
 
 # Spread CPU threads so N parallel pytorch processes don't oversubscribe.
 TOTAL_CPUS="$(nproc 2>/dev/null || echo 8)"
-THREADS_PER_JOB="$(( TOTAL_CPUS / NUM_GPUS ))"
+TOTAL_JOBS_CONCURRENT="$(( NUM_GPUS * NUM_JOBS_PER_GPU ))"
+THREADS_PER_JOB="$(( TOTAL_CPUS / TOTAL_JOBS_CONCURRENT ))"
 (( THREADS_PER_JOB < 1 )) && THREADS_PER_JOB=1
 
 UV_RUN=( uv run )
@@ -87,7 +90,7 @@ if [[ "${SKIP_SEGMENTS:-0}" != "1" ]]; then
     echo "[pipeline] Phase 1: per-segment training"
     echo "[pipeline]   workspace : ${WORKSPACE_DIR}"
     echo "[pipeline]   segments  : ${SEG_INDICES[*]}  (count=${#SEG_INDICES[@]})"
-    echo "[pipeline]   num GPUs  : ${NUM_GPUS} (offset=${GPU_OFFSET})"
+    echo "[pipeline]   num GPUs  : ${NUM_GPUS} (offset=${GPU_OFFSET}, jobs/GPU=${NUM_JOBS_PER_GPU})"
     echo "[pipeline]   threads/j : ${THREADS_PER_JOB}"
     echo "[pipeline]   log dir   : ${LOG_DIR}"
     echo "[pipeline]   wandb grp : ${WANDB_RUN_GROUP}"
@@ -104,11 +107,13 @@ if [[ "${SKIP_SEGMENTS:-0}" != "1" ]]; then
     PID_SEGS=(); PID_GPUS=()
     dispatch() {
         local seg_idx="$1" slot="$2"
-        local gpu_id=$(( GPU_OFFSET + slot ))
+        # Round-robin GPU id across NUM_GPUS so slots beyond NUM_GPUS
+        # co-locate on already-used GPUs (NUM_JOBS_PER_GPU>1).
+        local gpu_id=$(( GPU_OFFSET + slot % NUM_GPUS ))
         local seg_short=$(printf "seg_%02d" "${seg_idx}")
         local yaml="configs/experiments/segmented/${seg_short}.yaml"
         local log_file="${LOG_DIR}/${seg_short}_gpu${gpu_id}.log"
-        echo "[dispatch] ${seg_short} -> GPU ${gpu_id}, log=${log_file}"
+        echo "[dispatch] ${seg_short} -> GPU ${gpu_id} (slot ${slot}), log=${log_file}"
         (
             CUDA_VISIBLE_DEVICES="${gpu_id}" \
             OMP_NUM_THREADS="${THREADS_PER_JOB}" \
@@ -129,7 +134,7 @@ if [[ "${SKIP_SEGMENTS:-0}" != "1" ]]; then
     while (( i < ${#SEG_INDICES[@]} )); do
         PIDS=(); PID_SEGS=(); PID_GPUS=()
         slot=0
-        while (( slot < NUM_GPUS && i < ${#SEG_INDICES[@]} )); do
+        while (( slot < TOTAL_JOBS_CONCURRENT && i < ${#SEG_INDICES[@]} )); do
             dispatch "${SEG_INDICES[$i]}" "${slot}"
             slot=$(( slot + 1 )); i=$(( i + 1 ))
         done

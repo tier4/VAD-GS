@@ -380,7 +380,24 @@ class GaussianModelActor(GaussianModel):
     
     def set_max_radii(self, visibility_obj, max_radii2D):
         self.max_radii2D[visibility_obj] = torch.max(self.max_radii2D[visibility_obj], max_radii2D[visibility_obj])
-    
+
+    def update_optimizer(self, scaler=None):
+        super().update_optimizer(scaler=scaler)
+        # Hard upper bound on per-axis scale, applied in log-space directly
+        # on _scaling.data so autograd is untouched. densify_and_prune's
+        # big_points_ws check only fires at densify steps (every 100 iters
+        # until densify_until_iter); a Gaussian whose scale grows AFTER the
+        # last densify pass (iter 23900 → 30000 in the segmented config) is
+        # never pruned and lands in the final ckpt as a wild outlier (we
+        # saw up to scale=5655 m for a 5 m car). The obj_acc_loss path
+        # then NaNs on it. Cap at self.extent (≈ half the actor's largest
+        # bbox dim) — a single Gaussian as big as the actor itself is the
+        # physical upper bound; anything larger is numerical runaway.
+        if self._scaling.numel() > 0:
+            log_extent = float(torch.log(self.extent.detach().clamp(min=1e-6)))
+            with torch.no_grad():
+                self._scaling.data.clamp_(max=log_extent)
+
     def box_reg_loss(self):
         scaling_max = self.get_scaling.max(dim=1).values
         scaling_max = torch.where(scaling_max > self.extent * self.percent_dense, scaling_max, 0.)
