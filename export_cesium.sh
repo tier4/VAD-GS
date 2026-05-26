@@ -68,7 +68,7 @@ fi
 # --- Ensure dependencies are installed --------------------------------------
 PY="${VENV_DIR}/bin/python"
 
-if ! "${PY}" -c "import torch, numpy, yaml; import importlib; importlib.import_module('3dgs_io'); import spz" >/dev/null 2>&1; then
+if ! "${PY}" -c "import torch, numpy, yaml; import importlib; m = importlib.import_module('3dgs_io'); m.save_tileset; m.TilesetSaveOptions; import spz" >/dev/null 2>&1; then
     echo "=== Installing export dependencies into ${VENV_DIR} ==="
     VIRTUAL_ENV="${VENV_DIR}" uv pip install \
         --python "${PY}" \
@@ -77,7 +77,10 @@ if ! "${PY}" -c "import torch, numpy, yaml; import importlib; importlib.import_m
         pyyaml
 fi
 
-# Always update 3dgs-io to latest (picks up bug fixes for SPZ encoding etc.)
+# Always update 3dgs-io to latest (picks up bug fixes for SPZ encoding,
+# 3D Tiles writer, etc.). The rewritten 3dgs-io exposes save_tileset() /
+# TilesetSaveOptions, which export_cesium.py now uses to emit chunked
+# GLBs + tileset.json in one call.
 echo "=== Updating 3dgs-io to latest ==="
 VIRTUAL_ENV="${VENV_DIR}" uv pip install \
     --python "${PY}" \

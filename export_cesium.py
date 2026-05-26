@@ -26,7 +26,6 @@ import argparse
 import json
 import math
 import os
-import struct
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -36,12 +35,13 @@ import yaml
 import numpy as np
 import torch
 
-# 3dgs_io: KHR_gaussian_splatting compliant glTF I/O
+# 3dgs_io: KHR_gaussian_splatting compliant glTF + 3D Tiles writer
 from importlib import import_module
 
 _3dgs_io = import_module("3dgs_io")
-save_gltf = _3dgs_io.save_gltf
 GltfSaveOptions = _3dgs_io.GltfSaveOptions
+TilesetSaveOptions = _3dgs_io.TilesetSaveOptions
+save_tileset = _3dgs_io.save_tileset
 DatasetType = _3dgs_io.DatasetType
 GlbMetadata = _3dgs_io.GlbMetadata
 TrainingData = _3dgs_io.TrainingData
@@ -705,79 +705,30 @@ def build_export_metadata(
 
 
 # ---------------------------------------------------------------------------
-# Bounding box computation for tileset.json
+# Tileset post-processing: inject geodetic root transform + provenance generator
 # ---------------------------------------------------------------------------
 
 
-def compute_bounding_box(gc: GaussianCloud) -> dict:
-    """Compute an oriented bounding box for 3D Tiles (12-element array).
-
-    Returns the 'box' array: [cx, cy, cz, xx, xy, xz, yx, yy, yz, zx, zy, zz]
-    where (cx,cy,cz) is center and the 3 column vectors are half-axes.
-    """
-    n = gc.num_points
-    pos = np.array(gc.positions, dtype=np.float64).reshape(n, 3)
-    pmin = pos.min(axis=0)
-    pmax = pos.max(axis=0)
-    center = ((pmin + pmax) / 2).tolist()
-    half = ((pmax - pmin) / 2).tolist()
-    return {
-        "box": [
-            center[0], center[1], center[2],
-            half[0], 0, 0,
-            0, half[1], 0,
-            0, 0, half[2],
-        ]
-    }
-
-
-# ---------------------------------------------------------------------------
-# Tileset.json generation
-# ---------------------------------------------------------------------------
-
-
-def create_tileset_json(
-    glb_filename: str,
-    gc: GaussianCloud,
+def _patch_tileset_root(
+    tileset_path: Path,
     lat: float,
     lon: float,
     height: float,
-    geometric_error: float = 500.0,
-    spz_compression: bool = True,
-    model_to_enu_rotation: np.ndarray | None = None,
-) -> dict:
-    """Create a 3D Tiles 1.1 tileset.json for a single GLB tile."""
-    bv = compute_bounding_box(gc)
+    model_to_enu_rotation: np.ndarray | None,
+) -> None:
+    """Add a geodetic ``transform`` to the root tile of an existing tileset.json.
+
+    ``3dgs_io.save_tileset`` writes a model-local tileset without geospatial
+    placement. We post-patch the root with the ECEF transform so CesiumJS
+    places the model at the correct location on the WGS84 ellipsoid.
+    """
     transform = build_tileset_transform(lat, lon, height, model_to_enu_rotation)
-
-    tileset: dict = {
-        "asset": {"version": "1.1", "generator": "VAD-GS export_cesium.py"},
-        "geometricError": geometric_error,
-        "root": {
-            "boundingVolume": bv,
-            "geometricError": 0,
-            "refine": "ADD",
-            "transform": transform,
-            "content": {"uri": glb_filename},
-        },
-    }
-
-    # CesiumJS requires 3DTILES_content_gltf extension to detect 3DGS content.
-    # Both KHR_gaussian_splatting and the SPZ compression sub-extension must be
-    # declared as extensionsRequired for CesiumJS to route to its GS renderer.
-    gltf_extensions = ["KHR_gaussian_splatting"]
-    if spz_compression:
-        gltf_extensions.append("KHR_gaussian_splatting_compression_spz_2")
-
-    tileset["extensionsUsed"] = ["3DTILES_content_gltf"]
-    tileset["extensions"] = {
-        "3DTILES_content_gltf": {
-            "extensionsUsed": gltf_extensions,
-            "extensionsRequired": gltf_extensions,
-        }
-    }
-
-    return tileset
+    with open(tileset_path, encoding="utf-8") as f:
+        tileset = json.load(f)
+    tileset.setdefault("asset", {})["generator"] = "VAD-GS export_cesium.py"
+    tileset["root"]["transform"] = transform
+    with open(tileset_path, "w", encoding="utf-8") as f:
+        json.dump(tileset, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +807,13 @@ def main():
         type=float,
         default=500.0,
         help="Geometric error for tileset.json (default: 500)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=float,
+        default=10.0,
+        help="3D Tiles spatial chunk size in metres. Smaller values produce "
+        "more, smaller GLB tiles for streaming. (default: 10.0)",
     )
     args = parser.parse_args()
 
@@ -997,9 +955,7 @@ def main():
     total_points = merged.num_points
     print(f"  Total gaussians: {total_points:,}")
 
-    # Save GLB
-    glb_name = "model.glb"
-    glb_path = output_dir / glb_name
+    # Save tileset (chunked GLBs + tileset.json) via 3dgs_io
     use_spz = not args.no_spz_compression
     metadata = build_export_metadata(
         train_cfg=train_cfg,
@@ -1016,27 +972,30 @@ def main():
         start_timestamp_us=start_timestamp_us,
         end_timestamp_us=end_timestamp_us,
     )
-    options = GltfSaveOptions(spz_compression=use_spz, metadata=metadata)
     print(f"Metadata: {json.dumps(metadata.to_dict(), indent=2, ensure_ascii=False)}")
-    print(f"Saving GLB: {glb_path}")
-    save_gltf(merged, glb_path, options)
-    glb_size = glb_path.stat().st_size
-    print(f"  GLB size: {glb_size / 1024 / 1024:.1f} MB")
+    print(
+        f"Saving tileset to {output_dir} "
+        f"(chunk_size={args.chunk_size}m, geometric_error={args.geometric_error}, spz={use_spz})"
+    )
+    tileset_options = TilesetSaveOptions(
+        chunk_size=args.chunk_size,
+        geometric_error=args.geometric_error,
+        save_options=GltfSaveOptions(spz_compression=use_spz, metadata=metadata),
+    )
+    tileset_path = save_tileset(merged, output_dir, tileset_options)
 
-    # Save tileset.json
-    tileset = create_tileset_json(
-        glb_name,
-        merged,
+    # Inject geodetic placement on the root tile
+    _patch_tileset_root(
+        tileset_path,
         lat=lat,
         lon=lon,
         height=height,
-        geometric_error=args.geometric_error,
-        spz_compression=use_spz,
         model_to_enu_rotation=model_to_enu_rotation,
     )
-    tileset_path = output_dir / "tileset.json"
-    with open(tileset_path, "w", encoding="utf-8") as f:
-        json.dump(tileset, f, indent=2)
+
+    chunk_glbs = sorted(output_dir.glob("chunk_*.glb"))
+    total_bytes = sum(p.stat().st_size for p in chunk_glbs)
+    print(f"  Wrote {len(chunk_glbs)} GLB chunk(s), total {total_bytes / 1024 / 1024:.1f} MB")
     print(f"Saved tileset: {tileset_path}")
 
     print(f"\nExport complete!")
