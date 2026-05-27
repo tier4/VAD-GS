@@ -735,6 +735,111 @@ def _bg_lidar_prune_apply(
     return n_prune
 
 
+def _bg_actor_bbox_prune(
+    gaussians,
+    dataset,
+    *,
+    scale_mul: float = 1.0,
+    pad: float = 0.05,
+) -> int:
+    """Drop BG Gaussians whose center sits inside any actor's 3D bbox at any frame.
+
+    Catches per-segment "ghost actor" Gaussians: during the first few hundred
+    iters of segment training, actor opacity is low and L1 gradient leaks to
+    BG params in actor regions. Those BG Gaussians inherit actor color/shape
+    and persist after segment training. The merge step concatenates them
+    into the final BG, sitting INSIDE the actor's GT bbox.
+
+    LiDAR-based prune (_bg_lidar_prune_apply) misses these: LiDAR returns
+    from an actor body coincide with the actor surface, so a BG Gaussian
+    INSIDE the actor body has d_g ≈ d_lidar — "consistent" by tau test, not
+    "conflict". Bbox-based prune is orthogonal and complementary.
+
+    Args:
+        scale_mul: multiplier on each Gaussian's max(scaling) — the OBB is
+                   padded by this much per Gaussian. 1.0 means "include the
+                   Gaussian if its 1-sigma ellipsoid radius touches the bbox".
+        pad:       absolute extra margin (m) on top of scale-based pad.
+
+    Returns the number of Gaussians actually pruned. Called once before the
+    training loop; no DDP sync needed since every rank sees the same actor
+    GT and the same BG state.
+    """
+    bg = getattr(gaussians, "background", None)
+    if bg is None or bg.get_xyz.shape[0] == 0:
+        return 0
+
+    md = dataset.scene_info.metadata
+    obj_tracklets = md.get("obj_tracklets", None)
+    obj_info = md.get("obj_meta", None)
+    if obj_tracklets is None or obj_info is None or len(obj_info) == 0:
+        if is_main_process():
+            print("[bg_actor_bbox_prune] no actor metadata in scene; skipping")
+        return 0
+
+    xyz = bg.get_xyz.detach()                              # (N, 3)
+    N_before = xyz.shape[0]
+    device = xyz.device
+    max_scale = bg.get_scaling.detach().max(dim=1).values  # (N,)
+
+    # tracklets: (num_frames, max_obj, 8) = [tid, x, y, z, qw, qx, qy, qz]
+    tracklets_np = np.asarray(obj_tracklets, dtype=np.float32)
+    track_ids_np = tracklets_np[..., 0]                    # CPU, used as loop iterator
+    trans_t = torch.from_numpy(tracklets_np[..., 1:4]).to(device)  # (F, M, 3) GPU
+    rots_t = torch.from_numpy(tracklets_np[..., 4:8]).to(device)   # (F, M, 4) GPU
+    F, M_max = track_ids_np.shape
+
+    prune_mask = torch.zeros(N_before, dtype=torch.bool, device=device)
+    n_obb = 0
+    n_skip = 0
+
+    for f in range(F):
+        for c in range(M_max):
+            tid = int(track_ids_np[f, c])
+            if tid < 0:
+                continue
+            info = obj_info.get(tid)
+            if info is None:
+                n_skip += 1
+                continue
+            half_L = float(info["length"]) * 0.5
+            half_W = float(info["width"]) * 0.5
+            half_H = float(info["height"]) * 0.5
+
+            trans = trans_t[f, c]                          # (3,)
+            rot = rots_t[f, c]                             # (4,)
+            R = quaternion_to_matrix(rot.unsqueeze(0))[0]  # (3, 3), local->world
+
+            # local_xyz = (xyz - trans) @ R  (row-vector form; R is orthogonal so
+            # this equals R^T applied as column-vector inverse rotation).
+            local_xyz = (xyz - trans) @ R                  # (N, 3)
+
+            pad_per = scale_mul * max_scale + pad           # (N,)
+            inside = (
+                (local_xyz[:, 0].abs() < half_L + pad_per)
+                & (local_xyz[:, 1].abs() < half_W + pad_per)
+                & (local_xyz[:, 2].abs() < half_H + pad_per)
+            )
+            prune_mask |= inside
+            n_obb += 1
+
+    n_prune = int(prune_mask.sum().item())
+    if is_main_process():
+        print(
+            f"[bg_actor_bbox_prune] OBBs processed: {n_obb:,} (skipped invalid: {n_skip}), "
+            f"scale_mul={scale_mul}, pad={pad}m"
+        )
+        print(
+            f"[bg_actor_bbox_prune] N before: {N_before:,}, "
+            f"pruned: {n_prune:,} ({100.0 * n_prune / max(N_before, 1):.2f}%), "
+            f"N after: {N_before - n_prune:,}"
+        )
+
+    if n_prune > 0:
+        bg.prune_points(prune_mask)
+    return n_prune
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -926,18 +1031,30 @@ def training(rank: int = 0, world_size: int = 1) -> None:
     cams_per_frame = len(data_args.get("cameras", [0, 1, 2]))
 
     gaussians.training_setup()
-    try:
-        if cfg.loaded_iter == -1:
-            loaded_iter = searchForMaxIteration(cfg.trained_model_dir)
-        else:
-            loaded_iter = cfg.loaded_iter
-        ckpt_path = os.path.join(cfg.trained_model_dir, f'iteration_{loaded_iter}.pth')
-        state_dict = torch.load(ckpt_path)
-        start_iter = state_dict['iter']
-        print(f'Loading model from {ckpt_path}')
-        gaussians.load_state_dict(state_dict)
-    except:
-        pass
+    # Auto-resume from the highest iteration_N.pth in trained_model_dir, UNLESS
+    # bg_init_from is set — in that case the user is explicitly seeding BG from
+    # an external merged checkpoint, and resuming a stale local ckpt would (a)
+    # waste the bg_init and (b) load the old ckpt to the device it was saved on
+    # (default cuda:0 with no map_location) which under DDP makes every rank
+    # crowd cuda:0 and OOM at bg_lidar_prune.
+    if not cfg.train.get('bg_init_from', ''):
+        try:
+            if cfg.loaded_iter == -1:
+                loaded_iter = searchForMaxIteration(cfg.trained_model_dir)
+            else:
+                loaded_iter = cfg.loaded_iter
+            ckpt_path = os.path.join(cfg.trained_model_dir, f'iteration_{loaded_iter}.pth')
+            # map_location: route every saved tensor through THIS rank's current
+            # device (set by setup_distributed -> torch.cuda.set_device(local_rank)).
+            # Without this, torch.load reloads tensors to the device they were
+            # saved on — typically cuda:0 — across all ranks.
+            state_dict = torch.load(ckpt_path, map_location=f'cuda:{torch.cuda.current_device()}')
+            start_iter = state_dict['iter']
+            print(f'Loading model from {ckpt_path}')
+            gaussians.load_state_dict(state_dict)
+            del state_dict  # free the temp on-device buffers
+        except:
+            pass
 
     # Optional BG-only init from a merged checkpoint produced by the
     # segmented-BG-merge pipeline (script/experiments/merge_bg_checkpoints.py).
@@ -1022,6 +1139,43 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             scale_voxel_size=float(training_args.get("bg_lidar_prune_scale_voxel_size", 0.5)),
             scale_min_neighbors=int(training_args.get("bg_lidar_prune_scale_min_neighbors", 3)),
         )
+
+    # Drop BG Gaussians whose center sits inside any actor's 3D bbox at any
+    # frame. Catches "ghost actor" BG Gaussians from per-segment training
+    # (where actor opacity was low early on and L1 leaked actor color into
+    # BG). Orthogonal to bg_lidar_prune. Runs once on every rank — actor GT
+    # is identical across ranks so the result is deterministic.
+    if training_args.get("bg_actor_bbox_prune_enable", False):
+        _bg_actor_bbox_prune(
+            gaussians,
+            dataset,
+            scale_mul=float(training_args.get("bg_actor_bbox_prune_scale_mul", 1.0)),
+            pad=float(training_args.get("bg_actor_bbox_prune_pad", 0.05)),
+        )
+
+    # BG-only finetune: freeze all actor Gaussians + actor_pose so the optimizer
+    # touches only BG / sky. Actor opt_pose is lost on merge (merge_obj_checkpoints
+    # carries per-Gaussian state but not actor_pose.opt_*); leaving actors trainable
+    # cascades that mismatch into per-Gaussian state collapse within the first ~100
+    # iter. Combined with the dynamic-mask-aware loss masking below, BG learns from
+    # frames where the pixel is unoccluded by any actor (per-pixel, per-frame).
+    bg_only_finetune = bool(training_args.get('bg_only_finetune', False))
+    if bg_only_finetune:
+        frozen_param_groups = 0
+        for name in gaussians.obj_list:
+            m = getattr(gaussians, name)
+            for attr in ('_xyz', '_features_dc', '_features_rest', '_opacity', '_scaling', '_rotation', '_semantic'):
+                p = getattr(m, attr, None)
+                if isinstance(p, torch.nn.Parameter):
+                    p.requires_grad_(False)
+                    frozen_param_groups += 1
+        if gaussians.actor_pose is not None and getattr(gaussians.actor_pose, 'opt_track', False):
+            for attr in ('opt_trans', 'opt_rots'):
+                p = getattr(gaussians.actor_pose, attr, None)
+                if isinstance(p, torch.nn.Parameter):
+                    p.requires_grad_(False)
+                    frozen_param_groups += 1
+        print(f'[bg_only_finetune] froze {frozen_param_groups} param groups across {len(gaussians.obj_list)} actors + actor_pose')
 
     print(f'Starting from {start_iter}')
     save_cfg(cfg, cfg.model_path, epoch=start_iter)
@@ -2024,8 +2178,23 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
         with autocast('cuda', enabled=use_amp):
             with perf_section("main_render"):
-                soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
+                if bg_only_finetune:
+                    # Skip actor render entirely so the composite is BG + sky only.
+                    # Actor params are frozen anyway, but excluding them avoids
+                    # producing a broken (opt_pose=0) actor image that the L1/SSIM
+                    # would then have to mask away — instead we just don't draw it.
+                    soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, exclude_list=list(gaussians.obj_list))
+                else:
+                    soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
                 image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
+
+            # In bg_only mode, augment loss_mask to drop pixels covered by any
+            # actor in GT (per dynamic_mask convention: 255 = static; any channel
+            # != 255 = actor present). Computed once here, reused for L1/SSIM/PSNR.
+            effective_loss_mask = loss_mask
+            if bg_only_finetune and dynamic_mask is not None:
+                static_mask = torch.all(dynamic_mask == 255, dim=0, keepdim=True)
+                effective_loss_mask = loss_mask & static_mask
 
             scalar_dict = dict()
             # Defer .item() syncs — each one drains the CUDA stream. Stash
@@ -2036,9 +2205,9 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
             # rgb loss
             with perf_section("loss_rgb"):
-                Ll1 = l1_loss(image, gt_image, mask=loss_mask)
+                Ll1 = l1_loss(image, gt_image, mask=effective_loss_mask)
                 _pending_scalars.append(('l1_loss', Ll1.detach()))
-                loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
+                loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=effective_loss_mask))
 
             # Foreground shape regularization: penalize anisotropy
             # (max/min scale ratio) and oversized scales on OBJECT Gaussians
@@ -2047,7 +2216,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             # Gaussians that the densifier doesn't split because signed
             # gradients cancel across high-frequency edges (cf. AbsGS).
             with perf_section("loss_obj_shape"):
-                if (optim_args.lambda_shape_pena > 0 or optim_args.lambda_scale_pena > 0) and gaussians.include_obj and len(gaussians.obj_list) > 0:
+                if not bg_only_finetune and (optim_args.lambda_shape_pena > 0 or optim_args.lambda_scale_pena > 0) and gaussians.include_obj and len(gaussians.obj_list) > 0:
                     obj_scales = torch.cat(
                         [getattr(gaussians, n).get_scaling for n in gaussians.obj_list], dim=0
                     )
@@ -2084,14 +2253,27 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             with perf_section("loss_sky"):
                 if optim_args.lambda_sky > 0 and gaussians.include_sky and sky_mask is not None:
                     acc = torch.clamp(acc, min=1e-6, max=1.-1e-6)
-                    sky_loss = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc)).mean()
+                    sky_loss_per_pixel = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc))
+                    # In bg_only mode, the non-sky branch (-log(acc), pushes BG
+                    # acc → 1) would also fire on actor pixels — telling BG to
+                    # be opaque where actors should be. Restrict the mean to
+                    # (sky pixels) ∪ (non-sky AND static) pixels.
+                    if bg_only_finetune and dynamic_mask is not None:
+                        static_mask = torch.all(dynamic_mask == 255, dim=0, keepdim=True)
+                        keep_mask = sky_mask | static_mask
+                        if keep_mask.any():
+                            sky_loss = sky_loss_per_pixel[keep_mask].mean()
+                        else:
+                            sky_loss = sky_loss_per_pixel.mean()
+                    else:
+                        sky_loss = sky_loss_per_pixel.mean()
                     if len(optim_args.lambda_sky_scale) > 0:
                         sky_loss *= optim_args.lambda_sky_scale[viewpoint_cam.meta['cam']]
                     _pending_scalars.append(('sky_loss', sky_loss.detach()))
                     loss += optim_args.lambda_sky * sky_loss
 
             with perf_section("loss_obj_acc"):
-                if optim_args.lambda_reg > 0 and gaussians.include_obj and iteration >= optim_args.densify_until_iter:
+                if not bg_only_finetune and optim_args.lambda_reg > 0 and gaussians.include_obj and iteration >= optim_args.densify_until_iter:
                     render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=False)
                     image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
                     del render_pkg_obj
@@ -2109,7 +2291,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             with perf_section("loss_depth"):
                 if optim_args.lambda_depth_lidar > 0:
                     if optim_args.use_lidar_depth and lidar_depth is not None:
-                        depth_mask = torch.logical_and((lidar_depth > 0.), loss_mask)
+                        depth_mask = torch.logical_and((lidar_depth > 0.), effective_loss_mask)
                         expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)
                         depth_error = torch.abs((expected_depth[depth_mask] - lidar_depth[depth_mask]))
                         depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
@@ -2119,7 +2301,7 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                         del expected_depth, depth_error, lidar_depth_loss
 
                     if optim_args.use_voxel_depth:
-                        depth_mask = torch.logical_and((voxel_depth_tensor > 0.), loss_mask)
+                        depth_mask = torch.logical_and((voxel_depth_tensor > 0.), effective_loss_mask)
                         expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)
                         depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
                         depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
@@ -2206,6 +2388,14 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                         if sky_mask is not None: # if viewpoint_cam.sky_mask is not None:
                             filter_mask = sky_mask.to(normal_gt.device).to(torch.bool)
                             normal_gt[(filter_mask.repeat(3, 1, 1))] = -10
+                        # In bg_only mode, mask out actor pixels: mono_normal
+                        # at actor pixels predicts the ACTOR surface normal,
+                        # and rendered_normal is BG-only — matching them would
+                        # force BG to mimic actor surfaces. -10 sentinel is
+                        # then filtered out below via (normal_gt != -10).
+                        if bg_only_finetune and dynamic_mask is not None:
+                            actor_filter = torch.any(dynamic_mask != 255, dim=0, keepdim=True).to(normal_gt.device).bool()
+                            normal_gt[(actor_filter.repeat(3, 1, 1))] = -10
 
                         filter_mask = (normal_gt != -10)[0, :, :].to(torch.bool)
                         l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
@@ -2288,9 +2478,9 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                 if np.isnan(ema_loss_for_log):
                     ema_loss_for_log = cur_loss
 
-                ema_psnr_for_log = 0.4 * psnr(image, gt_image, loss_mask).mean().float().item() + 0.6 * ema_psnr_for_log
+                ema_psnr_for_log = 0.4 * psnr(image, gt_image, effective_loss_mask).mean().float().item() + 0.6 * ema_psnr_for_log
                 if np.isnan(ema_psnr_for_log):
-                    ema_psnr_for_log = psnr(image, gt_image, loss_mask).mean().float().item()
+                    ema_psnr_for_log = psnr(image, gt_image, effective_loss_mask).mean().float().item()
 
                 progress_bar.set_postfix({"Exp": f"{cfg.task}-{cfg.exp_name}",
                                           "Loss": f"{ema_loss_for_log:.{7}f},",

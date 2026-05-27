@@ -2,25 +2,33 @@ parent_cfg: configs/experiments/segmented/seg_base.yaml
 
 # Final integration step of the segmented-BG-merge pipeline.
 #
+# Phase 3 polishes the merged BG against the full 561-frame T4 sequence
+# WITHOUT touching actors at all. The merge step (script/experiments/
+# merge_obj_checkpoints.py) carries per-Gaussian actor state but not
+# actor_pose.opt_*, so re-training actors here collapses them within ~100
+# iters due to opt_pose=0 mismatch. Cleanest fix: don't build actor
+# models in this phase at all.
+#
 # Loads:
 #   * `train.bg_init_from`  ← merged BG Gaussians (concat of 13 segments,
 #     produced by script/experiments/merge_bg_checkpoints.py)
-#   * `train.obj_init_from` ← per-actor best segment state (produced by
-#     script/experiments/merge_obj_checkpoints.py — picks the segment
-#     with the highest psnr_obj for each T4 track_id)
 #   * Sky                    ← rebuilt from the full-sequence PLY (no merge)
 #
-# Then trains on the FULL 561-frame T4 sequence:
+# Trained:
 #   * BG  : low LR (1/10) — polish merged Gaussians, no densify
-#   * Obj : full LR — actors retain their best-segment init but converge
-#           further on the full-sequence supervision
 #   * Sky : full LR — fresh, learns from scratch
 #
-# obj uses per-tag LR overrides (gaussian_model_actor.py picks up
-# `position_lr_init_obj` etc.) so the BG /10 reduction doesn't starve it.
-# Sky doesn't have per-tag overrides today, so it inherits the BG /10 —
-# accept this for now (sky overfit is a separate issue; see analysis in
-# wandb/sweep-nu6sy3bm), or bump iterations to 16000 to give it time.
+# Not built / not trained:
+#   * Obj / actor_pose       ← `model.nsg.include_obj: false` skips actor
+#     model construction entirely. The per-segment actor ckpts remain on
+#     disk for downstream render-time composition (a separate tool can
+#     stitch them with the polished BG, picking the right per-actor
+#     segment per frame).
+#
+# `bg_only_finetune: true` controls one remaining training-time behavior:
+# the dynamic_mask is still loaded per frame, and BG L1/SSIM/PSNR/depth
+# losses skip pixels where any actor occludes GT — so BG learns "what's
+# behind actors" only from frames where the pixel is unoccluded.
 
 exp_name: t4_finetune_merged
 
@@ -33,6 +41,14 @@ data:
   selected_frames: [0, 560]        # full T4 sequence (561 frames)
   regenerate_pcd: false
 
+model:
+  nsg:
+    # No actor models in Phase 3. setup_functions skips the obj_NNN loop
+    # AND skips ActorPose construction (street_gaussian_model.py:230-233).
+    # All downstream actor-related code paths short-circuit because
+    # gaussians.obj_list is empty and gaussians.actor_pose is None.
+    include_obj: false
+
 train:
   iterations: 16000
   test_iterations: [2000, 8000, 16000]
@@ -40,11 +56,28 @@ train:
   checkpoint_iterations: [8000, 16000]
   log_image_interval: 100
 
-  bg_init_from:  output/t4_exp/merged_bg/iteration_0.pth
-  obj_init_from: output/t4_exp/merged_obj/iteration_0.pth
+  bg_init_from: output/t4_exp/merged_bg/iteration_0.pth
+
+  # Mask GT actor pixels out of L1 / SSIM / PSNR / depth losses (per the
+  # dynamic_mask). Without this, BG would be pushed to fit actor pixels
+  # (the actor isn't rendered with include_obj=false, so the L1 there
+  # would mistake actor RGB for "BG content we need to learn").
+  bg_only_finetune: True
+
+  # Drop BG Gaussians that ended up inside any actor's GT bbox at any
+  # frame. These are "ghost actor" BG Gaussians from per-segment training
+  # — when actor opacity was low in early iters of segment training, L1
+  # leaked actor RGB into BG params, leaving actor-shaped BG residuals
+  # that persist after segment finishes and merge concatenates them.
+  # LiDAR-based prune misses these (LiDAR returns from actor body match
+  # the BG Gaussian's depth → "consistent", not "conflict"). The bbox
+  # check is orthogonal and complementary.
+  bg_actor_bbox_prune_enable: True
+  bg_actor_bbox_prune_scale_mul: 1.0    # OBB pad = 1.0 * max(scaling) per Gaussian
+  bg_actor_bbox_prune_pad: 0.05         # plus 5cm absolute slack
 
 optim:
-  # === BG / sky base-class LR (/10): used to polish merged BG ===
+  # === BG / sky LR (/10): polish merged BG ===
   position_lr_init: 1.6e-06
   position_lr_final: 1.6e-07
   position_lr_max_steps: 16000
@@ -52,22 +85,81 @@ optim:
   rotation_lr: 0.0001
   feature_lr: 0.00025
 
-  # === Obj per-tag LR: full speed since obj also benefits from
-  #     further training on the full-sequence supervision. The
-  #     `args.get('<knob>_obj', args.<knob>)` fallback in
-  #     gaussian_model_actor.py:training_setup picks these up. ===
-  position_lr_init_obj: 1.6e-05
-  position_lr_final_obj: 1.6e-06
-  scaling_lr_obj: 0.005
-  rotation_lr_obj: 0.001
-  feature_lr_obj: 0.0025
+  # === Densify enabled, biased toward SPLIT (not aggressive prune) ===
+  # The earlier "prune-heavy" version killed split children before they
+  # could contribute:
+  #   - percent_big_ws=0.05 made the 0.5m big-size threshold smaller than
+  #     the typical split-child scale (parent_scale / (0.8 × 2) ≈ 0.625m
+  #     for a 1m parent), so split children died the moment they appeared.
+  #   - min_opacity=0.05 + opacity_reset wholesale wiped any Gaussian that
+  #     didn't recover above 5% in one densification_interval (impossible
+  #     for many legitimate Gaussians at 2805 views / 500 iter cycle).
+  #
+  # New balance:
+  #   - Lower densify grad threshold → 2× more split candidates per cycle
+  #   - Lower percent_dense → shift more borderline-size Gaussians into
+  #     the SPLIT path (vs CLONE), since the merged BG is dominated by
+  #     ~0.1-1m scale Gaussians where the size_threshold matters
+  #   - Restore percent_big_ws / min_opacity / max_screen_size to upstream
+  #     3DGS defaults so split children survive
+  #   - Disable opacity_reset entirely — relies on bg_lidar_prune (one-
+  #     shot), bg_actor_bbox_prune (one-shot), lambda_lidar_freespace
+  #     (continuous opacity push) for floater cleanup. Trade-off: slower
+  #     floater removal, but no risk of mass-killing legitimate Gaussians.
+  #   - Disabling reset also disables big_points/big_screen prune via the
+  #     `prune_big_points = iteration > opacity_reset_interval` gate in
+  #     train.py:2486 — split children always survive size-based prune.
+  densify_from_iter: 500              # let initial L1 settle before adding
+  densify_until_iter: 12000           # last 4k iter = polish only, no N changes
+  densification_interval: 500         # scaled for 2805 views (~17% per cycle)
+  opacity_reset_interval: 99999999    # OFF — see comment above
 
-  # Densify / opacity reset OFF — refinement only.
-  densify_from_iter: 99999999
-  densify_until_iter: 0
-  opacity_reset_interval: 99999999
+  # === SPLIT-friendly densify ===
+  # Threshold is on the mean per-Gaussian screen-space gradient norm over
+  # the densification_interval (500 iter). AbsGS variant uses the absolute-
+  # value gradient column (no sign cancellation across views), giving 2-5×
+  # larger values than the regular signed gradient — so 0.0002 here is
+  # roughly equivalent to stock 3DGS's 0.0002 on the regular column.
+  densify_grad_threshold_bkgd: 0.0002 # was 0.0005 — 2.5× more candidates qualify
+  densify_grad_abs_bkgd: True         # AbsGS: |grad| accumulator (catches edge oscillation)
+  # percent_dense * extent = split/clone boundary. With extent=10m and
+  # percent_dense=0.002, boundary at 2cm. Merged BG scales typically
+  # 0.05-1m → almost all Gaussians hit SPLIT path. Clone path effectively
+  # only fires for sub-2cm Gaussians (rare in BG).
+  percent_dense: 0.002                # was 0.005 — boundary 0.02m, vast majority SPLIT not CLONE
 
-  # Hard depth / propagation off (their value is during densification).
+  # === Training-loop prune DISABLED ===
+  # min_opacity=0 makes (sigmoid(opacity) < 0) always False → opacity-based
+  # prune (B1) never fires. Combined with opacity_reset_interval=99999999
+  # gating big_points / small_radii pruning (B3/B4), the densify_and_prune
+  # call now ONLY adds Gaussians (clone/split) — it never removes any
+  # legitimate Gaussian during training. The hardcoded degenerate-scale
+  # safety net (B2: all 3 axes < 1mm) at gaussian_model_bkgd.py:217 stays
+  # active but rarely fires.
+  #
+  # Floater handling is now ENTIRELY one-shot at startup:
+  #   - bg_lidar_prune_apply (LiDAR conflict + sky_mask + scale anomaly)
+  #   - bg_actor_bbox_prune (3D bbox overlap)
+  # Plus continuous lambda_lidar_freespace pushes floater opacity → 0
+  # (sigmoid output → 0, so they become invisible even though N stays
+  # the same).
+  min_opacity: 0.0                    # was 0.01 — disable opacity-based prune
+  percent_big_ws: 0.1                 # inert (prune_big_points gate is OFF)
+  max_screen_size: 40                 # inert (same gate)
+  prune_box_interval: 100
+
+  # === Loss balance: bump SSIM to drive more local-contrast gradient ===
+  # SSIM has a patch-level structural component that gives Gaussians on
+  # edges / texture stronger screen-space gradient than pixel-wise L1
+  # alone. Raising lambda_dssim 0.2 → 0.4 doubles the structural signal
+  # → more BG Gaussians cross densify_grad_threshold per cycle → more
+  # split. lambda_l1 stays at default 1.0.
+  lambda_dssim: 0.4
+
+  # Hard depth / propagation off — these are densify *strategies*
+  # (geometry-aware spawn from depth) but our BG already has 36.5M
+  # Gaussians; we only want pruning/redistribution, not new spawn from
+  # depth maps. Leave OFF so the merged-BG init guides everything.
   hard_depth_start: 99999999
   hard_depth_end: 0
   propagated_iteration_begin: 99999999
@@ -75,12 +167,11 @@ optim:
 
   # Free-space LiDAR opacity penalty: BG Gaussians whose center sits in
   # observed empty space (in front of a positive LiDAR return) are pushed
-  # toward opacity 0 every iter. Continuous companion to bg_lidar_prune
-  # (one-shot pre-train) — catches floaters that drift forward of LiDAR
-  # surfaces during fine-tuning. Densify is off here so the opacity-only
-  # gradient never gets cancelled by new spawn. start_iter=0: BG was
-  # already pre-conditioned by bg_lidar_prune, so no warmup needed.
-  lambda_lidar_freespace: 0.1
+  # toward opacity 0 every iter. With opacity_reset disabled, this is the
+  # PRIMARY continuous floater-cleanup mechanism — bumped to 0.5 (was 0.1)
+  # to compensate for the missing reset cycle. Floaters slowly drop below
+  # min_opacity=0.01 and get pruned in subsequent densify_and_prune calls.
+  lambda_lidar_freespace: 0.5
   lidar_freespace_start_iter: 0
 
   # seg_base re-enables use_voxel_depth to mirror the nuscenes reference
