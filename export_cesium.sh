@@ -33,6 +33,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv_export"
 PY_VERSION="3.13"
 
+# 3dgs-io pin. Pulled from the autowarefoundation/3dgs_io upstream
+# (public, the canonical location — the tier4/3dgs_io URL the script
+# used previously was a stale fork mirror without release tags). Pin
+# to a tag here, not main, so reruns are reproducible. Bump
+# THREE_DGS_IO_VERSION when upgrading.
+THREE_DGS_IO_VERSION="0.2.1"
+THREE_DGS_IO_REF="v${THREE_DGS_IO_VERSION}"
+
 # --- Parse shell-level options (--view, --port) before passing rest to Python -
 VIEW=false
 VIEW_PORT=8080
@@ -77,15 +85,24 @@ if ! "${PY}" -c "import torch, numpy, yaml; import importlib; m = importlib.impo
         pyyaml
 fi
 
-# Always update 3dgs-io to latest (picks up bug fixes for SPZ encoding,
-# 3D Tiles writer, etc.). The rewritten 3dgs-io exposes save_tileset() /
-# TilesetSaveOptions, which export_cesium.py now uses to emit chunked
-# GLBs + tileset.json in one call.
-echo "=== Updating 3dgs-io to latest ==="
-VIRTUAL_ENV="${VENV_DIR}" uv pip install \
-    --python "${PY}" \
-    --reinstall --no-cache \
-    "3dgs-io @ git+https://github.com/tier4/3dgs_io.git"
+# Install 3dgs-io at the pinned version above. Re-install only when the
+# currently installed version doesn't match (= venv missing 3dgs-io, or a
+# previous run pinned a different commit). Re-running with the same pin
+# is a no-op aside from the version check.
+INSTALLED_3DGS_IO_VERSION="$("${PY}" -c 'import importlib.metadata as m; print(m.version("3dgs-io"))' 2>/dev/null || true)"
+if [ "${INSTALLED_3DGS_IO_VERSION}" != "${THREE_DGS_IO_VERSION}" ]; then
+    if [ -n "${INSTALLED_3DGS_IO_VERSION}" ]; then
+        echo "=== Replacing 3dgs-io ${INSTALLED_3DGS_IO_VERSION} -> ${THREE_DGS_IO_VERSION} (${THREE_DGS_IO_REF}) ==="
+    else
+        echo "=== Installing 3dgs-io ${THREE_DGS_IO_VERSION} (${THREE_DGS_IO_REF}) ==="
+    fi
+    VIRTUAL_ENV="${VENV_DIR}" uv pip install \
+        --python "${PY}" \
+        --reinstall --no-cache \
+        "3dgs-io @ git+https://github.com/autowarefoundation/3dgs_io.git@${THREE_DGS_IO_REF}"
+else
+    echo "=== 3dgs-io ${THREE_DGS_IO_VERSION} already installed (${THREE_DGS_IO_REF}) ==="
+fi
 
 # --- Run export -------------------------------------------------------------
 echo "=== Exporting to Cesium 3D Tiles ==="
