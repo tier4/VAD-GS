@@ -29,6 +29,21 @@ parent_cfg: configs/experiments/segmented/seg_base.yaml
 # the dynamic_mask is still loaded per frame, and BG L1/SSIM/PSNR/depth
 # losses skip pixels where any actor occludes GT — so BG learns "what's
 # behind actors" only from frames where the pixel is unoccluded.
+#
+# Chunk-merge opacity ramp + repeated prune
+# -----------------------------------------
+# Instead of one-shot heuristic prunes (LiDAR-conflict / actor-bbox-overlap)
+# trying to guess which merged Gaussians to drop, we let the renderer itself
+# vote. After the bg_init_from load, every merged BG Gaussian's opacity is
+# slammed to a near-zero value (`bg_merge_opacity_init`). During warm-up the
+# rendering loss pulls opacity up only for Gaussians that genuinely
+# contribute (good colour/geometry support). Once the warm-up has had time
+# to discriminate, a periodic opacity-threshold prune
+# (`bg_merge_opacity_prune_*`) drops the ones that never recovered — i.e.
+# floaters, duplicates from segment overlap, ghost-actor residuals, free-
+# space Gaussians. This subsumes the heuristic one-shot prunes (kept off
+# below for now); flip `bg_lidar_prune_enable` / `bg_actor_bbox_prune_enable`
+# back on if you want the opacity ramp plus the heuristic prune layered.
 
 exp_name: t4_finetune_merged
 
@@ -64,17 +79,33 @@ train:
   # would mistake actor RGB for "BG content we need to learn").
   bg_only_finetune: True
 
-  # Drop BG Gaussians that ended up inside any actor's GT bbox at any
-  # frame. These are "ghost actor" BG Gaussians from per-segment training
-  # — when actor opacity was low in early iters of segment training, L1
-  # leaked actor RGB into BG params, leaving actor-shaped BG residuals
-  # that persist after segment finishes and merge concatenates them.
-  # LiDAR-based prune misses these (LiDAR returns from actor body match
-  # the BG Gaussian's depth → "consistent", not "conflict"). The bbox
-  # check is orthogonal and complementary.
-  bg_actor_bbox_prune_enable: True
+  # Heuristic one-shot prunes — superseded by the chunk-merge opacity ramp
+  # below. The ramp lets the renderer decide which Gaussians are needed,
+  # which subsumes both prunes (ghost-actor BG / LiDAR-conflict BG produce
+  # no useful gradient → their opacity stays near 0 → the periodic
+  # opacity-threshold prune drops them). Flip back to True to layer them
+  # on top of the ramp (no harm, just more work at startup).
+  bg_actor_bbox_prune_enable: False
   bg_actor_bbox_prune_scale_mul: 1.0    # OBB pad = 1.0 * max(scaling) per Gaussian
   bg_actor_bbox_prune_pad: 0.05         # plus 5cm absolute slack
+
+  # === Chunk-merge opacity ramp + periodic threshold prune ===
+  # Initial opacity (sigmoid space) every merged BG Gaussian is reset to
+  # right after bg_init_from loads. ~0.005 puts every Gaussian deeply
+  # invisible; the loss has to *earn* opacity per Gaussian by pulling it
+  # back up. Adam moments on opacity are also cleared so per-segment
+  # momentum doesn't bias the recovery. Set to 0 to disable the ramp and
+  # keep merged opacities as-is (legacy behaviour).
+  bg_merge_opacity_init: 0.005
+  # First training iter the periodic opacity-threshold prune fires.
+  # Should sit AFTER the ramp has had ~2-3 densification cycles to push
+  # genuine Gaussians above the threshold (and to let lambda_lidar_freespace
+  # / SSIM gradients flow). 2000 iter @ default cadence gives ~4 prune
+  # passes between 2k and 12k.
+  bg_merge_opacity_prune_start_iter: 2000
+  bg_merge_opacity_prune_until_iter: 12000   # stops dropping at the densify cutoff so the final 4k is polish-only
+  bg_merge_opacity_prune_interval: 500       # same cadence as densify, so prune lines up with one cycle of grad accum
+  bg_merge_opacity_prune_threshold: 0.01     # drop sigmoid(opacity) < 0.01 = "Gaussian still invisible after warm-up"
 
 optim:
   # === BG / sky LR (/10): polish merged BG ===
@@ -128,22 +159,25 @@ optim:
   # only fires for sub-2cm Gaussians (rare in BG).
   percent_dense: 0.002                # was 0.005 — boundary 0.02m, vast majority SPLIT not CLONE
 
-  # === Training-loop prune DISABLED ===
+  # === Training-loop prune (densify_and_prune path) DISABLED ===
   # min_opacity=0 makes (sigmoid(opacity) < 0) always False → opacity-based
-  # prune (B1) never fires. Combined with opacity_reset_interval=99999999
-  # gating big_points / small_radii pruning (B3/B4), the densify_and_prune
-  # call now ONLY adds Gaussians (clone/split) — it never removes any
-  # legitimate Gaussian during training. The hardcoded degenerate-scale
-  # safety net (B2: all 3 axes < 1mm) at gaussian_model_bkgd.py:217 stays
-  # active but rarely fires.
+  # prune inside densify_and_prune (B1) never fires. Combined with
+  # opacity_reset_interval=99999999 gating big_points / small_radii pruning
+  # (B3/B4), the densify_and_prune call now ONLY adds Gaussians (clone/
+  # split) — it never removes any legitimate Gaussian during training. The
+  # hardcoded degenerate-scale safety net (B2: all 3 axes < 1mm) at
+  # gaussian_model_bkgd.py:217 stays active but rarely fires.
   #
-  # Floater handling is now ENTIRELY one-shot at startup:
-  #   - bg_lidar_prune_apply (LiDAR conflict + sky_mask + scale anomaly)
-  #   - bg_actor_bbox_prune (3D bbox overlap)
-  # Plus continuous lambda_lidar_freespace pushes floater opacity → 0
-  # (sigmoid output → 0, so they become invisible even though N stays
-  # the same).
-  min_opacity: 0.0                    # was 0.01 — disable opacity-based prune
+  # Floater handling lives in TWO independent paths, both outside
+  # densify_and_prune:
+  #   1. Chunk-merge opacity ramp (bg_merge_opacity_*) — see train: block.
+  #      Slams every merged Gaussian to opacity 0.005, then periodically
+  #      drops Gaussians whose opacity stays below 0.01 after warm-up.
+  #      This is the primary floater killer.
+  #   2. Continuous lambda_lidar_freespace pushes free-space Gaussians'
+  #      opacity → 0 every iter, feeding straight into the chunk-merge
+  #      prune at the next interval.
+  min_opacity: 0.0                    # was 0.01 — disable densify_and_prune's opacity prune (replaced by bg_merge_opacity_prune)
   percent_big_ws: 0.1                 # inert (prune_big_points gate is OFF)
   max_screen_size: 40                 # inert (same gate)
   prune_box_interval: 100

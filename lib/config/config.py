@@ -62,6 +62,23 @@ cfg.train.bg_lidar_prune_scale_anomaly_thr = 5.0  # Scale-anomaly threshold: a G
 cfg.train.bg_lidar_prune_scale_voxel_size = 0.5  # Voxel edge length (scene-unit meters) used to bin Gaussians for the scale-anomaly check. Larger -> coarser neighborhood definition.
 cfg.train.bg_lidar_prune_scale_min_neighbors = 3  # Minimum neighbor Gaussians (excluding self) in the same voxel before the scale-anomaly score is acted on. Avoids flagging Gaussians in very sparse voxels where the mean estimate is noisy.
 
+# === Chunk-merge BG opacity ramp + periodic threshold prune ===
+# After bg_init_from concatenates per-segment BG checkpoints, the merged
+# state contains many redundant/floater Gaussians from segment overlaps.
+# The "ramp" strategy: slam every BG Gaussian to a near-zero opacity right
+# after the merge load, then let training pull opacity back up only for
+# Gaussians that actually contribute to L1/SSIM gradient. After a warm-up,
+# periodically drop Gaussians whose opacity stayed below a threshold. This
+# uses the renderer-driven gradient itself as the "do you matter?" oracle,
+# subsuming heuristics like bg_lidar_prune / bg_actor_bbox_prune (a
+# Gaussian inside an actor body or in observed free space gets no useful
+# gradient → its opacity stays near 0 → it gets pruned).
+cfg.train.bg_merge_opacity_init = 0.0  # If > 0, after bg_init_from set every BG Gaussian's opacity to inverse_sigmoid(this value) and reset its Adam moments. 0 disables the override (legacy: keep merged opacities as-is).
+cfg.train.bg_merge_opacity_prune_start_iter = 0  # First training iter at which the periodic opacity-threshold BG prune fires. Should sit AFTER the opacity warm-up has had time to push genuine Gaussians above the threshold (~1-2 densification cycles).
+cfg.train.bg_merge_opacity_prune_until_iter = 0  # Last iter the periodic prune may fire (inclusive). 0 means "until train.iterations".
+cfg.train.bg_merge_opacity_prune_interval = 500  # Cadence (in iters) of the repeated opacity-threshold BG prune.
+cfg.train.bg_merge_opacity_prune_threshold = 0.0  # Drop BG Gaussians with sigmoid(opacity) below this. 0 disables the periodic prune entirely. Independent of optim.min_opacity (which gates the densify_and_prune prune path).
+
 cfg.optim = CN()
 cfg.optim.use_amp = False # If set to True, use Automatic Mixed Precision (AMP) for training.
 # learning rate

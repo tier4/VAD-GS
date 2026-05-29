@@ -27,7 +27,7 @@ from lib.utils.loss_utils import l1_loss, l2_loss, psnr, ssim, patch_norm_mse_lo
 from lib.utils.img_utils import save_img_torch, visualize_depth_numpy
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer
 from lib.models.street_gaussian_model import StreetGaussianModel
-from lib.utils.general_utils import safe_state
+from lib.utils.general_utils import safe_state, inverse_sigmoid
 from lib.utils.perf_timer import perf_section, perf_iter_end
 from lib.utils.camera_utils import Camera
 from lib.utils.cfg_utils import save_cfg
@@ -840,6 +840,97 @@ def _bg_actor_bbox_prune(
     return n_prune
 
 
+def _bg_merge_opacity_init_apply(gaussians, init_value: float) -> None:
+    """Slam every merged BG Gaussian's opacity down to `init_value` (sigmoid space).
+
+    Used by the chunk-merge pipeline (cfg.train.bg_init_from + bg_merge_opacity_init).
+    The intent is to start training with all Gaussians invisible, then let the
+    rendering loss pull opacity back up only for Gaussians that genuinely
+    contribute. The companion periodic opacity-threshold prune (see
+    cfg.train.bg_merge_opacity_prune_*) then drops everything that failed to
+    recover.
+
+    Also clears the opacity parameter's Adam exp_avg / exp_avg_sq if present
+    (carrying segment-training momentum into the fine-tune would push opacity
+    back up before the gradient has had a chance to vote). Right after
+    bg_init_from + training_setup(), no optimizer.step has run yet so
+    optimizer.state has no entry for _opacity — we just rebind the Parameter
+    in that case. After the first step, state is populated and we zero it.
+    """
+    bg = getattr(gaussians, "background", None)
+    if bg is None:
+        if is_main_process():
+            print("[bg_merge_opacity_init] no background model; skipping")
+        return
+    if init_value <= 0.0 or init_value >= 1.0:
+        raise ValueError(
+            f"[bg_merge_opacity_init] init_value must be in (0, 1); got {init_value}"
+        )
+    N = bg.get_xyz.shape[0]
+    if N == 0:
+        if is_main_process():
+            print("[bg_merge_opacity_init] background has 0 Gaussians; skipping")
+        return
+    op_before = torch.sigmoid(bg._opacity.detach()).flatten()
+    new_logits = inverse_sigmoid(
+        torch.full_like(bg._opacity.detach(), float(init_value))
+    )
+    # Rebind the opacity Parameter on both the model and the optimizer's
+    # param group, clearing any Adam state. Mirrors reset_optimizer's logic
+    # but tolerates the "no stored state yet" case (right after
+    # load_state_dict, before any optimizer.step has run).
+    new_param = torch.nn.Parameter(new_logits.requires_grad_(True))
+    for group in bg.optimizer.param_groups:
+        if group.get("name") != "opacity":
+            continue
+        old_param = group["params"][0]
+        if old_param in bg.optimizer.state:
+            del bg.optimizer.state[old_param]
+        group["params"][0] = new_param
+        break
+    else:
+        raise RuntimeError("[bg_merge_opacity_init] no 'opacity' param group on bg.optimizer")
+    bg._opacity = new_param
+    op_after = torch.sigmoid(bg._opacity.detach()).flatten()
+    if is_main_process():
+        print(
+            f"[bg_merge_opacity_init] reset BG opacity for {N:,} Gaussians: "
+            f"before sigmoid(op) mean={op_before.mean().item():.4f} "
+            f"median={op_before.median().item():.4f} "
+            f"max={op_before.max().item():.4f}; "
+            f"after sigmoid(op) = {op_after.mean().item():.4f} (uniform, Adam moments cleared)"
+        )
+
+
+def _bg_merge_opacity_prune(gaussians, threshold: float) -> int:
+    """Drop BG Gaussians with sigmoid(opacity) < threshold.
+
+    DDP-safe by determinism: every rank holds the same BG state (DDP gradient
+    sync keeps parameters identical after each optimizer.step), so each rank
+    computes the same prune_mask and ends up with the same pruned BG without
+    needing a broadcast. Mirrors the pattern of _bg_lidar_prune_apply.
+
+    Returns the number of Gaussians pruned.
+    """
+    bg = getattr(gaussians, "background", None)
+    if bg is None or threshold <= 0.0:
+        return 0
+    op = torch.sigmoid(bg._opacity.detach()).squeeze(-1)
+    prune_mask = op < float(threshold)
+    n_prune = int(prune_mask.sum())
+    if n_prune == 0:
+        return 0
+    N_before = bg.get_xyz.shape[0]
+    bg.prune_points(prune_mask)
+    if is_main_process():
+        print(
+            f"[bg_merge_opacity_prune] threshold={threshold}: pruned "
+            f"{n_prune:,} / {N_before:,} ({100.0 * n_prune / max(N_before, 1):.2f}%) "
+            f"-> BG now has {bg.get_xyz.shape[0]:,} Gaussians"
+        )
+    return n_prune
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -1077,6 +1168,14 @@ def training(rank: int = 0, world_size: int = 1) -> None:
             raise RuntimeError('train.bg_init_from set but model has no background — check model.nsg.include_bkgd.')
         gaussians.background.load_state_dict(bg_state)
         print(f'[bg_init] BG now has {gaussians.background.get_xyz.shape[0]} Gaussians')
+
+        # Optional chunk-merge opacity ramp: slam every merged BG Gaussian's
+        # opacity down to a near-zero value so training has to re-justify each
+        # Gaussian. The companion periodic opacity-threshold prune (below)
+        # drops the ones that fail to recover.
+        bg_merge_op_init = float(cfg.train.get('bg_merge_opacity_init', 0.0) or 0.0)
+        if bg_merge_op_init > 0.0:
+            _bg_merge_opacity_init_apply(gaussians, init_value=bg_merge_op_init)
 
     # Optional per-actor init from a merged-obj checkpoint produced by
     # script/experiments/merge_obj_checkpoints.py. For each obj model
@@ -2542,6 +2641,24 @@ def training(rank: int = 0, world_size: int = 1) -> None:
                     gaussians.reset_opacity(exclude_list=_reset_exclude)
                 if data_args.white_background and iteration == optim_args.densify_from_iter:
                     gaussians.reset_opacity(exclude_list=_reset_exclude)
+
+            # Chunk-merge: periodic opacity-threshold prune of BG Gaussians.
+            # Runs INDEPENDENTLY of densify_and_prune (which is gated by
+            # densify_until_iter). The point of this pass is to repeatedly
+            # cull the merged-BG Gaussians that the loss-driven opacity ramp
+            # never pulled above _prune_thr — i.e. Gaussians the renderer
+            # has decided it does not need. Deterministic per rank: every
+            # DDP rank holds identical bg._opacity after the previous
+            # optimizer.step (DDP grad sync), so each rank computes the
+            # same mask and prunes locally.
+            _bg_op_prune_thr = float(training_args.get('bg_merge_opacity_prune_threshold', 0.0) or 0.0)
+            if _bg_op_prune_thr > 0.0:
+                _start = int(training_args.get('bg_merge_opacity_prune_start_iter', 0) or 0)
+                _until_raw = int(training_args.get('bg_merge_opacity_prune_until_iter', 0) or 0)
+                _until = _until_raw if _until_raw > 0 else int(training_args.iterations)
+                _interval = int(training_args.get('bg_merge_opacity_prune_interval', 500) or 500)
+                if _interval > 0 and _start <= iteration <= _until and iteration % _interval == 0:
+                    _bg_merge_opacity_prune(gaussians, threshold=_bg_op_prune_thr)
 
             with perf_section("training_report"):
                 # NOTE: called on every rank — eval is sharded inside via
