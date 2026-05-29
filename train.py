@@ -2462,14 +2462,25 @@ def training(rank: int = 0, world_size: int = 1) -> None:
 
                     n_conflict = int(conflict_mask.sum().item())
                     if n_conflict > 0:
-                        # get_opacity is post-sigmoid in (0, 1); L1 mean pushes
-                        # conflicting Gaussians' opacity toward 0.
+                        # BCE-style asymmetric free-space penalty.
+                        #   per-Gaussian term: -log(1 - sigmoid(opacity_logit))
+                        #   reduction:        .sum() over conflict (no 1/N_conflict)
+                        # opacity_logit gradient becomes sigma itself: stays non-
+                        # zero at low sigma where the old sigma(1-sigma)/N form
+                        # vanished, and grows toward 1 as sigma -> 1 so L1's
+                        # opacity-up pressure during the chunk-merge ramp is
+                        # actively countered. clamp_min(1e-6) caps the log near
+                        # sigma = 1 to prevent inf.
                         opacity_bg = bg.get_opacity.squeeze(-1)
-                        freespace_loss = opacity_bg[conflict_mask].mean()
-                        _pending_scalars.append(('lidar_freespace_loss', freespace_loss.detach()))
+                        freespace_term = -(1.0 - opacity_bg[conflict_mask]).clamp_min(1e-6).log()
+                        freespace_loss = freespace_term.sum()
+                        # Log per-Gaussian mean alongside the sum so the wandb
+                        # curve is comparable to the legacy mean-of-sigma view.
+                        _pending_scalars.append(('lidar_freespace_loss', freespace_term.mean().detach()))
+                        _pending_scalars.append(('lidar_freespace_loss_sum', freespace_loss.detach()))
                         _pending_scalars.append(('lidar_freespace_n', torch.tensor(float(n_conflict), device=opacity_bg.device)))
                         loss += optim_args.lambda_lidar_freespace * freespace_loss
-                        del opacity_bg, freespace_loss
+                        del opacity_bg, freespace_term, freespace_loss
 
 
             # color correction loss
